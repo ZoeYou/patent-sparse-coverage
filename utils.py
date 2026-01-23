@@ -627,11 +627,101 @@ def process_doc_batch(doc_texts: List[str],
                 if not token_in_chunk:
                     char_spans.append((tok_start, tok_end, tok.text))
         elif unit == "spacy_sentence":
-            for sent in doc_spacy.sents:
-                t = sent.text.strip()
-                if not t:
-                    continue
-                char_spans.append((sent.start_char, sent.end_char, t))
+            # For abstract section, split by [SEP] first, then process title and abstract separately
+            if section == "abstract" and "[SEP]" in vis_text:
+                # Split by [SEP] to separate title and abstract
+                sep_pos = vis_text.find("[SEP]")
+                if sep_pos >= 0:
+                    # Extract title part (before [SEP])
+                    title_part_raw = vis_text[:sep_pos]
+                    title_part = title_part_raw.strip()
+                    
+                    # Extract abstract part (after [SEP], keep [abstract] token if present)
+                    after_sep = vis_text[sep_pos + len("[SEP]"):]
+                    # Keep [abstract] token in abstract_part - don't remove it
+                    abstract_part = after_sep.strip()
+                    # Find where abstract content starts in vis_text (including [abstract] token)
+                    abstract_content_start = sep_pos + len("[SEP]")
+                    # Skip leading whitespace
+                    leading_ws_len = len(after_sep) - len(after_sep.lstrip())
+                    abstract_content_start += leading_ws_len
+                    
+                    sentences_found = False
+                    
+                    # Process title part
+                    if title_part:
+                        title_doc = NLP(title_part)
+                        # Calculate offset: find where title content actually starts in vis_text
+                        title_text_start_in_vis = len(title_part_raw) - len(title_part.lstrip())
+                        
+                        for sent in title_doc.sents:
+                            t = sent.text.strip()
+                            if not t or len(t) < 3:
+                                continue
+                            # Skip special token patterns
+                            if re.match(r'^\[.*\]\s*$', t) or re.match(r'^\[.*\]\s*\[.*\]\s*$', t):
+                                continue
+                            # Adjust offset: sent.start_char is relative to title_part, add title_text_start_in_vis
+                            sent_start = title_text_start_in_vis + sent.start_char
+                            sent_end = title_text_start_in_vis + sent.end_char
+                            char_spans.append((sent_start, sent_end, t))
+                            sentences_found = True
+                    
+                    # Process abstract part (includes [abstract] token if present)
+                    if abstract_part:
+                        abstract_doc = NLP(abstract_part)
+                        
+                        for sent in abstract_doc.sents:
+                            t = sent.text.strip()
+                            if not t:
+                                continue
+                            # For [abstract] token itself, keep it if it's a standalone sentence
+                            # Otherwise, skip very short sentences (but allow [abstract] token)
+                            if len(t) < 3 and t != "[abstract]":
+                                continue
+                            # Skip other special token patterns (but keep [abstract])
+                            if t != "[abstract]" and (re.match(r'^\[.*\]\s*$', t) or re.match(r'^\[.*\]\s*\[.*\]\s*$', t)):
+                                continue
+                            # Adjust offset: sent.start_char is relative to abstract_part, add abstract_content_start
+                            sent_start = abstract_content_start + sent.start_char
+                            sent_end = abstract_content_start + sent.end_char
+                            char_spans.append((sent_start, sent_end, t))
+                            sentences_found = True
+                else:
+                    # Fallback: if [SEP] not found, process normally
+                    sentences_found = False
+                    for sent in doc_spacy.sents:
+                        t = sent.text.strip()
+                        if not t:
+                            continue
+                        if len(t) < 3:
+                            continue
+                        if re.match(r'^\[.*\]\s*$', t) or re.match(r'^\[.*\]\s*\[.*\]\s*$', t):
+                            continue
+                        char_spans.append((sent.start_char, sent.end_char, t))
+                        sentences_found = True
+            else:
+                # For non-abstract sections or abstract without [SEP], process normally
+                sentences_found = False
+                for sent in doc_spacy.sents:
+                    t = sent.text.strip()
+                    if not t:
+                        continue
+                    # Filter out sentences that are only special tokens or very short
+                    if len(t) < 3:
+                        continue
+                    # Additional check: skip sentences that are only special token patterns
+                    # (e.g., "[abstract]", "[claim]", "[invention]", "[SEP]")
+                    if re.match(r'^\[.*\]\s*$', t) or re.match(r'^\[.*\]\s*\[.*\]\s*$', t):
+                        continue
+                    char_spans.append((sent.start_char, sent.end_char, t))
+                    sentences_found = True
+            
+            # Debug: if no sentences found but vis_text exists, it might be too short or only special tokens
+            # This is expected for some documents where truncation leaves only special tokens
+            if not sentences_found and vis_text and len(vis_text.strip()) > 0:
+                # vis_text exists but no sentences found - this is okay, we'll just have CLS token
+                pass
         elif unit == "doc":
             t = vis_text.strip()
             if t:
@@ -673,8 +763,18 @@ def process_doc_batch(doc_texts: List[str],
                 continue
 
             # Quality filtering for non-encoder_token modes (encoder_token outputs all tokens as-is)
-            if unit != "encoder_token" and not filter_span_quality(span_text):
-                continue
+            # For spacy_sentence, we're more lenient - only filter if span is clearly invalid
+            # because sentences should generally be kept even if they're short or contain common words
+            if unit != "encoder_token":
+                if unit == "spacy_sentence":
+                    # For sentences, only filter if they're extremely short or clearly invalid
+                    # Don't apply the full filter_span_quality which is designed for tokens/noun_chunks
+                    if len(span_text.strip()) < 3:
+                        continue
+                else:
+                    # For other units (spacy_token, noun_chunk), use full quality filter
+                    if not filter_span_quality(span_text):
+                        continue
 
             # IMPORTANT: do not drop tokens; pool over all tokens in the unit span
             span_emb = token_embeddings[token_start:token_end].mean(dim=0)

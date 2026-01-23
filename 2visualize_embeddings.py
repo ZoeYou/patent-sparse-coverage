@@ -26,11 +26,20 @@ try:
     UMAP_AVAILABLE = True
 except ImportError:
     UMAP_AVAILABLE = False
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModel
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.utils import PlotlyJSONEncoder
 import glob
+import re
+import torch
+import spacy
+from utils import (
+    ensure_section_tokens,
+    load_corpus,
+    process_doc_batch,
+    DEVICE,
+)
 
 
 app = Flask(__name__)
@@ -38,6 +47,11 @@ CORS(app)
 
 # Global cache for loaded data
 _data_cache = {}
+
+# Global cache for models and tokenizers
+_model_cache = {}
+_tokenizer_cache = {}
+_nlp_cache = None
 
 
 def scan_embeddings_directories(base_dir: str = ".") -> List[Dict[str, str]]:
@@ -84,6 +98,81 @@ def scan_embeddings_directories(base_dir: str = ".") -> List[Dict[str, str]]:
     return embeddings_dirs
 
 
+def parse_embedding_dir_name(embeddings_dir: str) -> Optional[Dict[str, str]]:
+    """
+    Parse embeddings directory name to extract model info.
+    
+    Directory format: embeddings_{model_name}_{unit}_{cls}_{layer}
+    Example: embeddings_PatentMap-V0-SecPair-Claim_spacy_token_cls_second_last
+    
+    Returns:
+        Dict with keys: model_name, unit, cls, layer, or None if parsing fails
+    """
+    dir_name = os.path.basename(embeddings_dir.rstrip('/'))
+    
+    # Remove 'embeddings_' prefix
+    if not dir_name.startswith('embeddings_'):
+        return None
+    
+    parts = dir_name[len('embeddings_'):].split('_')
+    
+    # Known unit types (ordered by specificity - longer names first)
+    valid_units = ["spacy_sentence", "spacy_token", "encoder_token", "noun_chunk", "doc"]
+    valid_layers = ["second_last", "last"]  # Order matters: check longer first
+    valid_cls = ["cls", "nocls"]
+    
+    # Find unit, cls, and layer from the end
+    unit = None
+    cls = None
+    layer = None
+    
+    # Check for layer (could be multi-word like "second_last")
+    # Check longer names first
+    for l in valid_layers:
+        layer_parts = l.split('_')
+        if len(parts) >= len(layer_parts):
+            # Check if the last N parts match the layer
+            if parts[-len(layer_parts):] == layer_parts:
+                layer = l
+                parts = parts[:-len(layer_parts)]
+                break
+    
+    # Check for cls (should be after layer is removed)
+    if len(parts) >= 1 and parts[-1] in valid_cls:
+        cls = parts[-1]
+        parts = parts[:-1]
+    
+    # Find unit (could be multi-word like "spacy_sentence")
+    # Check longer names first
+    for u in valid_units:
+        unit_parts = u.split('_')
+        if len(parts) >= len(unit_parts):
+            # Check if the last N parts match the unit
+            if parts[-len(unit_parts):] == unit_parts:
+                unit = u
+                parts = parts[:-len(unit_parts)]
+                break
+    
+    # Remaining parts form the model name
+    model_name = '_'.join(parts) if parts else None
+    
+    # Debug: print parsing results
+    if not all([model_name, unit, cls, layer]):
+        print(f"Parsing failed for: {dir_name}")
+        print(f"  Remaining parts: {parts}")
+        print(f"  Found - model_name: {model_name}, unit: {unit}, cls: {cls}, layer: {layer}")
+    
+    if model_name and unit and cls and layer:
+        return {
+            'model_name': model_name,
+            'unit': unit,
+            'cls': cls,
+            'layer': layer
+        }
+    
+    return None
+
+
 def detect_unit_from_directory(embeddings_dir: str) -> Optional[str]:
     """
     Automatically detect unit type from embeddings directory name.
@@ -94,6 +183,11 @@ def detect_unit_from_directory(embeddings_dir: str) -> Optional[str]:
     Returns:
         Unit type string if detected, None otherwise
     """
+    parsed = parse_embedding_dir_name(embeddings_dir)
+    if parsed:
+        return parsed['unit']
+    
+    # Fallback to old method
     dir_name = os.path.basename(embeddings_dir.rstrip('/'))
     
     # Known unit types (ordered by specificity - longer names first)
@@ -117,6 +211,37 @@ def detect_unit_from_directory(embeddings_dir: str) -> Optional[str]:
                         return unit
     
     return None
+
+
+def get_model_path_from_name(model_name: str) -> str:
+    """
+    Infer model path from model name.
+    
+    Common mappings:
+    - PatentMap-V0-SecPair-Claim -> ZoeYou/PatentMap-V0-SecPair-Claim
+    - bert-for-patents -> anferico/bert-for-patents
+    - paecter -> (may need special handling)
+    
+    Returns:
+        Model path (HuggingFace ID or local path)
+    """
+    # Common model name to path mappings
+    model_mappings = {
+        'PatentMap-V0-SecPair-Claim': 'ZoeYou/PatentMap-V0-SecPair-Claim',
+        'bert-for-patents': 'anferico/bert-for-patents',
+        'paecter': 'anferico/bert-for-patents',  # Fallback, may need adjustment
+    }
+    
+    # Check if it's already a full path/ID
+    if '/' in model_name:
+        return model_name
+    
+    # Check mappings
+    if model_name in model_mappings:
+        return model_mappings[model_name]
+    
+    # Default: try to use as-is (might be a local path or HuggingFace ID)
+    return model_name
 
 
 def load_embeddings_and_metadata(embeddings_dir: str, sections: List[str], unit: str) -> Tuple[Dict[str, np.ndarray], Dict[str, List[Dict]]]:
@@ -242,6 +367,62 @@ def find_embeddings_for_doc(metadata: List[Dict], embeddings: np.ndarray, doc_id
     return indices, selected_metadata
 
 
+def format_text_for_hover(text: str, max_line_length: int = 60) -> str:
+    """
+    Format text for hover tooltip with automatic line breaks.
+    
+    Inserts <br> tags at word boundaries to make text wrap in hover tooltips.
+    Note: Plotly's hover template supports HTML, so <br> tags will be rendered.
+    
+    Args:
+        text: Text to format
+        max_line_length: Maximum characters per line before wrapping
+    
+    Returns:
+        Formatted text with <br> tags for line breaks (HTML escaped except for <br>)
+    """
+    if not text:
+        return ''
+    
+    # Escape HTML special characters first to prevent XSS
+    import html
+    text = html.escape(text)
+    
+    # Split into words
+    words = text.split()
+    if not words:
+        return text
+    
+    lines = []
+    current_line = []
+    current_length = 0
+    
+    for word in words:
+        word_length = len(word)
+        # Add 1 for space if not first word in line
+        space_length = 1 if current_line else 0
+        
+        if current_length + space_length + word_length <= max_line_length:
+            # Add to current line
+            current_line.append(word)
+            current_length += space_length + word_length
+        else:
+            # Start new line
+            if current_line:
+                lines.append(' '.join(current_line))
+            current_line = [word]
+            current_length = word_length
+    
+    # Add remaining words
+    if current_line:
+        lines.append(' '.join(current_line))
+    
+    # Join with <br> tags - these will be rendered as HTML by Plotly
+    # Note: We use <br> (not &lt;br&gt;) because Plotly's hover template
+    # supports HTML rendering for customdata when used in hovertemplate
+    return '<br>'.join(lines)
+
+
 def create_plotly_visualization(embeddings_2d: np.ndarray, 
                                 metadata: List[Dict],
                                 selected_indices: Optional[List[int]] = None,
@@ -331,7 +512,29 @@ def create_plotly_visualization(embeddings_2d: np.ndarray,
                     emb_2d = selected_embeddings[idx]
                     section_x.append(emb_2d[0])
                     section_y.append(emb_2d[1])
-                    span_text = meta.get('span_text_raw', meta.get('span_text', ''))[:50]
+                    # Get full text
+                    span_text_full = meta.get('span_text_raw', meta.get('span_text', ''))
+                    # Determine truncation based on unit type
+                    unit_type = meta.get('unit', 'unknown')
+                    if unit_type == 'spacy_sentence':
+                        # For sentences, show full text (or up to 500 chars for very long sentences)
+                        span_text = span_text_full[:500] if len(span_text_full) > 500 else span_text_full
+                        if len(span_text_full) > 500:
+                            span_text += '...'
+                        # Format with line breaks (longer lines for sentences)
+                        span_text = format_text_for_hover(span_text, max_line_length=70)
+                    elif unit_type == 'doc':
+                        # For doc-level, show up to 300 chars
+                        span_text = span_text_full[:300] if len(span_text_full) > 300 else span_text_full
+                        if len(span_text_full) > 300:
+                            span_text += '...'
+                        # Format with line breaks
+                        span_text = format_text_for_hover(span_text, max_line_length=65)
+                    else:
+                        # For tokens/noun_chunks, keep shorter truncation (50 chars)
+                        span_text = span_text_full[:50] if len(span_text_full) > 50 else span_text_full
+                        # Format with line breaks (shorter lines for tokens)
+                        span_text = format_text_for_hover(span_text, max_line_length=50)
                     section_hover_data.append({
                         'doc_id': doc_id,
                         'section': section,
@@ -339,8 +542,17 @@ def create_plotly_visualization(embeddings_2d: np.ndarray,
                     })
                 
                 if section_x:  # Only plot if there are tokens
-                    # Prepare customdata as list of lists for Plotly
-                    customdata_list = [[hd['doc_id'], hd['section'], hd['text']] for hd in section_hover_data]
+                    # Prepare hover text with HTML formatting for each point
+                    hovertext_list = []
+                    for idx, hd in enumerate(section_hover_data):
+                        # Build hover text with HTML line breaks in the text field
+                        hover_text = (f"<b>Token</b><br>"
+                                     f"Doc ID: {hd['doc_id']}<br>"
+                                     f"Section: {hd['section']}<br>"
+                                     f"Text: {hd['text']}<br>"
+                                     f"X: {section_x[idx]:.2f}<br>"
+                                     f"Y: {section_y[idx]:.2f}")
+                        hovertext_list.append(hover_text)
                     
                     fig.add_trace(go.Scatter(
                         x=section_x,
@@ -354,14 +566,15 @@ def create_plotly_visualization(embeddings_2d: np.ndarray,
                             line=dict(width=1.5, color='black')
                         ),
                         name=f"{doc_id} - {section.upper()}",
-                        hovertemplate='<b>Token</b><br>' +
-                                      'Doc ID: %{customdata[0]}<br>' +
-                                      'Section: %{customdata[1]}<br>' +
-                                      'Text: %{customdata[2]}<br>' +
-                                      'X: %{x:.2f}<br>' +
-                                      'Y: %{y:.2f}<br>' +
-                                      '<extra></extra>',
-                        customdata=customdata_list,
+                        hovertext=hovertext_list,  # Use hovertext for better HTML support
+                        hovertemplate='%{hovertext}<extra></extra>',
+                        # Enable HTML rendering in hover
+                        hoverlabel=dict(
+                            namelength=-1,
+                            bgcolor='rgba(255, 255, 255, 0.95)',
+                            bordercolor='rgba(0, 0, 0, 0.2)',
+                            font_size=12
+                        ),
                         showlegend=True
                     ))
         
@@ -415,12 +628,17 @@ def create_plotly_visualization(embeddings_2d: np.ndarray,
         template='plotly_white',
         width=900,
         height=700,
+        # Add right margin to accommodate legend
+        margin=dict(l=60, r=200, t=60, b=60),
         legend=dict(
             yanchor="top",
             y=0.99,
             xanchor="left",
-            x=1.01,
-            font=dict(size=10)
+            x=1.02,  # Slightly further right, but margin will accommodate it
+            font=dict(size=10),
+            # Allow legend to scroll if too long
+            itemwidth=30,
+            tracegroupgap=5
         )
     )
     
@@ -691,6 +909,361 @@ def visualize():
         return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
 
 
+def compute_query_embeddings(query_text: str, section: str, embeddings_dir: str, 
+                            model_path: str = None, unit: str = None, 
+                            keep_cls: bool = True, layer: str = "last", 
+                            max_length: int = 512) -> Tuple[np.ndarray, List[Dict]]:
+    """
+    Compute embeddings for a query text on-the-fly.
+    
+    Args:
+        query_text: The query text to embed
+        section: Section type ('abstract', 'claim', 'invention')
+        embeddings_dir: Embeddings directory (used to infer parameters if not provided)
+        model_path: Model path (inferred from embeddings_dir if not provided)
+        unit: Unit type (inferred from embeddings_dir if not provided)
+        keep_cls: Whether to keep CLS token
+        layer: Which layer to use ('last' or 'second_last')
+        max_length: Maximum sequence length
+    
+    Returns:
+        embeddings: np.array of shape [N, hidden_dim]
+        metadata: List of metadata dicts
+    """
+    # Parse embeddings_dir to get parameters if not provided
+    if not model_path or not unit:
+        parsed = parse_embedding_dir_name(embeddings_dir)
+        if parsed:
+            if not model_path:
+                model_path = get_model_path_from_name(parsed['model_name'])
+            if not unit:
+                unit = parsed['unit']
+            if not layer:
+                layer = parsed['layer']
+            if keep_cls is None:
+                keep_cls = (parsed['cls'] == 'cls')
+    
+    if not model_path or not unit:
+        raise ValueError("Could not infer model_path and unit from embeddings_dir")
+    
+    # Load or get cached model and tokenizer
+    cache_key = f"{model_path}_{layer}"
+    if cache_key not in _model_cache:
+        print(f"Loading model: {model_path}")
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
+        ensure_section_tokens(tokenizer, model)
+        model.to(DEVICE)
+        model.eval()
+        _model_cache[cache_key] = model
+        _tokenizer_cache[cache_key] = tokenizer
+    else:
+        model = _model_cache[cache_key]
+        tokenizer = _tokenizer_cache[cache_key]
+    
+    # Query text is already formatted in the calling function, so use as-is
+    formatted_text = query_text
+    
+    # Load spaCy if needed and set it in utils module
+    global _nlp_cache
+    if unit != "encoder_token":
+        if _nlp_cache is None:
+            print("Loading spaCy model...")
+            _nlp_cache = spacy.load("en_core_web_sm", disable=["ner", "textcat"])
+            _nlp_cache.max_length = 900000 + 10000
+        # Set in utils module so process_doc_batch can use it
+        import utils
+        utils.NLP = _nlp_cache
+    
+    # Process the query (single document)
+    doc_ids = ['QUERY']
+    sections_list = [section]
+    doc_texts = [formatted_text]
+    
+    # Use process_doc_batch to compute embeddings
+    batch_results = process_doc_batch(
+        doc_texts=doc_texts,
+        doc_ids=doc_ids,
+        sections=sections_list,
+        unit=unit,
+        model=model,
+        tokenizer=tokenizer,
+        device=DEVICE,
+        max_length=max_length,
+        keep_cls=keep_cls,
+        layer=layer
+    )
+    
+    # Extract embeddings and metadata
+    embeddings_list = []
+    metadata_list = []
+    
+    for doc_id, sec, doc_text, span_text_raw, span_text_canonical, span_emb in batch_results:
+        embeddings_list.append(span_emb)
+        metadata_list.append({
+            'doc_id': doc_id,
+            'section': sec,
+            'span_text_raw': span_text_raw,
+            'span_text': span_text_canonical,
+            'unit': unit
+        })
+    
+    if not embeddings_list:
+        raise ValueError("No embeddings were generated for the query")
+    
+    embeddings = np.vstack(embeddings_list)
+    return embeddings, metadata_list
+
+
+def load_citation_mapping(mapping_file: str) -> Dict[str, List[str]]:
+    """
+    Load citation mapping from gold.json file.
+    
+    Args:
+        mapping_file: Path to gold.json file
+    
+    Returns:
+        Dict mapping query_id -> list of cited document IDs
+    """
+    with open(mapping_file, 'r') as f:
+        raw_citations = json.load(f)
+    
+    # Convert to simple mapping: query_id -> [cited_doc_ids]
+    citation_mapping = {}
+    for query_id, cited_list in raw_citations.items():
+        cited_doc_ids = []
+        for cited_info in cited_list:
+            cited_id = cited_info.get('cited_id', '')
+            if cited_id:
+                cited_doc_ids.append(cited_id)
+        citation_mapping[query_id] = cited_doc_ids
+    
+    return citation_mapping
+
+
+@app.route('/api/load_queries', methods=['POST'])
+def load_queries():
+    """Load queries from queries.json file."""
+    data = request.json
+    queries_file = data.get('queries_file', './downstream/perf200/content/queries.json')
+    
+    if not os.path.exists(queries_file):
+        return jsonify({'error': f'Queries file not found: {queries_file}'}), 404
+    
+    try:
+        queries = load_corpus(queries_file)
+        query_ids = sorted(list(queries.keys()))
+        
+        # Get sections available for each query
+        query_info = {}
+        for qid in query_ids:
+            query_info[qid] = {
+                'id': qid,
+                'sections': []
+            }
+            query_doc = queries[qid]
+            if query_doc.get('abstract'):
+                query_info[qid]['sections'].append('abstract')
+            if query_doc.get('claim'):
+                query_info[qid]['sections'].append('claim')
+            if query_doc.get('invention'):
+                query_info[qid]['sections'].append('invention')
+        
+        return jsonify({
+            'queries': query_info,
+            'query_ids': query_ids,
+            'count': len(query_ids)
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/load_citations', methods=['POST'])
+def load_citations():
+    """Load citation mapping from gold.json file."""
+    data = request.json
+    mapping_file = data.get('mapping_file', './downstream/perf200/mapping/gold.json')
+    
+    if not os.path.exists(mapping_file):
+        return jsonify({'error': f'Mapping file not found: {mapping_file}'}), 404
+    
+    try:
+        citation_mapping = load_citation_mapping(mapping_file)
+        return jsonify({
+            'citations': citation_mapping,
+            'count': len(citation_mapping)
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
+@app.route('/api/visualize_query_citations', methods=['POST'])
+def visualize_query_citations():
+    """Visualize query and its cited documents."""
+    data = request.json
+    embeddings_dir = data.get('embeddings_dir')
+    query_id = data.get('query_id')
+    section = data.get('section', 'abstract')
+    queries_file = data.get('queries_file', './downstream/perf200/content/queries.json')
+    mapping_file = data.get('mapping_file', './downstream/perf200/mapping/gold.json')
+    reduction = data.get('reduction', 'umap')
+    n_neighbors = data.get('n_neighbors', 15)
+    min_dist = data.get('min_dist', 0.1)
+    max_embeddings = data.get('max_embeddings', 50000)
+    
+    if not embeddings_dir or not query_id:
+        return jsonify({'error': 'embeddings_dir and query_id are required'}), 400
+    
+    try:
+        # Parse embeddings_dir to get parameters
+        parsed = parse_embedding_dir_name(embeddings_dir)
+        if not parsed:
+            dir_name = os.path.basename(embeddings_dir.rstrip('/'))
+            return jsonify({
+                'error': f'Could not parse embeddings directory name: {dir_name}',
+                'hint': 'Expected format: embeddings_{model_name}_{unit}_{cls}_{layer}'
+            }), 400
+        
+        unit = parsed['unit']
+        keep_cls = (parsed['cls'] == 'cls')
+        layer = parsed['layer']
+        
+        # Load queries
+        queries = load_corpus(queries_file)
+        if query_id not in queries:
+            return jsonify({'error': f'Query {query_id} not found'}), 404
+        
+        query_doc = queries[query_id]
+        
+        # Format query text based on section (matching document format)
+        if section == 'abstract':
+            title = query_doc.get('title', '').strip()
+            abstract = query_doc.get('abstract', '').strip()
+            if not abstract:
+                return jsonify({'error': f'Query {query_id} has no {section} section'}), 404
+            query_text = f"{title} [SEP] [abstract] {abstract}".strip() if title else f"[abstract] {abstract}".strip()
+        elif section == 'claim':
+            query_text = query_doc.get('claim', '').strip()
+            if not query_text:
+                return jsonify({'error': f'Query {query_id} has no {section} section'}), 404
+            query_text = f"[claim] {query_text}".strip()
+        elif section == 'invention':
+            query_text = query_doc.get('invention', '').strip()
+            if not query_text:
+                return jsonify({'error': f'Query {query_id} has no {section} section'}), 404
+            query_text = f"[invention] {query_text}".strip()
+        else:
+            return jsonify({'error': f'Invalid section: {section}'}), 400
+        
+        # Load citation mapping
+        citation_mapping = load_citation_mapping(mapping_file)
+        cited_doc_ids = citation_mapping.get(query_id, [])
+        
+        if not cited_doc_ids:
+            return jsonify({'error': f'Query {query_id} has no cited documents'}), 404
+        
+        print(f"Computing embeddings for query {query_id} (section: {section})")
+        print(f"Found {len(cited_doc_ids)} cited documents")
+        
+        # Compute query embeddings
+        query_embeddings, query_metadata = compute_query_embeddings(
+            query_text=query_text,
+            section=section,
+            embeddings_dir=embeddings_dir,
+            unit=unit,
+            keep_cls=keep_cls,
+            layer=layer
+        )
+        
+        # Load document embeddings
+        embeddings_by_section, metadata_by_section = load_embeddings_and_metadata(
+            embeddings_dir, [section], unit
+        )
+        
+        if section not in embeddings_by_section:
+            return jsonify({'error': f'Section {section} not found in embeddings'}), 404
+        
+        doc_embeddings = embeddings_by_section[section]
+        doc_metadata = metadata_by_section[section]
+        
+        # Find embeddings for cited documents
+        cited_indices = []
+        cited_metadata_list = []
+        for doc_id in cited_doc_ids:
+            indices, meta_list = find_embeddings_for_doc(doc_metadata, doc_embeddings, doc_id)
+            cited_indices.extend(indices)
+            cited_metadata_list.extend(meta_list)
+        
+        if not cited_indices:
+            return jsonify({'error': f'No embeddings found for cited documents'}), 404
+        
+        # Combine query and cited document embeddings
+        all_embeddings = np.vstack([query_embeddings, doc_embeddings[cited_indices]])
+        all_metadata = query_metadata + cited_metadata_list
+        
+        # Create indices for visualization
+        query_indices = list(range(len(query_embeddings)))
+        cited_indices_in_combined = [len(query_embeddings) + i for i in range(len(cited_indices))]
+        
+        # Subsample if needed (preserve query and cited documents)
+        selected_indices = set(query_indices + cited_indices_in_combined)
+        if len(all_embeddings) > max_embeddings:
+            num_available = max_embeddings - len(selected_indices)
+            if num_available > 0:
+                all_indices = set(range(len(all_embeddings)))
+                non_selected = list(all_indices - selected_indices)
+                if len(non_selected) > num_available:
+                    sampled = np.random.choice(non_selected, size=num_available, replace=False).tolist()
+                else:
+                    sampled = non_selected
+                indices_to_keep = sorted(list(selected_indices) + sampled)
+            else:
+                indices_to_keep = sorted(list(selected_indices))
+            
+            all_embeddings = all_embeddings[indices_to_keep]
+            all_metadata = [all_metadata[i] for i in indices_to_keep]
+            
+            # Update indices
+            index_mapping = {old: new for new, old in enumerate(indices_to_keep)}
+            query_indices = [index_mapping[i] for i in query_indices if i in index_mapping]
+            cited_indices_in_combined = [index_mapping[i] for i in cited_indices_in_combined if i in index_mapping]
+        
+        # Reduce dimensions
+        embeddings_2d = reduce_dimensions(
+            all_embeddings,
+            method=reduction,
+            n_neighbors=n_neighbors,
+            min_dist=min_dist
+        )
+        
+        # Create visualization with query and cited documents highlighted
+        selected_indices = query_indices + cited_indices_in_combined
+        selected_metadata = [all_metadata[i] for i in selected_indices]
+        
+        title = f"Query {query_id} ({section.upper()}) and {len(cited_doc_ids)} Cited Documents"
+        
+        plot_data = create_plotly_visualization(
+            embeddings_2d,
+            all_metadata,
+            selected_indices=selected_indices,
+            selected_metadata=selected_metadata,
+            title=title,
+            sections=[section]
+        )
+        
+        return jsonify({
+            'plot': plot_data,
+            'query_count': len(query_indices),
+            'cited_count': len(cited_indices_in_combined),
+            'cited_doc_ids': cited_doc_ids
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
 @app.route('/api/tokenized_results', methods=['POST'])
 def tokenized_results():
     """Get tokenized results for selected documents."""
@@ -759,16 +1332,29 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Interactive embeddings visualization web app")
     parser.add_argument("--port", type=int, default=5000, help="Port to run the server on")
     parser.add_argument("--host", type=str, default="127.0.0.1", 
-                       help="Host to bind to. Use '0.0.0.0' for remote access (e.g., SSH/cluster)")
+                       help="Host to bind to. Use '0.0.0.0' for network access, '127.0.0.1' for SSH forwarding")
     parser.add_argument("--debug", action="store_true", help="Run in debug mode")
     parser.add_argument("--remote", action="store_true", 
-                       help="Shortcut: bind to 0.0.0.0 for remote access (useful for SSH/cluster)")
+                       help="Shortcut: bind to 0.0.0.0 for network access (NOT recommended for SSH forwarding)")
+    parser.add_argument("--ssh-forward", action="store_true",
+                       help="Optimized for SSH port forwarding: bind to 127.0.0.1 (recommended for SSH)")
     
     args = parser.parse_args()
     
-    # If --remote flag is set, override host
-    if args.remote:
+    # Priority: --ssh-forward > --remote > --host
+    if args.ssh_forward:
+        args.host = "127.0.0.1"
+    elif args.remote:
         args.host = "0.0.0.0"
+    
+    # Get hostname for better SSH forwarding instructions
+    import socket
+    try:
+        hostname = socket.gethostname()
+        hostname_fqdn = socket.getfqdn()
+    except:
+        hostname = "unknown"
+        hostname_fqdn = "unknown"
     
     print(f"\n{'='*70}")
     print(f"Starting interactive embeddings visualization server...")
@@ -778,16 +1364,42 @@ if __name__ == '__main__':
         print(f"\n🌐 Server bound to 0.0.0.0 (accessible from network)")
         print(f"   Local access: http://localhost:{args.port}")
         print(f"   Remote access: http://<node-ip>:{args.port}")
-        print(f"\n📡 For SSH port forwarding, run on your local machine:")
-        print(f"   ssh -L {args.port}:localhost:{args.port} <username>@<cluster-address>")
+        print(f"\n📡 For SSH port forwarding:")
+        print(f"   On your LOCAL machine, run:")
+        if hostname != "unknown":
+            print(f"   ssh -L {args.port}:localhost:{args.port} $(whoami)@{hostname}")
+            print(f"   Or if on SLURM cluster:")
+            print(f"   ssh -L {args.port}:{hostname}:{args.port} $(whoami)@<login-node>")
+        else:
+            print(f"   ssh -L {args.port}:localhost:{args.port} <username>@<cluster-address>")
         print(f"   Then open: http://localhost:{args.port}")
+        print(f"\n⚠️  Note: For SSH forwarding, consider using --ssh-forward instead of --remote")
     else:
-        print(f"\n🔒 Server bound to {args.host} (localhost only)")
+        print(f"\n🔒 Server bound to {args.host} (localhost only - perfect for SSH forwarding)")
         print(f"   Access at: http://localhost:{args.port}")
-        print(f"\n💡 For remote access via SSH, use:")
-        print(f"   1. Run with: python app.py --remote --port {args.port}")
-        print(f"   2. On local machine: ssh -L {args.port}:localhost:{args.port} <username>@<cluster>")
-        print(f"   3. Open browser: http://localhost:{args.port}")
+        print(f"\n📡 For SSH port forwarding:")
+        print(f"   1. Keep this server running on the remote machine")
+        print(f"   2. On your LOCAL machine, open a NEW terminal and run:")
+        if hostname != "unknown":
+            print(f"      Option A - Direct connection (if accessible):")
+            print(f"      ssh -L {args.port}:localhost:{args.port} $(whoami)@{hostname}")
+            print(f"\n      Option B - SLURM cluster (two-hop via login node):")
+            print(f"      Method 1 - Using ProxyJump (recommended, one command):")
+            print(f"      ssh -L {args.port}:localhost:{args.port} -J $(whoami)@<login-node> $(whoami)@{hostname}")
+            print(f"\n      Method 2 - Two separate commands:")
+            print(f"      Step 1: ssh -L {args.port}:localhost:{args.port} $(whoami)@<login-node>")
+            print(f"      Step 2: (in another terminal or background) ssh -L {args.port}:localhost:{args.port} {hostname}")
+            print(f"\n      Example for CLEPS cluster:")
+            print(f"      ssh -L {args.port}:localhost:{args.port} -J yzuo@cleps yzuo@{hostname}")
+        else:
+            print(f"      ssh -L {args.port}:localhost:{args.port} <username>@<cluster-address>")
+        print(f"\n   3. Open browser on LOCAL machine: http://localhost:{args.port}")
+        print(f"\n💡 Current hostname: {hostname}")
+        print(f"   If connection fails, check:")
+        print(f"   - SSH port forwarding is active (check with: ps aux | grep ssh)")
+        print(f"   - For SLURM: you need TWO hops (login node -> compute node)")
+        print(f"   - Server is bound to 127.0.0.1, so forward to 'localhost', not hostname")
+        print(f"   - Firewall is not blocking the port")
     
     print(f"{'='*70}\n")
     

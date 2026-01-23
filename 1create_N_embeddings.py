@@ -167,7 +167,7 @@ def main():
     if total_spans > args.max_spans:
         print(f"\n{'='*80}")
         print(f"Sampling {args.max_spans:,} spans from {total_spans:,} total spans (across all sections)")
-        print(f"Strategy: {args.sampling}")
+        print(f"Strategy: random sampling (proportional per section)")
         
         # Calculate per-section sampling budget (proportional to section size)
         section_sizes = {s: len(emb) if emb is not None else 0 for s, emb in embeddings_by_section.items()}
