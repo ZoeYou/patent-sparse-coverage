@@ -176,8 +176,14 @@ def create_contextual_span_embeddings(documents: dict, model, tokenizer, unit: s
         metadata: List of dicts with span info
     """
     model.eval()
-    # Separate embeddings by section
+    # Separate embeddings by section - use lists of numpy arrays for chunked accumulation
     all_embeddings_by_section = {
+        'abstract': [],
+        'claim': [],
+        'invention': []
+    }
+    # Temporary lists for accumulating embeddings before chunking
+    temp_embeddings_by_section = {
         'abstract': [],
         'claim': [],
         'invention': []
@@ -199,6 +205,20 @@ def create_contextual_span_embeddings(documents: dict, model, tokenizer, unit: s
     # Process in batches
     print(f"\nExtracting contextual span embeddings (batch size={batch_size})...")
     num_batches = (len(doc_data) + batch_size - 1) // batch_size
+    
+    # Chunk size: convert to numpy arrays every N batches to reduce peak memory
+    # For memory-intensive units, chunk more frequently
+    chunk_frequency = 20 if unit == "encoder_token" else 50
+    
+    def _chunk_embeddings():
+        """Convert accumulated embeddings to numpy arrays and clear temp lists."""
+        for section in ['abstract', 'claim', 'invention']:
+            if len(temp_embeddings_by_section[section]) > 0:
+                chunk_array = np.vstack(temp_embeddings_by_section[section])
+                all_embeddings_by_section[section].append(chunk_array)
+                temp_embeddings_by_section[section] = []
+                import gc
+                gc.collect()
     
     # Note: We'll process embeddings per section after all batches are done
     for batch_idx in tqdm(range(num_batches), desc="Processing batches"):
@@ -227,8 +247,8 @@ def create_contextual_span_embeddings(documents: dict, model, tokenizer, unit: s
             
             # Store results with proper metadata tracking, separated by section
             for doc_id, section, doc_text, span_text_raw, span_text_canonical, span_emb in batch_results:
-                if section in all_embeddings_by_section:
-                    all_embeddings_by_section[section].append(span_emb)
+                if section in temp_embeddings_by_section:
+                    temp_embeddings_by_section[section].append(span_emb)
                 all_metadata.append({
                     'doc_id': doc_id,
                     'section': section,
@@ -248,6 +268,9 @@ def create_contextual_span_embeddings(documents: dict, model, tokenizer, unit: s
             traceback.print_exc()
             continue
         
+        # Periodically chunk embeddings to reduce peak memory usage
+        if (batch_idx + 1) % chunk_frequency == 0:
+            _chunk_embeddings()
         
         # Clear GPU cache more frequently for memory-intensive units
         cache_frequency = 5 if unit == "encoder_token" else 10
@@ -256,16 +279,20 @@ def create_contextual_span_embeddings(documents: dict, model, tokenizer, unit: s
             import gc
             gc.collect()
     
-    # Convert embeddings per section to numpy arrays
+    # Final chunking for any remaining embeddings
+    _chunk_embeddings()
+    
+    # Convert embeddings per section to numpy arrays (concatenate chunks)
     embeddings_by_section = {}
     total_embeddings = 0
     
     for section in ['abstract', 'claim', 'invention']:
         if len(all_embeddings_by_section[section]) > 0:
-            print(f"Converting {len(all_embeddings_by_section[section])} embeddings for section '{section}'...")
+            print(f"Converting {sum(len(chunk) for chunk in all_embeddings_by_section[section])} embeddings for section '{section}'...")
+            # Concatenate all chunks
             embeddings_by_section[section] = np.vstack(all_embeddings_by_section[section])
             total_embeddings += len(embeddings_by_section[section])
-            # Clear list to free memory
+            # Clear chunks to free memory
             all_embeddings_by_section[section] = []
         else:
             embeddings_by_section[section] = None
@@ -800,3 +827,167 @@ def process_doc_batch(doc_texts: List[str],
     del encoding  # Also clean up the encoding dict
     
     return all_span_embeddings
+
+
+# ============================================================================
+# Embedding file and directory parsing utilities
+# ============================================================================
+
+def parse_embedding_filename(filename: str) -> dict:
+    """
+    Parse embedding filename to extract task, model, tokenization info.
+    
+    Expected format: patent_contextual_spans_{mode}_{model_name}_{unit}_{cls_suffix}.{ext}
+    
+    Example: patent_contextual_spans_abstract2abstract_PatentMap-V0-SecPair-Claim_spacy_token_cls.npy
+    
+    Returns dict with keys: mode, model_name, unit, cls_suffix, or None if parsing fails.
+    """
+    import os
+    basename = os.path.basename(filename)
+    # Remove extension
+    name_without_ext = os.path.splitext(basename)[0]
+    # Handle .npz files (remove .npz extension)
+    if name_without_ext.endswith('.npz'):
+        name_without_ext = name_without_ext[:-4]
+    
+    # Pattern: patent_contextual_spans_{mode}_{model_name}_{unit}_{cls_suffix}
+    pattern = r'patent_contextual_spans_(.+?)_(.+?)_(.+?)_(cls|nocls)$'
+    match = re.match(pattern, name_without_ext)
+    
+    if match:
+        return {
+            'mode': match.group(1),  # abstract2abstract or claim2all
+            'model_name': match.group(2),  # e.g., PatentMap-V0-SecPair-Claim
+            'unit': match.group(3),  # e.g., spacy_token, encoder_token
+            'cls_suffix': match.group(4)  # cls or nocls
+        }
+    else:
+        # Try alternative pattern (without cls suffix, for backward compatibility)
+        pattern_alt = r'patent_contextual_spans_(.+?)_(.+?)_(.+?)$'
+        match_alt = re.match(pattern_alt, name_without_ext)
+        if match_alt:
+            return {
+                'mode': match_alt.group(1),
+                'model_name': match_alt.group(2),
+                'unit': match_alt.group(3),
+                'cls_suffix': 'unknown'
+            }
+        return None
+
+
+def parse_embeddings_dir(dirname: str) -> dict:
+    """
+    Parse embeddings directory name from 1create_N_embeddings.py output.
+    
+    Expected format: embeddings_{model_name}_{unit}_{cls}_{layer}
+    
+    Example: embeddings_bert-for-patents_spacy_token_cls_last
+    
+    Returns dict with keys: model_name, unit, cls_suffix, layer, or None if parsing fails.
+    """
+    import os
+    basename = os.path.basename(dirname)
+    
+    # Pattern: embeddings_{model_name}_{unit}_{cls}_{layer}
+    pattern = r'embeddings_(.+?)_(.+?)_(cls|nocls)_(last|second_last)$'
+    match = re.match(pattern, basename)
+    
+    if match:
+        return {
+            'model_name': match.group(1),  # e.g., bert-for-patents
+            'unit': match.group(2),  # e.g., spacy_token, spacy_sentence
+            'cls_suffix': match.group(3),  # cls or nocls
+            'layer': match.group(4)  # last or second_last
+        }
+    return None
+
+
+def find_embedding_files(embeddings_dir: str, mode: str, unit: str = None) -> list:
+    """
+    Find embedding files in directory from 1create_N_embeddings.py output based on task mode.
+    
+    For abstract2abstract: returns [abstract_{unit}.npy/npz]
+    For claim2all: returns [abstract_{unit}.npy/npz, claim_{unit}.npy/npz, invention_{unit}.npy/npz]
+    
+    If unit is not provided, tries to infer from directory name or scans for available files.
+    
+    Returns list of file paths, or empty list if not found.
+    """
+    import os
+    if not os.path.isdir(embeddings_dir):
+        return []
+    
+    # Determine which sections are needed based on mode
+    if mode == "abstract2abstract":
+        required_sections = ['abstract']
+    elif mode == "claim2all":
+        required_sections = ['abstract', 'claim', 'invention']
+    else:
+        raise ValueError(f"Unknown mode: {mode}. Supported modes: abstract2abstract, claim2all")
+    
+    # If unit not provided, try to infer from directory name
+    if unit is None:
+        dir_info = parse_embeddings_dir(embeddings_dir)
+        if dir_info:
+            unit = dir_info['unit']
+        else:
+            # Scan for available files to infer unit
+            for f in os.listdir(embeddings_dir):
+                for section in required_sections:
+                    if f.startswith(f"{section}_") and (f.endswith('.npy') or f.endswith('.npz')):
+                        # Extract unit from filename: {section}_{unit}.{ext}
+                        unit = f.replace(f"{section}_", "").replace('.npy', '').replace('.npz', '')
+                        break
+                if unit:
+                    break
+    
+    if unit is None:
+        return []
+    
+    # Find files for each required section
+    found_files = []
+    for section in required_sections:
+        # Try .npy first, then .npz
+        for ext in ['.npy', '.npz']:
+            filepath = os.path.join(embeddings_dir, f"{section}_{unit}{ext}")
+            if os.path.exists(filepath):
+                found_files.append(filepath)
+                break
+    
+    # Return only if all required sections are found
+    if len(found_files) == len(required_sections):
+        return found_files
+    else:
+        return []
+
+
+# ============================================================================
+# Vector normalization utilities
+# ============================================================================
+
+def l2_normalize(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """
+    L2-normalize vectors (returns new array, non-destructive).
+    
+    Args:
+        X: Array of shape [N, d] to normalize
+        eps: Small epsilon to prevent division by zero
+    
+    Returns:
+        Normalized array of same shape
+    """
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    return X / np.clip(norms, eps, None)
+
+
+def l2_normalize_inplace(X: np.ndarray, eps: float = 1e-12):
+    """
+    L2-normalize vectors in-place (modifies input array).
+    
+    Args:
+        X: Array of shape [N, d] to normalize (will be modified)
+        eps: Small epsilon to prevent division by zero
+    """
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    X /= np.clip(norms, eps, None)

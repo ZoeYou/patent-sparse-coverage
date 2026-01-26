@@ -53,6 +53,10 @@ _model_cache = {}
 _tokenizer_cache = {}
 _nlp_cache = None
 
+# Global cache for dimensionality reduction results
+_reduction_cache = {}
+_reduction_cache_size_limit = 10  # Maximum number of cached results
+
 
 def scan_embeddings_directories(base_dir: str = ".") -> List[Dict[str, str]]:
     """
@@ -313,11 +317,146 @@ def load_embeddings_and_metadata(embeddings_dir: str, sections: List[str], unit:
     return embeddings_by_section, metadata_by_section
 
 
+def _get_embeddings_hash(embeddings: np.ndarray) -> str:
+    """
+    Generate a hash for embeddings array to use as cache key.
+    Uses a sample of embeddings for efficiency.
+    """
+    import hashlib
+    # Use a sample of embeddings for hashing (faster)
+    sample_size = min(1000, len(embeddings))
+    if sample_size > 0:
+        sample_indices = np.linspace(0, len(embeddings) - 1, sample_size, dtype=int)
+        sample = embeddings[sample_indices]
+    else:
+        sample = embeddings
+    
+    # Create hash from sample and shape
+    hash_obj = hashlib.md5(sample.tobytes())
+    hash_obj.update(f"{embeddings.shape}".encode())
+    return hash_obj.hexdigest()
+
+
+def normalize_embeddings(embeddings: np.ndarray, norm: str = 'l2') -> np.ndarray:
+    """
+    Normalize embeddings using layer normalization.
+    
+    Args:
+        embeddings: Input embeddings array of shape (n_samples, n_features)
+        norm: Normalization type ('l2' for L2 normalization, 'none' for no normalization)
+    
+    Returns:
+        Normalized embeddings array
+    """
+    if norm == 'none' or norm is None:
+        return embeddings
+    
+    if norm == 'l2':
+        # L2 normalization: normalize each sample to unit length
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        # Avoid division by zero
+        norms = np.where(norms == 0, 1, norms)
+        normalized = embeddings / norms
+        
+        # Verify normalization: check that norms are approximately 1.0
+        normalized_norms = np.linalg.norm(normalized, axis=1)
+        avg_norm = np.mean(normalized_norms)
+        if not np.allclose(normalized_norms, 1.0, atol=1e-6):
+            print(f"Warning: L2 normalization may not be correct. Average norm: {avg_norm:.6f}")
+        
+        return normalized
+    
+    raise ValueError(f"Unknown normalization type: {norm}. Use 'l2' or 'none'.")
+
+
 def reduce_dimensions(embeddings: np.ndarray, method: str = 'umap', n_components: int = 2, 
-                     random_state: int = 42, n_neighbors: int = 15, min_dist: float = 0.1) -> np.ndarray:
+                     random_state: int = 42, n_neighbors: int = 15, min_dist: float = 0.1,
+                     use_cache: bool = True, whiten: bool = False, normalize: str = 'none') -> np.ndarray:
     """
-    Reduce embeddings to 2D for visualization.
+    Reduce embeddings to 2D for visualization with optional caching and normalization.
+    
+    Args:
+        embeddings: Input embeddings array
+        method: Reduction method ('umap', 'tsne', or 'pca')
+        n_components: Number of output dimensions (default: 2)
+        random_state: Random seed for reproducibility (not used for PCA)
+        n_neighbors: UMAP parameter
+        min_dist: UMAP parameter
+        use_cache: Whether to use cache for results
+        whiten: Whether to whiten PCA components (default: False)
+        normalize: Normalization type before reduction ('l2' for L2 normalization, 'none' for no normalization)
+    
+    Returns:
+        2D embeddings array
     """
+    global _reduction_cache, _reduction_cache_size_limit
+    
+    # Apply normalization if requested
+    original_embeddings = embeddings.copy()  # Keep original for comparison
+    if normalize and normalize != 'none':
+        embeddings = normalize_embeddings(embeddings, norm=normalize)
+        # Verify normalization was applied
+        sample_norm_before = np.linalg.norm(original_embeddings[0])
+        sample_norm_after = np.linalg.norm(embeddings[0])
+        print(f"Applied {normalize} normalization to embeddings before reduction")
+        print(f"  Sample vector norm: {sample_norm_before:.4f} -> {sample_norm_after:.4f}")
+    else:
+        print(f"No normalization applied (normalize='{normalize}')")
+    
+    # Create cache key if caching is enabled
+    if use_cache:
+        # Use normalized embeddings for cache key if normalization is applied
+        emb_hash = _get_embeddings_hash(embeddings)
+        cache_key = f"{emb_hash}_{method}_{n_components}_{random_state}_{n_neighbors}_{min_dist}_{whiten}_{normalize}"
+        
+        # Check cache
+        if cache_key in _reduction_cache:
+            print(f"Using cached reduction result for {method} (normalize={normalize})")
+            return _reduction_cache[cache_key]
+        else:
+            print(f"Cache miss for {method} (normalize={normalize}), computing new result...")
+    
+    # Compute reduction
+    if method == 'pca':
+        from sklearn.decomposition import PCA
+        
+        # PCA is deterministic and fast, good for large datasets
+        # Note: PCA doesn't use random_state, but we include it in cache key for consistency
+        reducer = PCA(
+            n_components=n_components,
+            whiten=whiten,
+            random_state=random_state  # For consistency, though PCA is deterministic
+        )
+        embeddings_2d = reducer.fit_transform(embeddings)
+        
+        # Print variance explained
+        explained_variance = reducer.explained_variance_ratio_
+        total_variance = explained_variance.sum()
+        print(f"PCA: Explained variance ratio: {explained_variance} (total: {total_variance:.2%})")
+        
+        # Print statistics about input embeddings (help debug normalization)
+        if normalize and normalize != 'none':
+            input_norms = np.linalg.norm(embeddings, axis=1)
+            print(f"  Input embeddings stats (after {normalize} normalization):")
+            print(f"    Mean norm: {np.mean(input_norms):.6f}, Std: {np.std(input_norms):.6f}")
+            print(f"    Min norm: {np.min(input_norms):.6f}, Max norm: {np.max(input_norms):.6f}")
+        else:
+            input_norms = np.linalg.norm(embeddings, axis=1)
+            print(f"  Input embeddings stats (no normalization):")
+            print(f"    Mean norm: {np.mean(input_norms):.6f}, Std: {np.std(input_norms):.6f}")
+            print(f"    Min norm: {np.min(input_norms):.6f}, Max norm: {np.max(input_norms):.6f}")
+        
+        # Store in cache if enabled
+        if use_cache:
+            if len(_reduction_cache) >= _reduction_cache_size_limit:
+                # Remove oldest entry (simple FIFO - remove first key)
+                oldest_key = next(iter(_reduction_cache))
+                del _reduction_cache[oldest_key]
+            _reduction_cache[cache_key] = embeddings_2d
+            print(f"Cached reduction result for {method}")
+        
+        return embeddings_2d
+    
     if method == 'umap':
         if not UMAP_AVAILABLE:
             method = 'tsne'
@@ -330,6 +469,16 @@ def reduce_dimensions(embeddings: np.ndarray, method: str = 'umap', n_components
                 verbose=False
             )
             embeddings_2d = reducer.fit_transform(embeddings)
+            
+            # Store in cache if enabled
+            if use_cache:
+                if len(_reduction_cache) >= _reduction_cache_size_limit:
+                    # Remove oldest entry (simple FIFO - remove first key)
+                    oldest_key = next(iter(_reduction_cache))
+                    del _reduction_cache[oldest_key]
+                _reduction_cache[cache_key] = embeddings_2d
+                print(f"Cached reduction result for {method}")
+            
             return embeddings_2d
     
     if method == 'tsne':
@@ -349,6 +498,16 @@ def reduce_dimensions(embeddings: np.ndarray, method: str = 'umap', n_components
             verbose=0
         )
         embeddings_2d = reducer.fit_transform(embeddings_pca)
+        
+        # Store in cache if enabled
+        if use_cache:
+            if len(_reduction_cache) >= _reduction_cache_size_limit:
+                # Remove oldest entry
+                oldest_key = next(iter(_reduction_cache))
+                del _reduction_cache[oldest_key]
+            _reduction_cache[cache_key] = embeddings_2d
+            print(f"Cached reduction result for {method}")
+        
         return embeddings_2d
     
     raise ValueError(f"Unknown reduction method: {method}")
@@ -365,6 +524,172 @@ def find_embeddings_for_doc(metadata: List[Dict], embeddings: np.ndarray, doc_id
             selected_metadata.append(meta)
     
     return indices, selected_metadata
+
+
+def find_all_doc_embeddings(metadata: List[Dict], embeddings: np.ndarray, doc_ids: List[str]) -> Tuple[List[int], List[Dict]]:
+    """
+    Find all embeddings and metadata entries for multiple documents.
+    
+    Args:
+        metadata: Full metadata list
+        embeddings: Full embeddings array (for shape validation)
+        doc_ids: List of document IDs to find
+    
+    Returns:
+        (indices, selected_metadata)
+    """
+    indices = []
+    selected_metadata = []
+    
+    for doc_id in doc_ids:
+        for i, meta in enumerate(metadata):
+            if meta.get('doc_id') == doc_id:
+                indices.append(i)
+                selected_metadata.append(meta)
+    
+    return indices, selected_metadata
+
+
+def combine_section_embeddings(
+    embeddings_by_section: Dict[str, np.ndarray],
+    metadata_by_section: Dict[str, List[Dict]],
+    sections: List[str]
+) -> Tuple[np.ndarray, List[Dict], Dict[str, int]]:
+    """
+    Combine embeddings and metadata from multiple sections.
+    
+    Args:
+        embeddings_by_section: Dict mapping section -> embeddings array
+        metadata_by_section: Dict mapping section -> list of metadata dicts
+        sections: List of sections to combine
+    
+    Returns:
+        (combined_embeddings, combined_metadata, section_offsets)
+        section_offsets: Dict mapping section -> starting index in combined array
+    """
+    all_embeddings = []
+    all_metadata = []
+    section_offsets = {}
+    
+    for section in sections:
+        if section in embeddings_by_section:
+            section_offsets[section] = len(all_embeddings)
+            all_embeddings.append(embeddings_by_section[section])
+            all_metadata.extend(metadata_by_section[section])
+    
+    if not all_embeddings:
+        raise ValueError('No embeddings found in selected sections')
+    
+    return np.vstack(all_embeddings), all_metadata, section_offsets
+
+
+def subsample_embeddings_preserve_selected(
+    embeddings: np.ndarray,
+    metadata: List[Dict],
+    selected_indices: set,
+    max_embeddings: int,
+    random_seed: int = 42
+) -> Tuple[np.ndarray, List[Dict], Dict[int, int]]:
+    """
+    Subsample embeddings while preserving selected indices.
+    
+    Args:
+        embeddings: Full embeddings array
+        metadata: Full metadata list
+        selected_indices: Set of indices that must be preserved
+        max_embeddings: Maximum number of embeddings to keep
+        random_seed: Random seed for reproducibility
+    
+    Returns:
+        (subsampled_embeddings, subsampled_metadata, index_mapping)
+        index_mapping: Maps old_index -> new_index
+    """
+    if len(embeddings) <= max_embeddings:
+        # No subsampling needed
+        index_mapping = {i: i for i in range(len(embeddings))}
+        return embeddings, metadata, index_mapping
+    
+    num_selected = len(selected_indices)
+    num_available = max_embeddings - num_selected
+    
+    if num_available < 0:
+        # If selected items exceed max, keep only selected
+        indices_to_keep = sorted(list(selected_indices))
+    else:
+        # Randomly sample from non-selected indices
+        all_indices = set(range(len(embeddings)))
+        non_selected_indices = list(all_indices - selected_indices)
+        
+        np.random.seed(random_seed)
+        if len(non_selected_indices) > num_available:
+            sampled = np.random.choice(
+                non_selected_indices,
+                size=num_available,
+                replace=False
+            ).tolist()
+        else:
+            sampled = non_selected_indices
+        
+        indices_to_keep = sorted(list(selected_indices) + sampled)
+    
+    # Create mapping from old indices to new indices
+    index_mapping = {old: new for new, old in enumerate(indices_to_keep)}
+    
+    # Apply subsampling
+    subsampled_embeddings = embeddings[indices_to_keep]
+    subsampled_metadata = [metadata[i] for i in indices_to_keep]
+    
+    return subsampled_embeddings, subsampled_metadata, index_mapping
+
+
+def update_indices_after_subsampling(
+    original_indices: List[int],
+    index_mapping: Dict[int, int]
+) -> List[int]:
+    """
+    Update indices list after subsampling.
+    
+    Args:
+        original_indices: Original indices before subsampling
+        index_mapping: Mapping from old_index -> new_index
+    
+    Returns:
+        Updated indices after subsampling
+    """
+    updated = [index_mapping[i] for i in original_indices if i in index_mapping]
+    return updated
+
+
+def parse_visualization_params(data: dict) -> dict:
+    """
+    Parse visualization parameters with backward compatibility.
+    
+    Args:
+        data: Request JSON data
+    
+    Returns:
+        Parsed parameters dict
+    """
+    # Handle sections parameter (support both 'section' and 'sections')
+    sections = data.get('sections', None)
+    if sections is None:
+        section = data.get('section', 'abstract')
+        sections = [section] if isinstance(section, str) else section
+    
+    if isinstance(sections, str):
+        sections = [sections]
+    
+    return {
+        'embeddings_dir': data.get('embeddings_dir'),
+        'sections': sections,
+        'unit': data.get('unit'),
+        'reduction': data.get('reduction', 'umap'),
+        'n_neighbors': data.get('n_neighbors', 15),
+        'min_dist': data.get('min_dist', 0.1),
+        'max_embeddings': data.get('max_embeddings', 50000),
+        'whiten': data.get('whiten', False),  # PCA parameter: whether to whiten components
+        'normalize': data.get('normalize', 'none'),  # Normalization type: 'l2' or 'none'
+    }
 
 
 def format_text_for_hover(text: str, max_line_length: int = 60) -> str:
@@ -771,21 +1096,15 @@ def load_embeddings():
 def visualize():
     """Generate visualization for selected embeddings."""
     data = request.json
-    embeddings_dir = data.get('embeddings_dir')
-    sections = data.get('sections', ['abstract'])  # Now accepts multiple sections
-    unit = data.get('unit', 'spacy_token')
-    doc_ids = data.get('doc_ids', [])
-    reduction = data.get('reduction', 'umap')
-    n_neighbors = data.get('n_neighbors', 15)
-    min_dist = data.get('min_dist', 0.1)
-    max_embeddings = data.get('max_embeddings', 50000)
     
-    if not embeddings_dir:
+    if not data.get('embeddings_dir'):
         return jsonify({'error': 'embeddings_dir is required'}), 400
     
-    # Ensure sections is a list
-    if isinstance(sections, str):
-        sections = [sections]
+    # Parse parameters (with backward compatibility)
+    params = parse_visualization_params(data)
+    sections = params['sections']
+    unit = params.get('unit') or data.get('unit', 'spacy_token')
+    doc_ids = data.get('doc_ids', [])
     
     # Debug: print received sections
     print(f"Received sections for visualization: {sections}")
@@ -793,95 +1112,59 @@ def visualize():
     try:
         # Load embeddings for all selected sections
         embeddings_by_section, metadata_by_section = load_embeddings_and_metadata(
-            embeddings_dir, sections, unit
+            params['embeddings_dir'], sections, unit
         )
         
         if not embeddings_by_section:
             return jsonify({'error': 'No sections found'}), 404
         
-        # Combine embeddings from all sections, preserving section information
-        all_embeddings = []
-        all_metadata = []
-        section_offsets = {}  # Track where each section starts in combined array
-        
-        for section in sections:
-            if section in embeddings_by_section:
-                section_embeddings = embeddings_by_section[section]
-                section_metadata = metadata_by_section[section]
-                
-                section_offsets[section] = len(all_embeddings)
-                all_embeddings.append(section_embeddings)
-                all_metadata.extend(section_metadata)
-        
-        if not all_embeddings:
-            return jsonify({'error': 'No embeddings found in selected sections'}), 404
-        
-        # Concatenate all embeddings
-        embeddings = np.vstack(all_embeddings)
-        metadata = all_metadata
+        # Combine embeddings from all sections using helper function
+        embeddings, metadata, section_offsets = combine_section_embeddings(
+            embeddings_by_section, metadata_by_section, sections
+        )
         
         # Find selected document indices BEFORE subsampling to ensure they're preserved
         selected_doc_indices = set()
         if doc_ids:
-            for doc_id in doc_ids:
-                for i, meta in enumerate(metadata):
-                    if meta.get('doc_id') == doc_id:
-                        selected_doc_indices.add(i)
+            selected_indices_list, _ = find_all_doc_embeddings(metadata, embeddings, doc_ids)
+            selected_doc_indices = set(selected_indices_list)
         
         # Subsample if too large, but preserve selected document indices
-        subsample_mapping = {}  # Maps old index -> new index
-        if len(embeddings) > max_embeddings:
-            # Calculate how many embeddings we need to reserve for selected documents
-            num_selected = len(selected_doc_indices)
-            num_available = max_embeddings - num_selected
-            
-            if num_available < 0:
-                # If selected documents need more than max_embeddings, use all selected
-                indices_to_keep = sorted(list(selected_doc_indices))
-            else:
-                # Randomly sample from non-selected indices
-                all_indices = set(range(len(embeddings)))
-                non_selected_indices = list(all_indices - selected_doc_indices)
-                
-                if len(non_selected_indices) > num_available:
-                    sampled_indices = np.random.choice(
-                        non_selected_indices, 
-                        size=num_available, 
-                        replace=False
-                    ).tolist()
-                else:
-                    sampled_indices = non_selected_indices
-                
-                # Combine selected and sampled indices
-                indices_to_keep = sorted(list(selected_doc_indices) + sampled_indices)
-            
-            # Create mapping from old indices to new indices
-            for new_idx, old_idx in enumerate(indices_to_keep):
-                subsample_mapping[old_idx] = new_idx
-            
-            # Apply subsampling
-            embeddings = embeddings[indices_to_keep]
-            metadata = [metadata[i] for i in indices_to_keep]
-            print(f"Subsampled from {len(embeddings_by_section[list(embeddings_by_section.keys())[0]])} to {len(embeddings)} embeddings")
-            print(f"Preserved {len(selected_doc_indices)} embeddings from selected documents")
-        
-        # Reduce dimensions
-        embeddings_2d = reduce_dimensions(
-            embeddings,
-            method=reduction,
-            n_neighbors=n_neighbors,
-            min_dist=min_dist
+        embeddings, metadata, index_mapping = subsample_embeddings_preserve_selected(
+            embeddings, metadata, selected_doc_indices, params['max_embeddings']
         )
         
-        # Find selected embeddings (after subsampling, indices are already correct)
+        if len(selected_doc_indices) > 0:
+            original_count = len(embeddings_by_section[list(embeddings_by_section.keys())[0]])
+            print(f"Subsampled from {original_count} to {len(embeddings)} embeddings")
+            print(f"Preserved {len(selected_doc_indices)} embeddings from selected documents")
+        
+        # Reduce dimensions (with caching)
+        embeddings_2d = reduce_dimensions(
+            embeddings,
+            method=params['reduction'],
+            n_neighbors=params['n_neighbors'],
+            min_dist=params['min_dist'],
+            whiten=params.get('whiten', False),
+            normalize=params.get('normalize', 'none'),
+            use_cache=True
+        )
+        
+        # Find selected embeddings (after subsampling, need to update indices)
         selected_indices = []
         selected_metadata_list = []
         
         if doc_ids:
-            for doc_id in doc_ids:
-                indices, meta_list = find_embeddings_for_doc(metadata, embeddings, doc_id)
-                selected_indices.extend(indices)
-                selected_metadata_list.extend(meta_list)
+            # Update indices after subsampling
+            updated_selected_indices = update_indices_after_subsampling(
+                list(selected_doc_indices), index_mapping
+            )
+            
+            # Get metadata for selected indices
+            for idx in updated_selected_indices:
+                if idx < len(metadata):
+                    selected_indices.append(idx)
+                    selected_metadata_list.append(metadata[idx])
             
             print(f"Found {len(selected_indices)} embeddings to highlight for {len(doc_ids)} document(s)")
         
@@ -1105,16 +1388,21 @@ def visualize_query_citations():
     data = request.json
     embeddings_dir = data.get('embeddings_dir')
     query_id = data.get('query_id')
-    section = data.get('section', 'abstract')
     queries_file = data.get('queries_file', './downstream/perf200/content/queries.json')
     mapping_file = data.get('mapping_file', './downstream/perf200/mapping/gold.json')
-    reduction = data.get('reduction', 'umap')
-    n_neighbors = data.get('n_neighbors', 15)
-    min_dist = data.get('min_dist', 0.1)
-    max_embeddings = data.get('max_embeddings', 50000)
     
     if not embeddings_dir or not query_id:
         return jsonify({'error': 'embeddings_dir and query_id are required'}), 400
+    
+    # Parse visualization parameters (with backward compatibility)
+    params = parse_visualization_params(data)
+    sections = params['sections']
+    
+    if not sections:
+        return jsonify({'error': 'At least one section must be specified'}), 400
+    
+    # Debug: print received sections
+    print(f"Received sections for query-citations visualization: {sections}")
     
     try:
         # Parse embeddings_dir to get parameters
@@ -1137,25 +1425,27 @@ def visualize_query_citations():
         
         query_doc = queries[query_id]
         
-        # Format query text based on section (matching document format)
-        if section == 'abstract':
-            title = query_doc.get('title', '').strip()
-            abstract = query_doc.get('abstract', '').strip()
-            if not abstract:
-                return jsonify({'error': f'Query {query_id} has no {section} section'}), 404
-            query_text = f"{title} [SEP] [abstract] {abstract}".strip() if title else f"[abstract] {abstract}".strip()
-        elif section == 'claim':
-            query_text = query_doc.get('claim', '').strip()
-            if not query_text:
-                return jsonify({'error': f'Query {query_id} has no {section} section'}), 404
-            query_text = f"[claim] {query_text}".strip()
-        elif section == 'invention':
-            query_text = query_doc.get('invention', '').strip()
-            if not query_text:
-                return jsonify({'error': f'Query {query_id} has no {section} section'}), 404
-            query_text = f"[invention] {query_text}".strip()
-        else:
-            return jsonify({'error': f'Invalid section: {section}'}), 400
+        # Helper function to format query text for a section
+        def format_query_text_for_section(section: str) -> str:
+            """Format query text for a given section."""
+            if section == 'abstract':
+                title = query_doc.get('title', '').strip()
+                abstract = query_doc.get('abstract', '').strip()
+                if not abstract:
+                    raise ValueError(f'Query {query_id} has no {section} section')
+                return f"{title} [SEP] [abstract] {abstract}".strip() if title else f"[abstract] {abstract}".strip()
+            elif section == 'claim':
+                query_text = query_doc.get('claim', '').strip()
+                if not query_text:
+                    raise ValueError(f'Query {query_id} has no {section} section')
+                return f"[claim] {query_text}".strip()
+            elif section == 'invention':
+                query_text = query_doc.get('invention', '').strip()
+                if not query_text:
+                    raise ValueError(f'Query {query_id} has no {section} section')
+                return f"[invention] {query_text}".strip()
+            else:
+                raise ValueError(f'Invalid section: {section}')
         
         # Load citation mapping
         citation_mapping = load_citation_mapping(mapping_file)
@@ -1164,85 +1454,109 @@ def visualize_query_citations():
         if not cited_doc_ids:
             return jsonify({'error': f'Query {query_id} has no cited documents'}), 404
         
-        print(f"Computing embeddings for query {query_id} (section: {section})")
+        print(f"Computing embeddings for query {query_id} (sections: {sections})")
         print(f"Found {len(cited_doc_ids)} cited documents")
         
-        # Compute query embeddings
-        query_embeddings, query_metadata = compute_query_embeddings(
-            query_text=query_text,
-            section=section,
-            embeddings_dir=embeddings_dir,
-            unit=unit,
-            keep_cls=keep_cls,
-            layer=layer
-        )
+        # Compute query embeddings for each section
+        all_query_embeddings = []
+        all_query_metadata = []
+        available_sections = []
         
-        # Load document embeddings
+        for section in sections:
+            try:
+                query_text = format_query_text_for_section(section)
+                query_embeddings, query_metadata = compute_query_embeddings(
+                    query_text=query_text,
+                    section=section,
+                    embeddings_dir=embeddings_dir,
+                    unit=unit,
+                    keep_cls=keep_cls,
+                    layer=layer
+                )
+                all_query_embeddings.append(query_embeddings)
+                all_query_metadata.extend(query_metadata)
+                available_sections.append(section)
+            except ValueError as e:
+                # Skip sections that don't exist for this query
+                print(f"Warning: {str(e)}, skipping section {section}")
+                continue
+        
+        if not available_sections:
+            return jsonify({'error': f'Query {query_id} has no valid sections from {sections}'}), 404
+        
+        # Update sections to only include available ones
+        sections = available_sections
+        
+        # Combine query embeddings from all sections
+        if all_query_embeddings:
+            query_embeddings = np.vstack(all_query_embeddings)
+        else:
+            return jsonify({'error': 'No query embeddings were generated'}), 500
+        
+        # Load document embeddings for ALL selected sections (ALL documents from the dataset)
         embeddings_by_section, metadata_by_section = load_embeddings_and_metadata(
-            embeddings_dir, [section], unit
+            embeddings_dir, sections, unit
         )
         
-        if section not in embeddings_by_section:
-            return jsonify({'error': f'Section {section} not found in embeddings'}), 404
+        if not embeddings_by_section:
+            return jsonify({'error': f'No sections found in embeddings'}), 404
         
-        doc_embeddings = embeddings_by_section[section]
-        doc_metadata = metadata_by_section[section]
+        # Combine document embeddings from all sections using helper function
+        doc_embeddings, doc_metadata, section_offsets = combine_section_embeddings(
+            embeddings_by_section, metadata_by_section, sections
+        )
         
-        # Find embeddings for cited documents
-        cited_indices = []
-        cited_metadata_list = []
-        for doc_id in cited_doc_ids:
-            indices, meta_list = find_embeddings_for_doc(doc_metadata, doc_embeddings, doc_id)
-            cited_indices.extend(indices)
-            cited_metadata_list.extend(meta_list)
+        # Find embeddings for cited documents across all sections using helper function
+        cited_indices_in_full_dataset, cited_metadata_list = find_all_doc_embeddings(
+            doc_metadata, doc_embeddings, cited_doc_ids
+        )
         
-        if not cited_indices:
+        if not cited_indices_in_full_dataset:
             return jsonify({'error': f'No embeddings found for cited documents'}), 404
         
-        # Combine query and cited document embeddings
-        all_embeddings = np.vstack([query_embeddings, doc_embeddings[cited_indices]])
-        all_metadata = query_metadata + cited_metadata_list
+        # Combine query embeddings with ALL document embeddings from the dataset
+        # This ensures dimensionality reduction is computed on the full corpus for better context
+        all_embeddings = np.vstack([query_embeddings, doc_embeddings])
+        all_metadata = all_query_metadata + doc_metadata
         
         # Create indices for visualization
+        # Query indices are at the beginning (0 to len(query_embeddings)-1)
         query_indices = list(range(len(query_embeddings)))
-        cited_indices_in_combined = [len(query_embeddings) + i for i in range(len(cited_indices))]
+        # Cited document indices are offset by query length
+        cited_indices_in_combined = [len(query_embeddings) + i for i in cited_indices_in_full_dataset]
         
-        # Subsample if needed (preserve query and cited documents)
-        selected_indices = set(query_indices + cited_indices_in_combined)
-        if len(all_embeddings) > max_embeddings:
-            num_available = max_embeddings - len(selected_indices)
-            if num_available > 0:
-                all_indices = set(range(len(all_embeddings)))
-                non_selected = list(all_indices - selected_indices)
-                if len(non_selected) > num_available:
-                    sampled = np.random.choice(non_selected, size=num_available, replace=False).tolist()
-                else:
-                    sampled = non_selected
-                indices_to_keep = sorted(list(selected_indices) + sampled)
-            else:
-                indices_to_keep = sorted(list(selected_indices))
-            
-            all_embeddings = all_embeddings[indices_to_keep]
-            all_metadata = [all_metadata[i] for i in indices_to_keep]
-            
-            # Update indices
-            index_mapping = {old: new for new, old in enumerate(indices_to_keep)}
-            query_indices = [index_mapping[i] for i in query_indices if i in index_mapping]
-            cited_indices_in_combined = [index_mapping[i] for i in cited_indices_in_combined if i in index_mapping]
+        # Subsample if needed (preserve query and cited documents) using helper function
+        selected_indices_set = set(query_indices + cited_indices_in_combined)
+        all_embeddings, all_metadata, index_mapping = subsample_embeddings_preserve_selected(
+            all_embeddings, all_metadata, selected_indices_set, params['max_embeddings']
+        )
         
-        # Reduce dimensions
+        # Update indices after subsampling
+        query_indices = update_indices_after_subsampling(query_indices, index_mapping)
+        cited_indices_in_combined = update_indices_after_subsampling(cited_indices_in_combined, index_mapping)
+        
+        print(f"Computing dimensionality reduction on {len(all_embeddings)} embeddings "
+              f"(query: {len(query_indices)}, cited: {len(cited_indices_in_combined)}, "
+              f"other documents: {len(all_embeddings) - len(query_indices) - len(cited_indices_in_combined)})")
+        
+        # Reduce dimensions on the full dataset (query + all documents) with caching
         embeddings_2d = reduce_dimensions(
             all_embeddings,
-            method=reduction,
-            n_neighbors=n_neighbors,
-            min_dist=min_dist
+            method=params['reduction'],
+            n_neighbors=params['n_neighbors'],
+            min_dist=params['min_dist'],
+            whiten=params.get('whiten', False),
+            normalize=params.get('normalize', 'none'),
+            use_cache=True
         )
         
         # Create visualization with query and cited documents highlighted
         selected_indices = query_indices + cited_indices_in_combined
         selected_metadata = [all_metadata[i] for i in selected_indices]
         
-        title = f"Query {query_id} ({section.upper()}) and {len(cited_doc_ids)} Cited Documents"
+        # Create title with all sections
+        sections_str = ', '.join([s.upper() for s in sections])
+        title = f"Query {query_id} ({sections_str}) and {len(cited_doc_ids)} Cited Documents"
         
         plot_data = create_plotly_visualization(
             embeddings_2d,
@@ -1250,14 +1564,15 @@ def visualize_query_citations():
             selected_indices=selected_indices,
             selected_metadata=selected_metadata,
             title=title,
-            sections=[section]
+            sections=sections  # Pass all sections for shape differentiation
         )
         
         return jsonify({
             'plot': plot_data,
             'query_count': len(query_indices),
             'cited_count': len(cited_indices_in_combined),
-            'cited_doc_ids': cited_doc_ids
+            'cited_doc_ids': cited_doc_ids,
+            'sections': sections  # Return the sections that were actually used
         })
     except Exception as e:
         import traceback
