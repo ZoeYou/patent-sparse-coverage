@@ -167,7 +167,7 @@ def collect_doc_texts(documents: dict, max_docs: int = None) -> List[Tuple[str, 
 
 
 
-def create_contextual_span_embeddings(documents: dict, model, tokenizer, unit: str, max_docs: int = None, batch_size: int = 64, max_length: int = 512, keep_cls: bool = True, layer: str = "last") -> Tuple[dict, List[dict]]:
+def create_contextual_span_embeddings(documents: dict, model, tokenizer, unit: str, max_docs: int = None, batch_size: int = 64, max_length: int = 512, keep_cls: bool = True, layer: str = "last", span_pooling: str = "mean") -> Tuple[dict, List[dict]]:
     """
     Create contextual span embeddings for all documents using batch processing.
     
@@ -242,7 +242,8 @@ def create_contextual_span_embeddings(documents: dict, model, tokenizer, unit: s
                 device=DEVICE,
                 max_length=max_length,
                 keep_cls=keep_cls,
-                layer=layer
+                layer=layer,
+                span_pooling=span_pooling
             )
             
             # Store results with proper metadata tracking, separated by section
@@ -505,14 +506,19 @@ def process_doc_batch(doc_texts: List[str],
                       doc_ids: List[str],
                       sections: List[str],
                       unit: str,
-                      model, tokenizer, device, max_length: int = 512, keep_cls: bool = True, layer: str = "last") -> List[Tuple[str, str, str, str, str, np.ndarray]]:
+                      model, tokenizer, device, max_length: int = 512, keep_cls: bool = True, layer: str = "last", span_pooling: str = "mean") -> List[Tuple[str, str, str, str, str, np.ndarray]]:
     """
     Process a batch of doc-section texts (one encoder pass per doc-section):
     1) Encode doc_texts in batch (max_length parameter, default 512)
     2) Derive visible char range from offset_mapping; truncate text to what encoder saw
     3) Run spaCy on truncated text ONLY; extract semantic units (token/sentence/doc/noun_chunk)
     4) Map unit char spans -> token spans via offset_mapping
-    5) Pool token embeddings for each unit
+    5) Pool token embeddings for each unit using specified method (mean or max)
+
+    Args:
+        span_pooling: Pooling method for aggregating token embeddings within a span.
+                     'mean' (default): averages all tokens in the span
+                     'max': takes maximum value across tokens for each dimension
 
     Returns: List of (doc_id, section, doc_text, span_text_raw, span_text_canonical, span_embedding)
              section is one of {"abstract","claim","invention"} (matching baselines.py style).
@@ -804,7 +810,13 @@ def process_doc_batch(doc_texts: List[str],
                         continue
 
             # IMPORTANT: do not drop tokens; pool over all tokens in the unit span
-            span_emb = token_embeddings[token_start:token_end].mean(dim=0)
+            # Pool multiple token embeddings into a single span embedding
+            if span_pooling == "max":
+                span_emb = token_embeddings[token_start:token_end].max(dim=0)[0]  # max returns (values, indices), take values
+            elif span_pooling == "mean":
+                span_emb = token_embeddings[token_start:token_end].mean(dim=0)
+            else:
+                raise ValueError(f"Unknown span_pooling method: {span_pooling}. Must be 'mean' or 'max'")
 
             span_emb = span_emb.cpu().numpy()
             span_emb = span_emb / (np.linalg.norm(span_emb) + 1e-12)

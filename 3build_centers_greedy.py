@@ -74,6 +74,8 @@ def build_output_dir(base_out_dir: str, embeddings_dir: str, mode: str) -> str:
     """
     Build output directory name that includes embedding source information.
     
+    Format matches baselines.py expectations: centers_greedy_{mode}_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}
+    
     If base_out_dir is provided and doesn't look like a default, use it as-is.
     Otherwise, extract info from embeddings_dir and build a descriptive directory name.
     """
@@ -82,14 +84,48 @@ def build_output_dir(base_out_dir: str, embeddings_dir: str, mode: str) -> str:
         return base_out_dir
     
     # Extract info from embeddings_dir
-    dir_info = parse_embeddings_dir(embeddings_dir)
+    # Normalize path first (remove trailing slash)
+    normalized_dir = embeddings_dir.rstrip('/')
+    dir_info = parse_embeddings_dir(normalized_dir)
+    
     if dir_info:
-        # Format: centers_greedy_{mode}_{model_name}_{unit}_{cls_suffix}
-        out_dir = f"centers_greedy_{mode}_{dir_info['model_name']}_{dir_info['unit']}_{dir_info['cls_suffix']}"
+        # Format: centers_greedy_{mode}_{model_name}_{unit}_{cls_suffix}_{layer}
+        # This matches baselines.py expected format: centers_greedy_{mode}_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}
+        model_name = dir_info['model_name']
+        tokenization_unit = dir_info['unit']  # e.g., spacy_token, spacy_sentence
+        cls_suffix = dir_info['cls_suffix']  # cls or nocls
+        layer = dir_info.get('layer', 'last')  # last or second_last, default to last if not found
+        
+        out_dir = f"centers_greedy_{mode}_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}"
         return out_dir
     
-    # Fallback: use directory name
-    basename = os.path.basename(embeddings_dir)
+    # Fallback: try to extract from directory name manually
+    # Handle case where parse_embeddings_dir fails (e.g., due to path format)
+    basename = os.path.basename(normalized_dir)
+    if basename.startswith('embeddings_'):
+        # Try to extract components manually
+        parts = basename.replace('embeddings_', '').split('_')
+        if len(parts) >= 4:
+            # Assume format: {model}_{unit}_{cls}_{layer}
+            # Model name might contain underscores, so we need to be careful
+            # Try to find cls/nocls and last/second_last positions
+            cls_pos = None
+            layer_pos = None
+            for i, part in enumerate(parts):
+                if part in ['cls', 'nocls']:
+                    cls_pos = i
+                elif part in ['last', 'second_last']:
+                    layer_pos = i
+            
+            if cls_pos is not None and layer_pos is not None and cls_pos < layer_pos:
+                model_name = '_'.join(parts[:cls_pos])
+                tokenization_unit = '_'.join(parts[cls_pos+1:layer_pos])
+                cls_suffix = parts[cls_pos]
+                layer = parts[layer_pos]  # last or second_last
+                out_dir = f"centers_greedy_{mode}_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}"
+                return out_dir
+    
+    # Final fallback: use directory name as-is
     return f"centers_greedy_{basename}_{mode}"
 
 
@@ -359,7 +395,7 @@ def main():
 
     ap.add_argument("--r", type=float, default=None,
                     help="Cosine distance radius (0~2). If not provided, will auto-select based on kNN distribution.")
-    ap.add_argument("--ref_size", type=int, default=100000,
+    ap.add_argument("--ref_size", type=int, default=0,
                     help="Build FAISS index on a reference subset of this size. Default 0=use full dataset (consistent with kmeans). Set to >0 to use subset (faster but less accurate).")
     ap.add_argument("--max_centers", type=int, default=50000, 
                     help="Maximum number of vocabulary centers to select (default: 50000).")
@@ -410,8 +446,8 @@ def main():
                     help="k for kNN distance distribution (default: 20). Only used if --r is not provided.")
     ap.add_argument("--auto_r_n_query", type=float, default=0.01,
                     help="Fraction of embeddings to use as query points for kNN distribution (default: 0.01, i.e., 1%%). "
-                         "The actual number will be min(n_query_ratio * N, N) where N is the total number of embeddings. "
-                         "Only used if --r is not provided.")
+                         "The actual number will be min(n_query_ratio * N, N, 5000) where N is the total number of embeddings. "
+                         "Maximum is capped at 5k to avoid excessive computation. Only used if --r is not provided.")
     ap.add_argument("--auto_r_n_sample_centers", type=int, default=0,
                     help="Number of centers to sample for sphere neighbor stats (default: 0, skip for faster coverage-only evaluation). "
                          "Set to >0 (e.g., 2000) to compute posting length statistics. "
@@ -487,8 +523,14 @@ def main():
               f"layer={embeddings_dir_info['layer']}")
 
     # Build output directory with embedding source information
+    # Format: centers_greedy_{mode}_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}
+    # This matches baselines.py expected format for automatic discovery
     args.out_dir = build_output_dir(args.out_dir, args.embeddings_dir, args.mode)
     print(f"[greedy] Output directory: {args.out_dir}")
+    if embeddings_dir_info:
+        layer = embeddings_dir_info.get('layer', 'last')
+        print(f"[greedy] Output dir format matches baselines.py expectations:")
+        print(f"[greedy]   Format: centers_greedy_{args.mode}_{embeddings_dir_info['model_name']}_{embeddings_dir_info['unit']}_{embeddings_dir_info['cls_suffix']}_{layer}")
     
     os.makedirs(args.out_dir, exist_ok=True)
     rng = np.random.default_rng(args.seed)
@@ -570,8 +612,8 @@ def main():
     if args.r is None:
         # Calculate actual number of query points based on fraction and reference set size
         n_query_actual = max(1, int(args.auto_r_n_query * N_ref))
-        n_query_actual = min(n_query_actual, N_ref)  # Ensure not exceeding total size
-        print(f"[auto_r] Using {args.auto_r_n_query:.1%} of reference set ({N_ref:,} points) = {n_query_actual:,} query points for kNN distribution")
+        n_query_actual = min(n_query_actual, N_ref, 5000)  # Cap at 5k to avoid excessive computation
+        print(f"[auto_r] Using {args.auto_r_n_query:.1%} of reference set ({N_ref:,} points) = {n_query_actual:,} query points for kNN distribution (capped at 5k)")
         
         if EVALUATE_R_AVAILABLE:
             # Use full evaluation strategy from evaluate_r.py
@@ -639,7 +681,6 @@ def main():
 
     centers_ref_ids = []
     gains = []
-    posting_lists = []  # Store posting list for each center: list of point indices assigned to each center
     coverage_history = []  # Store coverage after each center is added (for post-processing)
     t0 = time.time()
     t_last_iter = t0  # Track time of last iteration for time estimation
@@ -665,23 +706,34 @@ def main():
 
         covered_frac = 1.0 - (n_uncovered / N_ref)
 
-        # Adaptive optimization: reduce candidate pool size as coverage increases
+        # Adaptive optimization: reduce candidate pool size and increase centers per iteration as coverage increases
         # When coverage is high, we can use fewer candidates since remaining points are sparse
-        # This significantly speeds up later iterations without sacrificing much quality
+        # Also increase centers per iteration to reduce total iterations needed
         if covered_frac < 0.3:
-            # Early stage: use full candidate pool
+            # Early stage: use full candidate pool and default centers per iter
             adaptive_n_cand = args.n_candidates_per_iter
             adaptive_pool_size = args.density_pool_size
+            adaptive_n_centers_per_iter = args.n_centers_per_iter
         elif covered_frac < 0.6:
-            # Mid stage: reduce by 25%
+            # Mid stage: reduce candidate pool by 25%, keep default centers per iter
             adaptive_n_cand = max(100, int(args.n_candidates_per_iter * 0.75))
             adaptive_pool_size = max(adaptive_n_cand, int(args.density_pool_size * 0.75))
-        else:
-            # Late stage: reduce by 50% (coverage > 60%)
+            adaptive_n_centers_per_iter = args.n_centers_per_iter
+        elif covered_frac < 0.9:
+            # Late stage: reduce candidate pool by 50%, increase centers per iter by 2x
             adaptive_n_cand = max(100, int(args.n_candidates_per_iter * 0.5))
             adaptive_pool_size = max(adaptive_n_cand, int(args.density_pool_size * 0.5))
+            adaptive_n_centers_per_iter = args.n_centers_per_iter * 2
+        else:
+            # Very late stage (coverage > 90%): reduce candidate pool further, increase centers per iter by 3x
+            # This significantly reduces iterations when gain is very small
+            adaptive_n_cand = max(100, int(args.n_candidates_per_iter * 0.5))
+            adaptive_pool_size = max(adaptive_n_cand, int(args.density_pool_size * 0.5))
+            adaptive_n_centers_per_iter = args.n_centers_per_iter * 3
         
         n_cand = min(adaptive_n_cand, n_uncovered)
+        # Ensure adaptive_n_centers_per_iter doesn't exceed available candidates
+        adaptive_n_centers_per_iter = min(adaptive_n_centers_per_iter, n_cand)
         
         # Auto-disable density sampling when we have many uncovered points (more efficient)
         use_density_this_iter = (density_sampling_enabled and 
@@ -724,8 +776,8 @@ def main():
             
             if should_log:
                 adaptive_info = ""
-                if adaptive_n_cand < args.n_candidates_per_iter or adaptive_pool_size < args.density_pool_size:
-                    adaptive_info = f" [adaptive: n_cand={adaptive_n_cand}, pool={adaptive_pool_size}]"
+                if adaptive_n_cand < args.n_candidates_per_iter or adaptive_pool_size < args.density_pool_size or adaptive_n_centers_per_iter != args.n_centers_per_iter:
+                    adaptive_info = f" [adaptive: n_cand={adaptive_n_cand}, pool={adaptive_pool_size}, centers/iter={adaptive_n_centers_per_iter}]"
                 print(f"[greedy] Density sampling: pool={pool_size}, selected top {n_cand} by density "
                         f"(max={densities[top_density_idx[0]]}, min={densities[top_density_idx[-1]]}){adaptive_info}")
         else:
@@ -807,8 +859,10 @@ def main():
                     if result is not None:
                         candidate_gains.append(result)
                         
-                        # Early stopping check (only for n_centers_per_iter == 1)
-                        if args.n_centers_per_iter == 1 and result[1] >= early_stop_threshold:
+                        # Early stopping check (only for adaptive_n_centers_per_iter == 1)
+                        # Note: We check args.n_centers_per_iter here because early stopping only makes sense
+                        # when we're selecting 1 center per iteration (not adaptive)
+                        if args.n_centers_per_iter == 1 and adaptive_n_centers_per_iter == 1 and result[1] >= early_stop_threshold:
                             if should_log:
                                 print(f"[greedy] Early stop: found candidate with gain={result[1]} >= {early_stop_threshold} "
                                         f"({args.early_stop_gain_ratio:.0%} of max possible)")
@@ -822,24 +876,26 @@ def main():
                     candidate_gains.append(result)
                     
                     # Early stopping: if we found enough candidates with high gain, stop evaluating
-                    # (only if n_centers_per_iter == 1, otherwise we need to evaluate all to select top-k)
-                    if args.n_centers_per_iter == 1 and result[1] >= early_stop_threshold:
+                    # (only if adaptive_n_centers_per_iter == 1, otherwise we need to evaluate all to select top-k)
+                    # Note: We check args.n_centers_per_iter here because early stopping only makes sense
+                    # when we're selecting 1 center per iteration (not adaptive)
+                    if args.n_centers_per_iter == 1 and adaptive_n_centers_per_iter == 1 and result[1] >= early_stop_threshold:
                         if should_log:
                             print(f"[greedy] Early stop: found candidate with gain={result[1]} >= {early_stop_threshold} "
                                     f"({args.early_stop_gain_ratio:.0%} of max possible), skipping remaining candidates")
                         break
        
 
-        # Select top n_centers_per_iter candidates by gain
+        # Select top adaptive_n_centers_per_iter candidates by gain
         if len(candidate_gains) == 0:
             print(f"[greedy] No candidates with gain > 0. Stop.")
             break
         
         # Select centers: either simple top-k or incremental gain (to minimize overlap)
-        if args.n_centers_per_iter == 1 or not args.minimize_overlap:
+        if adaptive_n_centers_per_iter == 1 or not args.minimize_overlap:
             # Simple selection: just pick top-k by gain
             candidate_gains.sort(key=lambda x: x[1], reverse=True)
-            n_select = min(args.n_centers_per_iter, len(candidate_gains))
+            n_select = min(adaptive_n_centers_per_iter, len(candidate_gains))
             selected_candidates = candidate_gains[:n_select]
         else:
             # Incremental gain selection: minimize overlap by recalculating gain after each selection
@@ -850,7 +906,7 @@ def main():
             # Use boolean array for tracking coverage within this iteration (much faster for large sets)
             covered_in_iter = np.zeros(N_ref, dtype=bool)
             
-            for _ in range(min(args.n_centers_per_iter, len(candidate_gains))):
+            for _ in range(min(adaptive_n_centers_per_iter, len(candidate_gains))):
                 if len(remaining_candidates) == 0:
                     break
                 
@@ -919,7 +975,7 @@ def main():
         # Calculate total gain for logging
         # For incremental gain mode, total gain is the union of all covered points
         # (in incremental mode, each candidate's new_covered is already incremental, so union = total)
-        if args.n_centers_per_iter > 1 and args.minimize_overlap:
+        if adaptive_n_centers_per_iter > 1 and args.minimize_overlap:
             # In incremental mode, selected_candidates already contain incremental covered arrays
             # Total gain is the union of all incremental covered points (use numpy unique)
             if len(selected_candidates) > 0:
@@ -942,17 +998,9 @@ def main():
             # Store the gain (incremental gain if minimize_overlap, original gain otherwise)
             gains.append(gain)
             
-            # Store posting list for this center: all neighbors within radius (not just newly covered)
-            # Note: This uses sphere membership (multi-assignment), where each point can belong to multiple centers
-            # if it falls within their radius. This is the actual behavior of the greedy algorithm.
-            start, end = int(lims[cand_pos]), int(lims[cand_pos + 1])
-            all_neighbors_ref = I[start:end]  # These are indices in X_ref
-            # Convert to original dataset indices if using subset
-            if ref_idx is not None:
-                posting_list = ref_idx[all_neighbors_ref].tolist()
-            else:
-                posting_list = all_neighbors_ref.tolist()
-            posting_lists.append(posting_list)
+            # Note: Posting lists are no longer stored here - they will be computed in baselines.py
+            # after target_coverage truncation. This saves memory and ensures posting lists are computed
+            # for all documents (not just ref_size subset) and only for centers that will be used.
             
             # Collect newly covered arrays (will concatenate and update at end)
             all_new_covered_arrays.append(new_covered_array)
@@ -1004,7 +1052,12 @@ def main():
                     estimated_remaining_time = avg_iter_time * remaining_iters
                     remaining_time_str = f"  ETA={estimated_remaining_time/60:.1f}m"
             
-            if args.n_centers_per_iter > 1:
+            # Show adaptive adjustment info if different from default
+            adaptive_info = ""
+            if adaptive_n_centers_per_iter != args.n_centers_per_iter:
+                adaptive_info = f" [adaptive: {adaptive_n_centers_per_iter} centers/iter]"
+            
+            if adaptive_n_centers_per_iter > 1:
                 # Calculate overlap ratio for logging (only if minimize_overlap is enabled)
                 if args.minimize_overlap and n_select > 1:
                     # Overlap = (sum of individual gains - total union gain) / sum of individual gains
@@ -1013,14 +1066,14 @@ def main():
                     print(f"[greedy] iter={it+1:6d}  centers={len(centers_ref_ids):6d}  "
                           f"covered={covered_frac:.4f}  selected={n_select} centers  "
                           f"best_gain={best_gain_this_iter:6d}  total_gain={total_gain_this_iter:6d}  "
-                          f"overlap={overlap_ratio:.1%}  elapsed={elapsed/60:.1f}m{remaining_time_str}")
+                          f"overlap={overlap_ratio:.1%}  elapsed={elapsed/60:.1f}m{remaining_time_str}{adaptive_info}")
                 else:
                     print(f"[greedy] iter={it+1:6d}  centers={len(centers_ref_ids):6d}  "
                           f"covered={covered_frac:.4f}  selected={n_select} centers  "
-                          f"best_gain={best_gain_this_iter:6d}  total_gain={total_gain_this_iter:6d}  elapsed={elapsed/60:.1f}m{remaining_time_str}")
+                          f"best_gain={best_gain_this_iter:6d}  total_gain={total_gain_this_iter:6d}  elapsed={elapsed/60:.1f}m{remaining_time_str}{adaptive_info}")
             else:
                 print(f"[greedy] iter={it+1:6d}  centers={len(centers_ref_ids):6d}  "
-                      f"covered={covered_frac:.4f}  best_gain={best_gain_this_iter:6d}  elapsed={elapsed/60:.1f}m{remaining_time_str}")
+                      f"covered={covered_frac:.4f}  best_gain={best_gain_this_iter:6d}  elapsed={elapsed/60:.1f}m{remaining_time_str}{adaptive_info}")
 
     # Build final centers matrix in original space
     if len(centers_ref_ids) == 0:
@@ -1039,25 +1092,24 @@ def main():
     out_path = os.path.join(args.out_dir, out_name)
     np.save(out_path, centers)
     
-    # Save posting lists (inverted index)
-    # Format: posting_lists[i] = list of point indices assigned to center i
-    # Note: Posting lists use sphere membership (multi-assignment), where each point can appear in multiple
-    # posting lists if it falls within multiple centers' radii. Different assignment strategies (soft/hard)
-    # can be applied during retrieval evaluation in baselines.py.
-    posting_lists_path = os.path.join(args.out_dir, out_name.replace(".npy", "_posting_lists.npz"))
-    # Convert to arrays for efficient storage (using npz format)
-    # Store as list of arrays since posting lists have different lengths
-    posting_lists_dict = {f"center_{i}": np.array(pl, dtype=np.int64) for i, pl in enumerate(posting_lists)}
-    np.savez_compressed(posting_lists_path, **posting_lists_dict)
-    print(f"[greedy] Saved posting lists: {posting_lists_path}")
-    print(f"[greedy]   Total centers: {len(posting_lists)}")
-    print(f"[greedy]   Total assignments: {sum(len(pl) for pl in posting_lists):,}")
-    print(f"[greedy]   Avg posting length: {np.mean([len(pl) for pl in posting_lists]):.1f}")
+    # Note: Posting lists are no longer saved here.
+    # They will be computed in baselines.py after target_coverage truncation,
+    # ensuring we only compute posting lists for centers that will be used.
+    # This also allows posting lists to be computed for all documents,
+    # even if ref_size < N was used during center building.
 
+    # Note: embeddings_path is not saved in stats because:
+    # 1. 3build_centers_greedy.py loads section-separated files (abstract_{unit}.npy, claim_{unit}.npy, etc.)
+    # 2. baselines.py expects a single concatenated file (patent_contextual_spans_{mode}_{model}_{unit}_{cls}.npy)
+    # 3. baselines.py will find the embeddings file using pattern matching
+    # If a concatenated file exists, it will be used; otherwise baselines.py will need to load and concatenate sections
+    embeddings_path_for_stats = None  # Not saved - baselines.py will find embeddings via pattern matching
+    
     stats = {
         "embeddings_dir": args.embeddings_dir,
         "task_mode": args.mode,
         "embedding_files": [os.path.basename(f) for f in embedding_files],
+        "embeddings_path": embeddings_path_for_stats,  # Path to embeddings file (for baselines.py)
         "N": int(N),
         "d": int(d),
         "r": float(args.r),
@@ -1077,9 +1129,8 @@ def main():
         "seed": int(args.seed),
         "n_candidates_per_iter": int(args.n_candidates_per_iter),
         "max_centers": int(args.max_centers),
-        "posting_lists_path": posting_lists_path,  # Path to saved posting lists
-        "total_assignments": int(sum(len(pl) for pl in posting_lists)),
-        "avg_posting_length": float(np.mean([len(pl) for pl in posting_lists])),
+        # Note: posting_lists_path removed - posting lists are computed in baselines.py
+        # Note: total_assignments and avg_posting_length removed - computed in baselines.py
     }
     
     # Add parsed directory info if available
