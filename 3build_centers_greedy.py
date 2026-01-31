@@ -466,6 +466,24 @@ def main():
                     help="Fast mode: skip covering evaluation, only compute sphere neighbor stats. "
                          "Only used if --r is not provided.")
     
+    # Soft coverage (vMF-style continuous weights instead of binary cover)
+    ap.add_argument("--soft_cover", action="store_true",
+                    help="Use soft coverage: continuous weights w(x,c)=exp(kappa*(sim-1)), "
+                         "gain = sum of marginal contributions. Reduces reliance on fixed hard threshold.")
+    ap.add_argument("--soft_cover_tau", type=float, default=0.5,
+                    help="Target covered_mass for soft coverage (default: 0.5). "
+                         "Point x is 'sufficiently covered' when max_c w(x,c) >= tau.")
+    ap.add_argument("--soft_cover_kappa", type=float, default=None,
+                    help="Kappa for soft coverage weight. If None, derived from r: kappa = -ln(tau)/r.")
+    
+    # Per-center radius (each center gets its own r_c for adaptive sphere size)
+    ap.add_argument("--per_center_r", action="store_true",
+                    help="Compute and save per-center radius r_c for each selected center. "
+                         "r_c = median cosine distance to k nearest neighbors. "
+                         "Baselines will use r_c when building posting lists.")
+    ap.add_argument("--per_center_r_k", type=int, default=20,
+                    help="k for k-NN when computing per-center radius (default: 20).")
+    
     args = ap.parse_args()
 
     # Input validation
@@ -496,6 +514,10 @@ def main():
         raise ValueError(f"--ref_size must be non-negative, got {args.ref_size}")
     if args.early_stop_gain_ratio < 0 or args.early_stop_gain_ratio > 1:
         raise ValueError(f"--early_stop_gain_ratio must be in [0, 1], got {args.early_stop_gain_ratio}")
+    if args.soft_cover and (args.soft_cover_tau <= 0 or args.soft_cover_tau > 1):
+        raise ValueError(f"--soft_cover_tau must be in (0, 1], got {args.soft_cover_tau}")
+    if args.per_center_r and args.per_center_r_k < 2:
+        raise ValueError(f"--per_center_r_k must be >= 2, got {args.per_center_r_k}")
     
     # Validate inputs
     if not os.path.isdir(args.embeddings_dir):
@@ -653,10 +675,22 @@ def main():
             )
         print(f"[greedy] Using auto-selected radius: r={args.r:.6f}")
 
-    covered = np.zeros(N_ref, dtype=bool)
-    # Use a set to track uncovered indices for faster sampling (O(1) removal vs O(N) scan)
-    # This optimization significantly speeds up the greedy loop when many points are covered
-    uncovered_set = set(range(N_ref))
+    # Coverage state: binary (hard) or soft (continuous weights)
+    soft_cover = getattr(args, "soft_cover", False)
+    if soft_cover:
+        covered_mass = np.zeros(N_ref, dtype=np.float32)
+        insufficient_set = set(range(N_ref))
+        tau = args.soft_cover_tau
+        kappa = args.soft_cover_kappa
+        if kappa is None:
+            kappa = -np.log(tau) / float(args.r)
+            print(f"[greedy] soft_cover: kappa={kappa:.2f} (derived from r={args.r:.3f}, tau={tau})")
+        else:
+            print(f"[greedy] soft_cover: kappa={kappa:.2f} (user-specified)")
+        print(f"[greedy] soft_cover: tau={tau}, point sufficiently covered when max_c w(x,c) >= {tau}")
+    else:
+        covered = np.zeros(N_ref, dtype=bool)
+        uncovered_set = set(range(N_ref))
 
     sim_th = 1.0 - float(args.r)  # cosine_dist <= r  <=> sim >= 1-r
     print(f"[greedy] radius r={args.r:.6f} => sim_threshold={sim_th:.6f}")
@@ -681,6 +715,7 @@ def main():
 
     centers_ref_ids = []
     gains = []
+    r_per_center = []  # Per-center radius (when --per_center_r)
     coverage_history = []  # Store coverage after each center is added (for post-processing)
     t0 = time.time()
     t_last_iter = t0  # Track time of last iteration for time estimation
@@ -698,8 +733,11 @@ def main():
         # Check if we should log this iteration (compute once per iteration)
         should_log = (it + 1) % args.log_every == 0 or it == 0
         
-        # Fast path: use set for uncovered tracking
-        n_uncovered = len(uncovered_set)
+        # Fast path: use set for uncovered/insufficient tracking
+        if soft_cover:
+            n_uncovered = len(insufficient_set)
+        else:
+            n_uncovered = len(uncovered_set)
         if n_uncovered == 0:
             print("[greedy] All reference points covered. Stop.")
             break
@@ -739,8 +777,9 @@ def main():
         use_density_this_iter = (density_sampling_enabled and 
                                 n_uncovered > n_cand)
         
-        # Convert uncovered_set to array once for reuse (used in both density and direct sampling)
-        uncovered_array_indices = np.fromiter(uncovered_set, dtype=np.int64, count=n_uncovered)
+        # Convert uncovered/insufficient set to array once for reuse
+        sample_set = insufficient_set if soft_cover else uncovered_set
+        uncovered_array_indices = np.fromiter(sample_set, dtype=np.int64, count=n_uncovered)
         
         # Merge density sampling and candidate evaluation into single range_search
         if use_density_this_iter:
@@ -764,15 +803,18 @@ def main():
             top_density_idx = np.argsort(-densities)[:n_cand]
             cand = pool_candidates[top_density_idx]
             
-            # Reuse range_search results - extract lims and I for selected candidates
+            # Reuse range_search results - extract lims, I, D for selected candidates
             lims = np.zeros(n_cand + 1, dtype=np.int64)
             lims[0] = 0
             I_list = []
+            D_list = []
             for i, pool_idx in enumerate(top_density_idx):
                 start, end = int(lims_pool[pool_idx]), int(lims_pool[pool_idx + 1])
                 I_list.append(I_pool[start:end])
+                D_list.append(D_pool[start:end])
                 lims[i + 1] = lims[i] + (end - start)
             I = np.concatenate(I_list) if I_list else np.array([], dtype=np.int64)
+            D = np.concatenate(D_list) if D_list else np.array([], dtype=np.float32)
             
             if should_log:
                 adaptive_info = ""
@@ -802,10 +844,10 @@ def main():
             raise RuntimeError(f"range_search returned unexpected lims shape: {len(lims)} != {n_cand + 1}")
 
         # Evaluate gain for all candidates (to support multi-center selection)
-        # Use numpy array operations instead of set operations for better performance
-        # Update uncovered_array for fast boolean indexing (reuse pre-allocated array)
-        uncovered_array.fill(False)
-        uncovered_array[uncovered_array_indices] = True
+        # For hard coverage: update uncovered_array for fast boolean indexing
+        if not soft_cover:
+            uncovered_array.fill(False)
+            uncovered_array[uncovered_array_indices] = True
         
         # Early stopping logic:
         # - max_possible_gain = n_uncovered (theoretical maximum: one center could cover all uncovered points)
@@ -823,66 +865,84 @@ def main():
         use_parallel = (n_threads > 1 and n_cand > 50)  # Only parallelize if many candidates
         
         def compute_gain(i, lims, I, uncovered_array, N_ref):
-            """Compute gain for a single candidate."""
+            """Compute gain for a single candidate (hard coverage)."""
             start, end = int(lims[i]), int(lims[i + 1])
-            # Validate indices
             if start < 0 or end > len(I) or start > end:
                 return None
             neigh = I[start:end]
             if neigh.size == 0:
                 return None
-            # Validate neighbor indices are within bounds
             if np.any(neigh < 0) or np.any(neigh >= N_ref):
                 return None
-            
-            # Use boolean indexing instead of set intersection
-            # Only count neighbors that are both in neigh AND in uncovered_array
             new_covered_mask = uncovered_array[neigh]
             new_covered_array = neigh[new_covered_mask]
             g = len(new_covered_array)
-            
             if g > 0:
                 return (i, g, new_covered_array)
             return None
         
-        candidate_gains = []  # List of (cand_pos, gain, new_covered_array)
+        def compute_gain_soft(i, lims, D, I, covered_mass, tau, kappa, N_ref):
+            """Compute gain for a single candidate (soft coverage): marginal contribution sum."""
+            start, end = int(lims[i]), int(lims[i + 1])
+            if start < 0 or end > len(I) or start > end:
+                return None
+            neigh = I[start:end]
+            sims = D[start:end] if len(D) >= end else np.zeros(0)
+            if neigh.size == 0:
+                return None
+            if len(sims) != len(neigh):
+                return None
+            if np.any(neigh < 0) or np.any(neigh >= N_ref):
+                return None
+            gain = 0.0
+            new_covered_list = []
+            for j in range(len(neigh)):
+                x = int(neigh[j])
+                sim = float(sims[j])
+                w = np.exp(kappa * (sim - 1.0))
+                marginal = max(0.0, w - covered_mass[x])
+                gain += marginal
+                new_covered_list.append((x, w))
+            if gain > 0:
+                return (i, gain, new_covered_list)
+            return None
         
-        if use_parallel:
-            # Parallel evaluation of candidates
+        candidate_gains = []  # List of (cand_pos, gain, new_covered) where new_covered is array or list of (x,w)
+        
+        if soft_cover:
+            # Soft coverage: use marginal gain
+            early_stop_soft = (early_stop_threshold / n_uncovered) * tau if n_uncovered > 0 else float('inf')
+            for i in range(n_cand):
+                result = compute_gain_soft(i, lims, D, I, covered_mass, tau, kappa, N_ref)
+                if result is not None:
+                    candidate_gains.append(result)
+                    if args.n_centers_per_iter == 1 and adaptive_n_centers_per_iter == 1 and result[1] >= early_stop_soft:
+                        if should_log:
+                            print(f"[greedy] Early stop (soft): gain={result[1]:.1f} >= {early_stop_soft:.1f}")
+                        break
+        elif use_parallel:
+            # Parallel evaluation (hard coverage)
             with ThreadPoolExecutor(max_workers=n_threads) as executor:
                 futures = {executor.submit(compute_gain, i, lims, I, uncovered_array, N_ref): i 
                           for i in range(n_cand)}
                 
-                # Early stopping only works in sequential mode, so check results as they complete
                 for future in as_completed(futures):
                     result = future.result()
                     if result is not None:
                         candidate_gains.append(result)
-                        
-                        # Early stopping check (only for adaptive_n_centers_per_iter == 1)
-                        # Note: We check args.n_centers_per_iter here because early stopping only makes sense
-                        # when we're selecting 1 center per iteration (not adaptive)
                         if args.n_centers_per_iter == 1 and adaptive_n_centers_per_iter == 1 and result[1] >= early_stop_threshold:
                             if should_log:
-                                print(f"[greedy] Early stop: found candidate with gain={result[1]} >= {early_stop_threshold} "
-                                        f"({args.early_stop_gain_ratio:.0%} of max possible)")
-                            # Cancel remaining futures (they'll complete but we'll ignore results)
+                                print(f"[greedy] Early stop: found candidate with gain={result[1]} >= {early_stop_threshold}")
                             break
         else:
-            # Sequential evaluation (with early stopping support)
+            # Sequential evaluation (hard coverage)
             for i in range(n_cand):
                 result = compute_gain(i, lims, I, uncovered_array, N_ref)
                 if result is not None:
                     candidate_gains.append(result)
-                    
-                    # Early stopping: if we found enough candidates with high gain, stop evaluating
-                    # (only if adaptive_n_centers_per_iter == 1, otherwise we need to evaluate all to select top-k)
-                    # Note: We check args.n_centers_per_iter here because early stopping only makes sense
-                    # when we're selecting 1 center per iteration (not adaptive)
                     if args.n_centers_per_iter == 1 and adaptive_n_centers_per_iter == 1 and result[1] >= early_stop_threshold:
                         if should_log:
-                            print(f"[greedy] Early stop: found candidate with gain={result[1]} >= {early_stop_threshold} "
-                                    f"({args.early_stop_gain_ratio:.0%} of max possible), skipping remaining candidates")
+                            print(f"[greedy] Early stop: found candidate with gain={result[1]} >= {early_stop_threshold}")
                         break
        
 
@@ -892,13 +952,14 @@ def main():
             break
         
         # Select centers: either simple top-k or incremental gain (to minimize overlap)
-        if adaptive_n_centers_per_iter == 1 or not args.minimize_overlap:
-            # Simple selection: just pick top-k by gain
+        if adaptive_n_centers_per_iter == 1 or not args.minimize_overlap or soft_cover:
+            # Simple selection: pick top-k by gain (soft always uses simple: gain is precomputed)
             candidate_gains.sort(key=lambda x: x[1], reverse=True)
             n_select = min(adaptive_n_centers_per_iter, len(candidate_gains))
             selected_candidates = candidate_gains[:n_select]
+            # For soft, keep as-is; downstream handles (x,w) for covered_mass update
         else:
-            # Incremental gain selection: minimize overlap by recalculating gain after each selection
+            # Incremental gain selection (hard only): minimize overlap by recalculating gain after each selection
             # This ensures each new center covers mostly different points from previously selected ones
             # Use boolean array for faster incremental gain calculation (instead of set operations)
             selected_candidates = []
@@ -973,51 +1034,62 @@ def main():
             n_select = len(selected_candidates)
         
         # Calculate total gain for logging
-        # For incremental gain mode, total gain is the union of all covered points
-        # (in incremental mode, each candidate's new_covered is already incremental, so union = total)
-        if adaptive_n_centers_per_iter > 1 and args.minimize_overlap:
-            # In incremental mode, selected_candidates already contain incremental covered arrays
-            # Total gain is the union of all incremental covered points (use numpy unique)
+        if soft_cover:
+            total_gain_this_iter = sum(g for _, g, _ in selected_candidates)
+        elif adaptive_n_centers_per_iter > 1 and args.minimize_overlap:
             if len(selected_candidates) > 0:
-                total_covered_array = np.unique(np.concatenate([inc for _, _, inc in selected_candidates]))
-                total_gain_this_iter = len(total_covered_array)
+                inc_arrays = [inc for _, _, inc in selected_candidates]
+                if inc_arrays and isinstance(inc_arrays[0], np.ndarray):
+                    total_covered_array = np.unique(np.concatenate(inc_arrays))
+                    total_gain_this_iter = len(total_covered_array)
+                else:
+                    total_gain_this_iter = sum(g for _, g, _ in selected_candidates)
             else:
                 total_gain_this_iter = 0
         else:
-            # In non-incremental mode, sum individual gains (may have overlap)
             total_gain_this_iter = sum(g for _, g, _ in selected_candidates)
         best_gain_this_iter = selected_candidates[0][1] if selected_candidates else 0
         
         # Process each selected center
-        # Use list of arrays instead of set, concatenate at end (faster)
         all_new_covered_arrays = []
+        all_new_covered_soft = []
         
-        for cand_pos, gain, new_covered_array in selected_candidates:
+        for cand_pos, gain, new_covered in selected_candidates:
             center_ref = int(cand[cand_pos])
             centers_ref_ids.append(center_ref)
-            # Store the gain (incremental gain if minimize_overlap, original gain otherwise)
             gains.append(gain)
             
-            # Note: Posting lists are no longer stored here - they will be computed in baselines.py
-            # after target_coverage truncation. This saves memory and ensures posting lists are computed
-            # for all documents (not just ref_size subset) and only for centers that will be used.
+            # Per-center radius (when --per_center_r)
+            if getattr(args, "per_center_r", False):
+                k_nn = min(args.per_center_r_k + 1, N_ref)
+                sims, _ = index.search(X_ref[center_ref:center_ref + 1].astype(np.float32), k_nn)
+                sims = sims[0]
+                if len(sims) > 1:
+                    sims = sims[1:]
+                cos_dists = 1.0 - sims.astype(np.float64)
+                r_c = float(np.median(cos_dists))
+                r_per_center.append(r_c)
             
-            # Collect newly covered arrays (will concatenate and update at end)
-            all_new_covered_arrays.append(new_covered_array)
+            if soft_cover:
+                all_new_covered_soft.extend(new_covered)
+            else:
+                all_new_covered_arrays.append(new_covered)
         
-        # Mark all newly covered points (batch update for efficiency)
-        # Concatenate all arrays at once (faster than iteratively updating set)
-        if len(all_new_covered_arrays) > 0:
-            # Concatenate all arrays and remove duplicates using numpy
+        # Mark all newly covered points
+        if soft_cover and all_new_covered_soft:
+            for x, w in all_new_covered_soft:
+                x = int(x)
+                covered_mass[x] = max(covered_mass[x], w)
+                if covered_mass[x] >= tau:
+                    insufficient_set.discard(x)
+        elif len(all_new_covered_arrays) > 0:
             all_new_covered_array = np.unique(np.concatenate(all_new_covered_arrays))
             covered[all_new_covered_array] = True
-            # Remove from uncovered set (O(1) per element, much faster than np.where)
-            # Directly remove from set using array (no need to convert to list first)
             uncovered_set.difference_update(all_new_covered_array)
         
         # Record coverage after adding centers in this iteration
-        # Calculate coverage from uncovered_set (more efficient than covered.mean())
-        current_coverage = 1.0 - (len(uncovered_set) / N_ref)
+        sample_set_now = insufficient_set if soft_cover else uncovered_set
+        current_coverage = 1.0 - (len(sample_set_now) / N_ref)
         # Record coverage for each center added in this iteration (use extend for efficiency)
         # Note: All centers added in the same iteration have the same coverage (after the iteration)
         coverage_history.extend([current_coverage] * len(selected_candidates))
@@ -1032,8 +1104,7 @@ def main():
         t_last_iter = t_current
         
         if should_log:
-            # Calculate coverage from uncovered_set (more efficient than covered.mean())
-            covered_frac = 1.0 - (len(uncovered_set) / N_ref)
+            covered_frac = 1.0 - (len(sample_set_now) / N_ref)
             elapsed = time.time() - t0
             
             # Track coverage for rate estimation
@@ -1057,8 +1128,8 @@ def main():
             if adaptive_n_centers_per_iter != args.n_centers_per_iter:
                 adaptive_info = f" [adaptive: {adaptive_n_centers_per_iter} centers/iter]"
             
-            if adaptive_n_centers_per_iter > 1:
-                # Calculate overlap ratio for logging (only if minimize_overlap is enabled)
+            if adaptive_n_centers_per_iter > 1 and not soft_cover:
+                # Calculate overlap ratio for logging (only if minimize_overlap is enabled, hard only)
                 if args.minimize_overlap and n_select > 1:
                     # Overlap = (sum of individual gains - total union gain) / sum of individual gains
                     sum_individual_gains = sum(g for _, g, _ in selected_candidates)
@@ -1120,12 +1191,14 @@ def main():
         "ref_size": int(N_ref),
         "use_full_index": bool(ref_idx is None),
         "n_centers": int(centers.shape[0]),
-        "achieved_coverage": float(1.0 - len(uncovered_set) / N_ref),  # Coverage on reference set (full dataset by default)
+        "achieved_coverage": float(1.0 - len(insufficient_set if soft_cover else uncovered_set) / N_ref),
         "coverage_history": [float(c) for c in coverage_history],  # Coverage after each center is added (for post-processing)
+        "r_per_center": [float(r) for r in r_per_center] if r_per_center else None,  # Per-center radius (when --per_center_r)
         "avg_gain": float(np.mean(gains) if gains else 0.0),
         "median_gain": float(np.median(gains) if gains else 0.0),
         "p90_gain": float(np.percentile(gains, 90) if gains else 0.0),
-        "max_gain": int(np.max(gains) if gains else 0),
+        "max_gain": float(np.max(gains)) if gains else 0,
+        "soft_cover": soft_cover,
         "seed": int(args.seed),
         "n_candidates_per_iter": int(args.n_candidates_per_iter),
         "max_centers": int(args.max_centers),

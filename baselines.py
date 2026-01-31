@@ -95,7 +95,8 @@ def find_centers(
     include_cls: bool,
     search_dir: str = ".",
     mode: str = "abstract2abstract",
-    layer: str = "last"
+    layer: str = "last",
+    centers_suffix: str = "",
 ) -> tuple:
     """
     Find centers files based on embedding parameters.
@@ -128,8 +129,8 @@ def find_centers(
     cls_suffix = "cls" if include_cls else "nocls"
     
     # Build expected directory name
-    # Format: centers_greedy_{mode}_{model_name}_{unit}_{cls_suffix}_{layer}
-    expected_dir_pattern = f"centers_greedy_{mode}_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}"
+    # Format: centers_greedy_{mode}_{model_name}_{unit}_{cls_suffix}_{layer}[_suffix]
+    expected_dir_pattern = f"centers_greedy_{mode}_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}{centers_suffix}"
     
     # Search for directories matching the pattern
     search_pattern = os.path.join(search_dir, expected_dir_pattern)
@@ -890,15 +891,24 @@ def main():
                             "Uses coverage_history from centers JSON to find the appropriate number of centers. "
                             "Default: None (use all centers). Example: --target_coverage 0.7 for 70%% coverage.")
     parser.add_argument("--use_soft_assignment", action="store_true", default=False,
-                       help="Use soft assignment for query spans (top-k centers with similarity weights). "
-                            "Default: False. If True, uses soft assignment; if False, uses hard assignment (only nearest center).")
-    parser.add_argument("--soft_assignment_k", type=int, default=5,
-                       help="Number of top centers to use for soft assignment. Default: 5. "
-                            "Higher values give more coverage but may introduce noise.")
-    parser.add_argument("--use_adaptive_threshold", action="store_true", default=True,
-                       help="Use adaptive similarity threshold for soft assignment (from centers JSON). "
-                            "Default: False (uses fixed top-k). If True, uses threshold-based assignment (all centers above threshold).")
-    
+                       help="Use soft assignment for query spans: all centers with sim >= threshold (same as document side, range_search). "
+                            "Default: False (hard assignment: only nearest center per span). If True, query assignment is consistent with posting lists.")
+    parser.add_argument("--soft_assignment_max_centers_per_span", type=int, default=None,
+                       help="When use_soft_assignment: cap each span to at most this many centers (by similarity). "
+                            "Default: None (no cap). Try 5 or 10 to reduce noise while keeping multi-center recall.")
+    parser.add_argument("--use_vmf", action="store_true", default=False,
+                       help="Use von Mises-Fisher (vMF) continuous weights: weight = exp(kappa_c * (sim - 1)) with per-center kappa. "
+                            "kappa_c is estimated from each center's posting list mean similarity (vMF MLE approximation). "
+                            "Default: False (use raw similarity as weight).")
+    parser.add_argument("--length_norm", type=str, default="none",
+                       choices=["none", "sqrt_centers"],
+                       help="Document length normalization for sparse_coverage. "
+                            "none: no normalization. sqrt_centers: divide by sqrt(num_centers_hit). "
+                            "Default: none.")
+    parser.add_argument("--centers_suffix", type=str, default="",
+                       help="Suffix for centers directory (e.g. '_soft', '_percenter'). "
+                            "Use when centers were built with --soft_cover or --per_center_r to custom out_dir.")
+
     args = parser.parse_args()
 
     print(f"Running evaluation for model: {args.model_name}")
@@ -2043,6 +2053,7 @@ def main():
         print(f"   Tokenization unit: {args.tokenization_unit}")
         print(f"   Include CLS: {args.include_cls}")
         print(f"   Layer: {getattr(args, 'layer', 'last')}")
+        print(f"   Length norm: {getattr(args, 'length_norm', 'none')}")
         
         # Import necessary modules
         from load_posting_lists import load_posting_lists
@@ -2096,9 +2107,10 @@ def main():
                     dense_model=args.dense_model,
                     tokenization_unit=args.tokenization_unit,
                     include_cls=args.include_cls,
-                    search_dir=".",  # Search from current directory (recursive)
+                    search_dir=".",
                     mode=test_mode,
-                    layer=getattr(args, 'layer', 'last')  # Use layer parameter, default to 'last'
+                    layer=getattr(args, 'layer', 'last'),
+                    centers_suffix=getattr(args, 'centers_suffix', ''),
                 )
                 centers_info_dict[test_mode] = (c_path, c_dir)
                 available_modes.append(test_mode)
@@ -2266,46 +2278,37 @@ def main():
             V: int,
             sim_threshold: float,
         ) -> list[tuple[np.ndarray, np.ndarray]]:
-            soft_assignment_k = args.soft_assignment_k if hasattr(args, "soft_assignment_k") else 5
-            use_soft_assignment = args.use_soft_assignment if hasattr(args, "use_soft_assignment") else True
-            use_adaptive_threshold = getattr(args, "use_adaptive_threshold", True)
-            
+            use_soft_assignment = args.use_soft_assignment if hasattr(args, "use_soft_assignment") else False
+
             query_sparse: list[tuple[np.ndarray, np.ndarray]] = []
             for spans in query_spans:
                 if spans.shape[0] == 0:
                     query_sparse.append((np.array([], dtype=np.int32), np.array([], dtype=np.float32)))
                     continue
-                
+
                 spans_norm = spans.astype(np.float32).copy()
                 faiss.normalize_L2(spans_norm)
-                
-                if use_soft_assignment:
-                    if use_adaptive_threshold and sim_threshold is not None:
-                        max_k = min(max(soft_assignment_k * 2, 20), V)
-                        similarities, assigned = center_index.search(spans_norm, k=max_k)
-                        center_weights: dict[int, float] = {}
+
+                if use_soft_assignment and sim_threshold is not None:
+                    # Same logic as document side: all centers with sim >= threshold (range_search)
+                    # Optional: cap each span to top-K centers by similarity (--soft_assignment_max_centers_per_span)
+                    max_centers_per_span = getattr(args, "soft_assignment_max_centers_per_span", None)
+                    lims, D, I = center_index.range_search(spans_norm, sim_threshold)
+                    center_weights: dict[int, float] = {}
+                    for span_idx in range(spans_norm.shape[0]):
+                        start, end = int(lims[span_idx]), int(lims[span_idx + 1])
+                        pairs = [(int(I[j]), float(D[j])) for j in range(start, end) if float(D[j]) > 0]
+                        if max_centers_per_span is not None and max_centers_per_span > 0 and len(pairs) > max_centers_per_span:
+                            pairs = sorted(pairs, key=lambda x: -x[1])[:max_centers_per_span]
+                        for center_id, sim in pairs:
+                            center_weights[center_id] = max(center_weights.get(center_id, 0.0), sim)
+                    if not center_weights:
+                        similarities, assigned = center_index.search(spans_norm, k=1)
                         for span_idx in range(similarities.shape[0]):
-                            for k_idx in range(similarities.shape[1]):
-                                sim = float(similarities[span_idx, k_idx])
-                                if sim >= sim_threshold:
-                                    center_id = int(assigned[span_idx, k_idx])
-                                    center_weights[center_id] = max(center_weights.get(center_id, 0.0), max(0.0, sim))
-                        
-                        if not center_weights:
-                            similarities, assigned = center_index.search(spans_norm, k=1)
-                            for span_idx in range(similarities.shape[0]):
-                                center_id = int(assigned[span_idx, 0])
-                                sim = float(similarities[span_idx, 0])
-                                center_weights[center_id] = max(center_weights.get(center_id, 0.0), max(0.0, sim))
-                    else:
-                        similarities, assigned = center_index.search(spans_norm, k=min(soft_assignment_k, V))
-                        center_weights = {}
-                        for span_idx in range(similarities.shape[0]):
-                            for k_idx in range(similarities.shape[1]):
-                                center_id = int(assigned[span_idx, k_idx])
-                                sim = float(similarities[span_idx, k_idx])
-                                center_weights[center_id] = max(center_weights.get(center_id, 0.0), max(0.0, sim))
-                    
+                            center_id = int(assigned[span_idx, 0])
+                            sim = float(similarities[span_idx, 0])
+                            center_weights[center_id] = max(center_weights.get(center_id, 0.0), max(0.0, sim))
+
                     if center_weights:
                         centers_arr = np.array(list(center_weights.keys()), dtype=np.int32)
                         weights_arr = np.array([center_weights[c] for c in centers_arr], dtype=np.float32)
@@ -2313,17 +2316,18 @@ def main():
                     else:
                         query_sparse.append((np.array([], dtype=np.int32), np.array([], dtype=np.float32)))
                 else:
+                    # Hard assignment: only nearest center per span
                     similarities, assigned = center_index.search(spans_norm, k=1)
                     center_weights = {}
                     for span_idx in range(similarities.shape[0]):
                         center_id = int(assigned[span_idx, 0])
                         sim = float(similarities[span_idx, 0])
                         center_weights[center_id] = max(center_weights.get(center_id, 0.0), max(0.0, sim))
-                    
+
                     centers_arr = np.array(list(center_weights.keys()), dtype=np.int32)
                     weights_arr = np.array([center_weights[c] for c in centers_arr], dtype=np.float32)
                     query_sparse.append((centers_arr, weights_arr))
-            
+
             return query_sparse
         
         for mode in available_modes:
@@ -2391,6 +2395,11 @@ def main():
             
             print(f"   Total loaded {len(span_to_doc):,} span-to-document mappings")
             
+            # Build doc_span_count for length normalization (spans per document)
+            doc_span_count: dict[str, int] = {}
+            for _span_idx, doc_id in span_to_doc.items():
+                doc_span_count[doc_id] = doc_span_count.get(doc_id, 0) + 1
+            
             # Load embeddings for document sections
             print(f"\n🔨 Computing posting lists for {V:,} centers...")
             print(f"   Using radius r={r:.6f} for range search")
@@ -2426,12 +2435,22 @@ def main():
             print(f"   ✅ FAISS index built")
             
             # Posting lists: for each center, store (span_idx, similarity)
+            # Use per-center r_c if available (from --per_center_r), else global r
+            r_per_center = centers_info.get("r_per_center", None)
+            if r_per_center is not None:
+                if len(r_per_center) != V:
+                    print(f"   ⚠️  r_per_center length {len(r_per_center)} != V {V}, using global r")
+                    r_per_center = None
+                else:
+                    print(f"   Using per-center radius (r_per_center from centers JSON)")
+            
             posting_lists: list[list[tuple[int, float]]] = []
             centers_norm_for_pl = centers.copy()
             faiss.normalize_L2(centers_norm_for_pl)
-            sim_thresh_pl = 1.0 - r
+            sim_thresh_default = 1.0 - r
             
             for center_idx in tqdm(range(V), desc="Computing posting lists"):
+                sim_thresh_pl = (1.0 - float(r_per_center[center_idx])) if r_per_center else sim_thresh_default
                 center_emb = centers_norm_for_pl[center_idx:center_idx + 1].astype(np.float32)
                 lims, D, I = embeddings_index.range_search(center_emb, sim_thresh_pl)
                 if len(lims) < 2:
@@ -2445,6 +2464,7 @@ def main():
             doc_postings: list[list[str]] = [[] for _ in range(V)]
             doc_postings_weights: list[list[float]] = [[] for _ in range(V)]
             doc_id_to_idx = {doc_id: idx for idx, doc_id in enumerate(documents_df.index)}
+            doc_centers_hit: dict[str, int] = {}
             
             for center_idx in tqdm(range(V), desc="Building inverted index"):
                 span_sims = posting_lists[center_idx]
@@ -2459,11 +2479,25 @@ def main():
                 for doc_id, weight in doc_weights.items():
                     doc_postings[center_idx].append(doc_id)
                     doc_postings_weights[center_idx].append(float(weight))
+                    doc_centers_hit[doc_id] = doc_centers_hit.get(doc_id, 0) + 1
             
             N_docs = len(documents_df)
             df = np.array([len(set(pl)) if pl else 0 for pl in doc_postings], dtype=np.float32)
             idf = (np.log((N_docs + 1.0) / (df + 1.0)) + 1.0).astype(np.float32)
-            
+
+            # Per-center kappa for vMF (when --use_vmf): estimate from posting list mean similarity
+            use_vmf = getattr(args, "use_vmf", False)
+            kappa = np.ones(V, dtype=np.float32)  # default 1.0 for empty centers
+            if use_vmf:
+                for center_idx in range(V):
+                    sims = [sim for _, sim in posting_lists[center_idx]]
+                    if sims:
+                        mean_sim = float(np.mean(sims))
+                        # vMF MLE approx: kappa ≈ (d-1) / (2*(1 - R_bar)), R_bar = mean_sim
+                        kappa_c = (d - 1.0) / (2.0 * max(1.0 - mean_sim, 0.01))
+                        kappa[center_idx] = np.clip(kappa_c, 0.1, 100.0)
+                print(f"   vMF: per-center kappa computed (min={kappa.min():.2f}, max={kappa.max():.2f}, mean={np.mean(kappa):.2f})")
+
             # Encode + assign queries
             if mode == "abstract2abstract":
                 print(f"\n📝 Evaluating: Abstract -> Abstract")
@@ -2479,6 +2513,12 @@ def main():
             query_spans = _encode_query_spans(query_texts, section=query_section, d=d)
             query_sparse = _assign_query_spans_to_centers(query_spans, center_index=center_index, V=V, sim_threshold=sim_threshold)
             
+            # Length normalization setup
+            length_norm = getattr(args, "length_norm", "none")
+            avg_span_count = 1.0
+            if length_norm == "sqrt_centers":
+                print(f"   Length norm: sqrt_centers")
+            
             print(f"🔍 Retrieving documents...")
             top_k = 100
             top_indices: list[list[int]] = []
@@ -2487,12 +2527,29 @@ def main():
                 for term, q_weight in zip(terms, weights):
                     if len(doc_postings[term]) == 0:
                         continue
+                    kt = float(kappa[term])
+                    q_sim = float(q_weight)
+                    idf_t = float(idf[term])
                     for doc_id, d_sim_weight in zip(doc_postings[term], doc_postings_weights[term]):
                         doc_idx = doc_id_to_idx.get(doc_id, None)
                         if doc_idx is None:
                             continue
-                        doc_scores[doc_idx] = doc_scores.get(doc_idx, 0.0) + float(q_weight) * (float(d_sim_weight) * float(idf[term]))
-                
+                        d_sim = float(d_sim_weight)
+                        if use_vmf:
+                            contrib = np.exp(kt * (q_sim - 1.0)) * np.exp(kt * (d_sim - 1.0)) * idf_t
+                        else:
+                            contrib = q_sim * d_sim * idf_t
+                        doc_scores[doc_idx] = doc_scores.get(doc_idx, 0.0) + contrib
+                # Apply document length normalization
+                if length_norm != "none" and doc_scores:
+                    for doc_idx in list(doc_scores.keys()):
+                        doc_id = documents_df.index[doc_idx]
+                        if length_norm == "sqrt_centers":
+                            nch = doc_centers_hit.get(doc_id, 1)
+                            norm_factor = max(np.sqrt(float(nch)), 1e-6)
+                        else:
+                            norm_factor = 1.0
+                        doc_scores[doc_idx] /= norm_factor
                 if doc_scores:
                     sorted_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
                     top_docs = [doc_idx for doc_idx, _ in sorted_docs[:top_k]]
@@ -2510,9 +2567,11 @@ def main():
             results = {}
             for k in [10, 20, 50, 100]:
                 results[f"recall@{k}"] = mean_recall_at_k(true_labels_list, retrieved_ids_list, k=k)
-            results["ndcg@10"] = mean_ndcg_at_k(true_labels_list, retrieved_ids_list, k=10)
+            for k in [10, 20, 50, 100]:
+                results[f"ndcg@{k}"] = mean_ndcg_at_k(true_labels_list, retrieved_ids_list, k=k)
             results["mrr@10"] = mean_mrr_at_k(true_labels_list, retrieved_ids_list, k=10)
             results["map"] = mean_average_precision(true_labels_list, retrieved_ids_list, k=100)
+            results["pres@100"] = mean_pres_at_k(true_labels_list, retrieved_ids_list, k=100)
             
             if mode == "abstract2abstract":
                 print_metric_table(results, "Sparse Coverage: Abstract -> Abstract")
