@@ -890,6 +890,10 @@ def main():
                             "If specified (0.0-1.0), will truncate centers to achieve this coverage. "
                             "Uses coverage_history from centers JSON to find the appropriate number of centers. "
                             "Default: None (use all centers). Example: --target_coverage 0.7 for 70%% coverage.")
+    parser.add_argument("--document_assignment", type=str, default="soft", choices=["hard", "soft"],
+                       help="Document side: hard = each span -> nearest center only (Voronoi); soft = each span in all spheres (range_search). Default: soft.")
+    parser.add_argument("--weight_aggregation", type=str, default="max", choices=["max", "sum"],
+                       help="Per (query, center) and (doc, center): max = use max similarity (default); sum = use sum of similarities (TF-style). Default: max.")
     parser.add_argument("--use_soft_assignment", action="store_true", default=False,
                        help="Use soft assignment for query spans: all centers with sim >= threshold (same as document side, range_search). "
                             "Default: False (hard assignment: only nearest center per span). If True, query assignment is consistent with posting lists.")
@@ -2279,6 +2283,13 @@ def main():
             sim_threshold: float,
         ) -> list[tuple[np.ndarray, np.ndarray]]:
             use_soft_assignment = args.use_soft_assignment if hasattr(args, "use_soft_assignment") else False
+            weight_agg = getattr(args, "weight_aggregation", "max")
+
+            def _update_weight(weights: dict, key: int, sim: float) -> None:
+                if weight_agg == "sum":
+                    weights[key] = weights.get(key, 0.0) + max(0.0, sim)
+                else:
+                    weights[key] = max(weights.get(key, 0.0), max(0.0, sim))
 
             query_sparse: list[tuple[np.ndarray, np.ndarray]] = []
             for spans in query_spans:
@@ -2290,8 +2301,6 @@ def main():
                 faiss.normalize_L2(spans_norm)
 
                 if use_soft_assignment and sim_threshold is not None:
-                    # Same logic as document side: all centers with sim >= threshold (range_search)
-                    # Optional: cap each span to top-K centers by similarity (--soft_assignment_max_centers_per_span)
                     max_centers_per_span = getattr(args, "soft_assignment_max_centers_per_span", None)
                     lims, D, I = center_index.range_search(spans_norm, sim_threshold)
                     center_weights: dict[int, float] = {}
@@ -2301,13 +2310,13 @@ def main():
                         if max_centers_per_span is not None and max_centers_per_span > 0 and len(pairs) > max_centers_per_span:
                             pairs = sorted(pairs, key=lambda x: -x[1])[:max_centers_per_span]
                         for center_id, sim in pairs:
-                            center_weights[center_id] = max(center_weights.get(center_id, 0.0), sim)
+                            _update_weight(center_weights, center_id, sim)
                     if not center_weights:
                         similarities, assigned = center_index.search(spans_norm, k=1)
                         for span_idx in range(similarities.shape[0]):
                             center_id = int(assigned[span_idx, 0])
                             sim = float(similarities[span_idx, 0])
-                            center_weights[center_id] = max(center_weights.get(center_id, 0.0), max(0.0, sim))
+                            _update_weight(center_weights, center_id, sim)
 
                     if center_weights:
                         centers_arr = np.array(list(center_weights.keys()), dtype=np.int32)
@@ -2316,13 +2325,12 @@ def main():
                     else:
                         query_sparse.append((np.array([], dtype=np.int32), np.array([], dtype=np.float32)))
                 else:
-                    # Hard assignment: only nearest center per span
                     similarities, assigned = center_index.search(spans_norm, k=1)
                     center_weights = {}
                     for span_idx in range(similarities.shape[0]):
                         center_id = int(assigned[span_idx, 0])
                         sim = float(similarities[span_idx, 0])
-                        center_weights[center_id] = max(center_weights.get(center_id, 0.0), max(0.0, sim))
+                        _update_weight(center_weights, center_id, sim)
 
                     centers_arr = np.array(list(center_weights.keys()), dtype=np.int32)
                     weights_arr = np.array([center_weights[c] for c in centers_arr], dtype=np.float32)
@@ -2400,64 +2408,84 @@ def main():
             for _span_idx, doc_id in span_to_doc.items():
                 doc_span_count[doc_id] = doc_span_count.get(doc_id, 0) + 1
             
-            # Load embeddings for document sections
+            # Load embeddings for document sections; build posting lists (doc hard = nearest center only, doc soft = sphere/range_search)
+            document_assignment = getattr(args, "document_assignment", "soft")
             print(f"\n🔨 Computing posting lists for {V:,} centers...")
-            print(f"   Using radius r={r:.6f} for range search")
+            print(f"   Document assignment: {document_assignment}")
             
             embeddings_files = [(sec, _embeddings_path(sec)) for sec in doc_sections]
-            print(f"   Loading embeddings from {len(embeddings_files)} file(s)...")
-            all_section_embeddings = []
-            for section_name, ep in embeddings_files:
-                print(f"   Loading {section_name} embeddings: {ep}")
-                sec_emb = _load_embeddings(ep)
-                if sec_emb.shape[1] != d:
-                    raise ValueError(f"Embedding dimension mismatch for {section_name}: {sec_emb.shape[1]} != {d}")
-                all_section_embeddings.append(sec_emb)
-                print(f"     ✅ Loaded {len(sec_emb):,} {section_name} embeddings")
-            
-            all_span_embeddings = np.vstack(all_section_embeddings)
-            print(f"   ✅ Total loaded {len(all_span_embeddings):,} span embeddings (concatenated from {len(embeddings_files)} sections)")
-            
-            # Align embeddings and metadata counts if needed
-            if len(all_span_embeddings) != total_spans_in_metadata:
-                print(f"   ⚠️  Warning: Embeddings count ({len(all_span_embeddings):,}) != metadata count ({total_spans_in_metadata:,})")
-                min_count = min(len(all_span_embeddings), total_spans_in_metadata)
-                all_span_embeddings = all_span_embeddings[:min_count]
-                span_to_doc = {k: v for k, v in span_to_doc.items() if k < min_count}
-                print(f"   Truncated to {min_count:,} spans")
-            
-            all_span_embeddings_norm = all_span_embeddings.copy()
-            faiss.normalize_L2(all_span_embeddings_norm)
-            
-            print(f"   Building FAISS index for all embeddings...")
-            embeddings_index = faiss.IndexFlatIP(d)
-            embeddings_index.add(all_span_embeddings_norm.astype(np.float32))
-            print(f"   ✅ FAISS index built")
-            
-            # Posting lists: for each center, store (span_idx, similarity)
-            # Use per-center r_c if available (from --per_center_r), else global r
-            r_per_center = centers_info.get("r_per_center", None)
-            if r_per_center is not None:
-                if len(r_per_center) != V:
-                    print(f"   ⚠️  r_per_center length {len(r_per_center)} != V {V}, using global r")
-                    r_per_center = None
-                else:
-                    print(f"   Using per-center radius (r_per_center from centers JSON)")
-            
             posting_lists: list[list[tuple[int, float]]] = []
             centers_norm_for_pl = centers.copy()
             faiss.normalize_L2(centers_norm_for_pl)
-            sim_thresh_default = 1.0 - r
+            total_loaded = 0
             
-            for center_idx in tqdm(range(V), desc="Computing posting lists"):
-                sim_thresh_pl = (1.0 - float(r_per_center[center_idx])) if r_per_center else sim_thresh_default
-                center_emb = centers_norm_for_pl[center_idx:center_idx + 1].astype(np.float32)
-                lims, D, I = embeddings_index.range_search(center_emb, sim_thresh_pl)
-                if len(lims) < 2:
-                    posting_lists.append([])
-                    continue
-                start, end = int(lims[0]), int(lims[1])
-                posting_lists.append([(int(I[i]), float(D[i])) for i in range(start, end)])
+            if document_assignment == "hard":
+                # Doc hard: each span -> nearest center only (Voronoi); no embeddings_index needed
+                print(f"   Building posting lists: each span -> nearest center (k=1)")
+                posting_lists = [[] for _ in range(V)]
+                span_offset = 0
+                for section_name, ep in embeddings_files:
+                    print(f"   Loading {section_name} embeddings: {ep}")
+                    sec_emb = _load_embeddings(ep)
+                    if sec_emb.shape[1] != d:
+                        raise ValueError(f"Embedding dimension mismatch for {section_name}: {sec_emb.shape[1]} != {d}")
+                    sec_emb = sec_emb.astype(np.float32)
+                    faiss.normalize_L2(sec_emb)
+                    sims, assigned = center_index.search(sec_emb, 1)
+                    for j in range(sec_emb.shape[0]):
+                        c = int(assigned[j, 0])
+                        sim = float(sims[j, 0])
+                        if sim > 0:
+                            posting_lists[c].append((span_offset + j, sim))
+                    total_loaded += sec_emb.shape[0]
+                    span_offset += sec_emb.shape[0]
+                    print(f"     ✅ {sec_emb.shape[0]:,} spans assigned (total: {total_loaded:,})")
+                    del sec_emb
+                print(f"   ✅ Total spans: {total_loaded:,}")
+            else:
+                # Doc soft: sphere (range_search) per center; build embeddings_index section-by-section
+                print(f"   Using radius r={r:.6f} for range search")
+                use_section_by_section = len(doc_sections) > 1
+                if use_section_by_section:
+                    print(f"   claim2all: building FAISS index section-by-section to reduce peak memory")
+                embeddings_index = faiss.IndexFlatIP(d)
+                for section_name, ep in embeddings_files:
+                    print(f"   Loading {section_name} embeddings: {ep}")
+                    sec_emb = _load_embeddings(ep)
+                    if sec_emb.shape[1] != d:
+                        raise ValueError(f"Embedding dimension mismatch for {section_name}: {sec_emb.shape[1]} != {d}")
+                    sec_emb = sec_emb.astype(np.float32)
+                    faiss.normalize_L2(sec_emb)
+                    embeddings_index.add(sec_emb)
+                    total_loaded += sec_emb.shape[0]
+                    print(f"     ✅ Loaded {sec_emb.shape[0]:,} (index size: {total_loaded:,})")
+                    del sec_emb
+                print(f"   ✅ Total in index: {total_loaded:,}")
+                r_per_center = centers_info.get("r_per_center", None)
+                if r_per_center is not None:
+                    if len(r_per_center) < V:
+                        r_per_center = None
+                    else:
+                        if len(r_per_center) > V:
+                            r_per_center = r_per_center[:V]  # truncate to match centers after coverage truncation
+                        print(f"   Using per-center radius (r_per_center from centers JSON)")
+                sim_thresh_default = 1.0 - r
+                for center_idx in tqdm(range(V), desc="Computing posting lists"):
+                    sim_thresh_pl = (1.0 - float(r_per_center[center_idx])) if r_per_center else sim_thresh_default
+                    center_emb = centers_norm_for_pl[center_idx:center_idx + 1].astype(np.float32)
+                    lims, D, I = embeddings_index.range_search(center_emb, sim_thresh_pl)
+                    if len(lims) < 2:
+                        posting_lists.append([])
+                        continue
+                    start, end = int(lims[0]), int(lims[1])
+                    posting_lists.append([(int(I[i]), float(D[i])) for i in range(start, end)])
+            
+            # Align metadata if index size differs from metadata count
+            if total_loaded != total_spans_in_metadata:
+                print(f"   ⚠️  Warning: Embeddings count ({total_loaded:,}) != metadata count ({total_spans_in_metadata:,})")
+                min_count = min(total_loaded, total_spans_in_metadata)
+                span_to_doc = {k: v for k, v in span_to_doc.items() if k < min_count}
+                print(f"   Truncated span_to_doc to {min_count:,} spans")
             
             # Build document-level inverted index (doc_id strings)
             print(f"\n🔨 Building document-level inverted index from posting lists...")
@@ -2466,6 +2494,7 @@ def main():
             doc_id_to_idx = {doc_id: idx for idx, doc_id in enumerate(documents_df.index)}
             doc_centers_hit: dict[str, int] = {}
             
+            weight_agg = getattr(args, "weight_aggregation", "max")
             for center_idx in tqdm(range(V), desc="Building inverted index"):
                 span_sims = posting_lists[center_idx]
                 if not span_sims:
@@ -2475,7 +2504,11 @@ def main():
                     doc_id = span_to_doc.get(span_idx, None)
                     if doc_id is None or doc_id not in doc_id_to_idx:
                         continue
-                    doc_weights[doc_id] = max(doc_weights.get(doc_id, 0.0), float(similarity))
+                    sim = float(similarity)
+                    if weight_agg == "sum":
+                        doc_weights[doc_id] = doc_weights.get(doc_id, 0.0) + max(0.0, sim)
+                    else:
+                        doc_weights[doc_id] = max(doc_weights.get(doc_id, 0.0), max(0.0, sim))
                 for doc_id, weight in doc_weights.items():
                     doc_postings[center_idx].append(doc_id)
                     doc_postings_weights[center_idx].append(float(weight))

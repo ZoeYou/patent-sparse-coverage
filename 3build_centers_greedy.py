@@ -385,20 +385,22 @@ def main():
     ap.add_argument("--embeddings_dir", type=str, required=True,
                     help="Directory from 1create_N_embeddings.py output. "
                          "Format: embeddings_{model}_{unit}_{cls}_{layer}.")
+    ap.add_argument("--out_dir", type=str, default="./centers")
+    ap.add_argument("--seed", type=int, default=666)
+
     ap.add_argument("--mode", type=str, required=True, choices=['abstract2abstract', 'claim2all'],
                     help="Task mode. "
                          "abstract2abstract: uses only abstract section. "
                          "claim2all: uses all sections (abstract, claim, invention).")
-    
-    ap.add_argument("--out_dir", type=str, default="./centers")
-    ap.add_argument("--seed", type=int, default=666)
-
     ap.add_argument("--r", type=float, default=None,
                     help="Cosine distance radius (0~2). If not provided, will auto-select based on kNN distribution.")
     ap.add_argument("--ref_size", type=int, default=0,
                     help="Build FAISS index on a reference subset of this size. Default 0=use full dataset (consistent with kmeans). Set to >0 to use subset (faster but less accurate).")
-    ap.add_argument("--max_centers", type=int, default=50000, 
-                    help="Maximum number of vocabulary centers to select (default: 50000).")
+    ap.add_argument("--max_centers", type=int, default=30000, 
+                    help="Maximum number of vocabulary centers to select (default: 30000).")
+    ap.add_argument("--max_coverage", type=float, default=1.0,
+                    help="Stop when coverage reaches this fraction (default: 1.0 = 100%%). "
+                         "Use 0.99 to stop at 99%% (faster, avoids long tail).")
     ap.add_argument("--log_every", type=int, default=5)
 
     ap.add_argument("--n_candidates_per_iter", type=int, default=2000,
@@ -482,7 +484,25 @@ def main():
                          "r_c = median cosine distance to k nearest neighbors. "
                          "Baselines will use r_c when building posting lists.")
     ap.add_argument("--per_center_r_k", type=int, default=20,
-                    help="k for k-NN when computing per-center radius (default: 20).")
+                    help="k for k-NN when computing per-center radius: r_c = median(cos_dist to k NN). "
+                         "Default 20 is a heuristic (small k noisier, large k smoother); no auto-selection.")
+    
+    # Adaptive concentration: fixed kappa, per-candidate r_c for density-adaptive spheres
+    # Dense regions -> smaller r_c (finer), sparse -> larger r_c (coarser)
+    ap.add_argument("--adaptive_concentration", action="store_true",
+                    help="Use adaptive concentration: fixed kappa, each sphere has similar "
+                         "'concentration' (points or weight). Dense regions get finer spheres.")
+    ap.add_argument("--adaptive_method", type=str, default="knn", choices=["knn", "weight"],
+                    help="Method for adaptive r_c: 'knn' = sphere contains ~K points, "
+                         "'weight' = sphere has total weight ~W_target.")
+    ap.add_argument("--adaptive_K", type=int, default=100,
+                    help="For adaptive_method=knn: target points per sphere (default: 100).")
+    ap.add_argument("--adaptive_W_target", type=float, default=50.0,
+                    help="For adaptive_method=weight: target total weight sum(w) per sphere (default: 50).")
+    ap.add_argument("--adaptive_kappa", type=float, default=5.0,
+                    help="Fixed kappa for adaptive concentration weight w=exp(kappa*(sim-1)) (default: 5).")
+    ap.add_argument("--adaptive_tau", type=float, default=0.5,
+                    help="Target covered_mass for 'sufficiently covered' in adaptive mode (default: 0.5).")
     
     args = ap.parse_args()
 
@@ -512,12 +532,21 @@ def main():
                          f"--n_candidates_per_iter ({args.n_candidates_per_iter}) when using density sampling")
     if args.ref_size < 0:
         raise ValueError(f"--ref_size must be non-negative, got {args.ref_size}")
+    if args.max_coverage <= 0 or args.max_coverage > 1:
+        raise ValueError(f"--max_coverage must be in (0, 1], got {args.max_coverage}")
     if args.early_stop_gain_ratio < 0 or args.early_stop_gain_ratio > 1:
         raise ValueError(f"--early_stop_gain_ratio must be in [0, 1], got {args.early_stop_gain_ratio}")
     if args.soft_cover and (args.soft_cover_tau <= 0 or args.soft_cover_tau > 1):
         raise ValueError(f"--soft_cover_tau must be in (0, 1], got {args.soft_cover_tau}")
     if args.per_center_r and args.per_center_r_k < 2:
         raise ValueError(f"--per_center_r_k must be >= 2, got {args.per_center_r_k}")
+    if getattr(args, "adaptive_concentration", False):
+        if args.adaptive_method == "knn" and args.adaptive_K < 2:
+            raise ValueError(f"--adaptive_K must be >= 2, got {args.adaptive_K}")
+        if args.adaptive_method == "weight" and args.adaptive_W_target <= 0:
+            raise ValueError(f"--adaptive_W_target must be > 0, got {args.adaptive_W_target}")
+        if args.adaptive_kappa <= 0:
+            raise ValueError(f"--adaptive_kappa must be > 0, got {args.adaptive_kappa}")
     
     # Validate inputs
     if not os.path.isdir(args.embeddings_dir):
@@ -595,6 +624,12 @@ def main():
         raise ValueError("Empty embedding matrix")
     if d == 0:
         raise ValueError("Zero-dimensional embeddings")
+
+    # claim2all: avoid OOM by defaulting to ref_size when N is large (3 sections => ~3x abstract size)
+    _CLAIM2ALL_REF_SIZE_DEFAULT = 300_000
+    if args.mode == "claim2all" and args.ref_size == 0 and N > _CLAIM2ALL_REF_SIZE_DEFAULT:
+        args.ref_size = min(N, _CLAIM2ALL_REF_SIZE_DEFAULT)
+        print(f"[greedy] claim2all: N={N:,} large, using ref_size={args.ref_size:,} to reduce memory (override with --ref_size 0 for full)")
 
     # Choose reference set for indexing (for neighbor queries)
     if args.ref_size and args.ref_size < N:
@@ -675,25 +710,41 @@ def main():
             )
         print(f"[greedy] Using auto-selected radius: r={args.r:.6f}")
 
-    # Coverage state: binary (hard) or soft (continuous weights)
+    # Coverage state: binary (hard), soft (continuous weights), or adaptive concentration
     soft_cover = getattr(args, "soft_cover", False)
+    adaptive_concentration = getattr(args, "adaptive_concentration", False)
+    if adaptive_concentration:
+        soft_cover = True  # Use soft semantics (covered_mass, insufficient_set)
     if soft_cover:
         covered_mass = np.zeros(N_ref, dtype=np.float32)
         insufficient_set = set(range(N_ref))
-        tau = args.soft_cover_tau
-        kappa = args.soft_cover_kappa
-        if kappa is None:
-            kappa = -np.log(tau) / float(args.r)
-            print(f"[greedy] soft_cover: kappa={kappa:.2f} (derived from r={args.r:.3f}, tau={tau})")
+        if adaptive_concentration:
+            tau = args.adaptive_tau
+            kappa = args.adaptive_kappa
+            print(f"[greedy] adaptive_concentration: method={args.adaptive_method}, kappa={kappa:.2f}, tau={tau}")
+            if args.adaptive_method == "knn":
+                print(f"[greedy]   Each sphere ~{args.adaptive_K} points (r_c adaptive)")
+            else:
+                print(f"[greedy]   Each sphere total weight ~{args.adaptive_W_target} (r_c adaptive)")
         else:
-            print(f"[greedy] soft_cover: kappa={kappa:.2f} (user-specified)")
-        print(f"[greedy] soft_cover: tau={tau}, point sufficiently covered when max_c w(x,c) >= {tau}")
+            tau = args.soft_cover_tau
+            kappa = args.soft_cover_kappa
+            if kappa is None:
+                kappa = -np.log(tau) / float(args.r)
+                print(f"[greedy] soft_cover: kappa={kappa:.2f} (derived from r={args.r:.3f}, tau={tau})")
+            else:
+                print(f"[greedy] soft_cover: kappa={kappa:.2f} (user-specified)")
+            print(f"[greedy] soft_cover: tau={tau}, point sufficiently covered when max_c w(x,c) >= {tau}")
     else:
         covered = np.zeros(N_ref, dtype=bool)
         uncovered_set = set(range(N_ref))
 
-    sim_th = 1.0 - float(args.r)  # cosine_dist <= r  <=> sim >= 1-r
-    print(f"[greedy] radius r={args.r:.6f} => sim_threshold={sim_th:.6f}")
+    if adaptive_concentration and args.r is None:
+        args.r = 0.3  # Placeholder for output filename; actual r_c are per-center
+        print(f"[greedy] adaptive_concentration: using r={args.r} for output naming only")
+    sim_th = 1.0 - float(args.r)  # cosine_dist <= r  <=> sim >= 1-r (used for non-adaptive or search)
+    if not adaptive_concentration:
+        print(f"[greedy] radius r={args.r:.6f} => sim_threshold={sim_th:.6f}")
     if args.n_centers_per_iter > 1:
         if args.minimize_overlap:
             print(f"[greedy] Multi-center mode: selecting {args.n_centers_per_iter} centers per iteration "
@@ -743,6 +794,9 @@ def main():
             break
 
         covered_frac = 1.0 - (n_uncovered / N_ref)
+        if covered_frac >= args.max_coverage:
+            print(f"[greedy] Reached target coverage {covered_frac:.2%} >= {args.max_coverage:.2%}. Stop.")
+            break
 
         # Adaptive optimization: reduce candidate pool size and increase centers per iteration as coverage increases
         # When coverage is high, we can use fewer candidates since remaining points are sparse
@@ -773,16 +827,28 @@ def main():
         # Ensure adaptive_n_centers_per_iter doesn't exceed available candidates
         adaptive_n_centers_per_iter = min(adaptive_n_centers_per_iter, n_cand)
         
-        # Auto-disable density sampling when we have many uncovered points (more efficient)
-        use_density_this_iter = (density_sampling_enabled and 
+        # Auto-disable density sampling when adaptive_concentration or when few uncovered
+        use_density_this_iter = (not adaptive_concentration and density_sampling_enabled and 
                                 n_uncovered > n_cand)
         
         # Convert uncovered/insufficient set to array once for reuse
         sample_set = insufficient_set if soft_cover else uncovered_set
         uncovered_array_indices = np.fromiter(sample_set, dtype=np.int64, count=n_uncovered)
         
+        # Adaptive concentration: use k-NN, per-candidate r_c, soft gain
+        if adaptive_concentration:
+            if n_uncovered <= n_cand:
+                cand = uncovered_array_indices
+            else:
+                cand = rng.choice(uncovered_array_indices, size=n_cand, replace=False)
+            k_search = min(max(args.adaptive_K * 3, 500), N_ref) if args.adaptive_method == "knn" else min(2000, N_ref)
+            Xq = X_ref[cand].astype(np.float32)
+            sims_all, I_all = index.search(Xq, min(k_search + 1, N_ref))  # +1 for self
+            lims = None
+            D = None
+            I = None
         # Merge density sampling and candidate evaluation into single range_search
-        if use_density_this_iter:
+        elif use_density_this_iter:
             # Density-aware sampling: sample larger pool, compute density, select top candidates
             # This is more efficient than random sampling when we have many uncovered points
             pool_size = min(adaptive_pool_size, n_uncovered)
@@ -839,8 +905,8 @@ def main():
             except Exception as e:
                 raise RuntimeError(f"FAISS range_search failed: {e}")
         
-        # Validate range_search output
-        if len(lims) != n_cand + 1:
+        # Validate range_search output (skip for adaptive - uses k-NN, lims is None)
+        if not adaptive_concentration and (lims is None or len(lims) != n_cand + 1):
             raise RuntimeError(f"range_search returned unexpected lims shape: {len(lims)} != {n_cand + 1}")
 
         # Evaluate gain for all candidates (to support multi-center selection)
@@ -907,9 +973,56 @@ def main():
                 return (i, gain, new_covered_list)
             return None
         
-        candidate_gains = []  # List of (cand_pos, gain, new_covered) where new_covered is array or list of (x,w)
+        def compute_gain_adaptive(i, sims_row, I_row, center_idx, covered_mass, kappa, N_ref, method, K_target, W_target):
+            """Adaptive concentration: per-candidate r_c. Returns (i, gain, r_c, new_covered_list)."""
+            arr_I = np.asarray(I_row)
+            mask = (arr_I != center_idx) & (arr_I >= 0) & (arr_I < N_ref)
+            sims = np.asarray(sims_row, dtype=np.float64)[mask]
+            neigh = arr_I[mask].astype(np.int64)
+            if len(sims) < 2:
+                return None
+            idx_s = np.argsort(-sims)
+            sims, neigh = sims[idx_s], neigh[idx_s]
+            if method == "knn":
+                n_take = min(K_target, len(neigh))
+            else:
+                wgts = np.exp(kappa * (sims - 1.0))
+                cs = np.cumsum(wgts)
+                idx = np.searchsorted(cs, W_target)
+                n_take = min(idx + 1, len(neigh)) if idx < len(neigh) else len(neigh)
+            if n_take == 0:
+                return None
+            r_c = 1.0 - float(sims[n_take - 1])
+            gain, new_cl = 0.0, []
+            for j in range(n_take):
+                x, s = int(neigh[j]), float(sims[j])
+                w = np.exp(kappa * (s - 1.0))
+                gain += max(0.0, w - covered_mass[x])
+                new_cl.append((x, w))
+            if gain > 0:
+                return (i, gain, r_c, new_cl)
+            return None
         
-        if soft_cover:
+        candidate_gains = []  # List of (cand_pos, gain, new_covered) or (cand_pos, gain, r_c, new_covered) for adaptive
+        
+        if adaptive_concentration:
+            adaptive_r_c_dict = {}
+            for i in range(n_cand):
+                center_idx = int(cand[i])
+                sims_row = sims_all[i]
+                I_row = I_all[i]
+                result = compute_gain_adaptive(i, sims_row, I_row, center_idx, covered_mass, kappa, N_ref,
+                    args.adaptive_method, args.adaptive_K, args.adaptive_W_target)
+                if result is not None:
+                    _i, gain, r_c, new_covered_list = result
+                    candidate_gains.append((_i, gain, new_covered_list))
+                    adaptive_r_c_dict[_i] = r_c
+            early_stop_soft = (early_stop_threshold / n_uncovered) * tau if n_uncovered > 0 else float('inf')
+            if candidate_gains and args.n_centers_per_iter == 1 and adaptive_n_centers_per_iter == 1:
+                best_gain = max(g for _, g, _ in candidate_gains)
+                if best_gain >= early_stop_soft and should_log:
+                    print(f"[greedy] Early stop (adaptive): best gain={best_gain:.1f}")
+        elif soft_cover:
             # Soft coverage: use marginal gain
             early_stop_soft = (early_stop_threshold / n_uncovered) * tau if n_uncovered > 0 else float('inf')
             for i in range(n_cand):
@@ -1059,8 +1172,10 @@ def main():
             centers_ref_ids.append(center_ref)
             gains.append(gain)
             
-            # Per-center radius (when --per_center_r)
-            if getattr(args, "per_center_r", False):
+            # Per-center radius (adaptive_concentration or --per_center_r)
+            if adaptive_concentration and cand_pos in adaptive_r_c_dict:
+                r_per_center.append(adaptive_r_c_dict[cand_pos])
+            elif getattr(args, "per_center_r", False):
                 k_nn = min(args.per_center_r_k + 1, N_ref)
                 sims, _ = index.search(X_ref[center_ref:center_ref + 1].astype(np.float32), k_nn)
                 sims = sims[0]
@@ -1136,15 +1251,15 @@ def main():
                     overlap_ratio = (sum_individual_gains - total_gain_this_iter) / sum_individual_gains if sum_individual_gains > 0 else 0.0
                     print(f"[greedy] iter={it+1:6d}  centers={len(centers_ref_ids):6d}  "
                           f"covered={covered_frac:.4f}  selected={n_select} centers  "
-                          f"best_gain={best_gain_this_iter:6d}  total_gain={total_gain_this_iter:6d}  "
+                          f"best_gain={best_gain_this_iter:8.1f}  total_gain={total_gain_this_iter:8.1f}  "
                           f"overlap={overlap_ratio:.1%}  elapsed={elapsed/60:.1f}m{remaining_time_str}{adaptive_info}")
                 else:
                     print(f"[greedy] iter={it+1:6d}  centers={len(centers_ref_ids):6d}  "
                           f"covered={covered_frac:.4f}  selected={n_select} centers  "
-                          f"best_gain={best_gain_this_iter:6d}  total_gain={total_gain_this_iter:6d}  elapsed={elapsed/60:.1f}m{remaining_time_str}{adaptive_info}")
+                          f"best_gain={best_gain_this_iter:8.1f}  total_gain={total_gain_this_iter:8.1f}  elapsed={elapsed/60:.1f}m{remaining_time_str}{adaptive_info}")
             else:
                 print(f"[greedy] iter={it+1:6d}  centers={len(centers_ref_ids):6d}  "
-                      f"covered={covered_frac:.4f}  best_gain={best_gain_this_iter:6d}  elapsed={elapsed/60:.1f}m{remaining_time_str}{adaptive_info}")
+                      f"covered={covered_frac:.4f}  best_gain={best_gain_this_iter:8.1f}  elapsed={elapsed/60:.1f}m{remaining_time_str}{adaptive_info}")
 
     # Build final centers matrix in original space
     if len(centers_ref_ids) == 0:
@@ -1199,9 +1314,15 @@ def main():
         "p90_gain": float(np.percentile(gains, 90) if gains else 0.0),
         "max_gain": float(np.max(gains)) if gains else 0,
         "soft_cover": soft_cover,
+        "adaptive_concentration": adaptive_concentration,
+        "adaptive_method": args.adaptive_method if adaptive_concentration else None,
+        "adaptive_K": args.adaptive_K if adaptive_concentration else None,
+        "adaptive_W_target": args.adaptive_W_target if adaptive_concentration else None,
+        "adaptive_kappa": args.adaptive_kappa if adaptive_concentration else None,
         "seed": int(args.seed),
         "n_candidates_per_iter": int(args.n_candidates_per_iter),
         "max_centers": int(args.max_centers),
+        "max_coverage": float(args.max_coverage),
         # Note: posting_lists_path removed - posting lists are computed in baselines.py
         # Note: total_assignments and avg_posting_length removed - computed in baselines.py
     }
