@@ -290,6 +290,59 @@ def log_evaluation_complete(task_name, time_taken=None):
 # ================== END FORMATTING FUNCTIONS ==================
 
 
+def load_checkpoint_model(checkpoint_path, max_length=512, hf_model_name=None):
+    """
+    Load a sentence transformer checkpoint without dense layers, or load a HuggingFace model.
+    If hf_model_name is provided, loads from HuggingFace; otherwise loads from checkpoint.
+    """
+    from sentence_transformers import SentenceTransformer, models
+    if hf_model_name:
+        print(f"Loading HuggingFace model: {hf_model_name}")
+        model = SentenceTransformer(hf_model_name)
+        print("Model loaded from HuggingFace Hub!")
+        return model
+    print(f"Loading checkpoint from: {checkpoint_path}")
+    transformer = models.Transformer(checkpoint_path, max_seq_length=max_length)
+    pooling_config_path = os.path.join(checkpoint_path, "1_Pooling", "config.json")
+    if os.path.exists(pooling_config_path):
+        with open(pooling_config_path, 'r') as f:
+            pooling_config = json.load(f)
+        pooling = models.Pooling(
+            transformer.get_word_embedding_dimension(),
+            pooling_mode_cls_token=pooling_config.get('pooling_mode_cls_token', False),
+            pooling_mode_mean_tokens=pooling_config.get('pooling_mode_mean_tokens', True),
+            pooling_mode_max_tokens=pooling_config.get('pooling_mode_max_tokens', False)
+        )
+    else:
+        pooling = models.Pooling(
+            transformer.get_word_embedding_dimension(),
+            pooling_mode_mean_tokens=True
+        )
+    model = SentenceTransformer(modules=[transformer, pooling])
+    print("Model loaded successfully (transformer + pooling only)")
+    return model
+
+
+def _is_sentence_transformer_checkpoint(model_name):
+    """True if model_name points to a directory that has 1_Pooling (SentenceTransformer layout)."""
+    path = _resolve_st_checkpoint_path(model_name)
+    return path is not None and os.path.isdir(path) and os.path.exists(os.path.join(path, "1_Pooling"))
+
+
+def _resolve_st_checkpoint_path(model_name):
+    """Resolve model_name to an absolute path; returns None if path does not exist."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    if os.path.isabs(model_name):
+        path = model_name
+    else:
+        path = os.path.normpath(os.path.join(base, model_name.strip("/")))
+    if os.path.isdir(path):
+        return path
+    if os.path.isdir(model_name):
+        return model_name
+    return path
+
+
 def mean_pooling(token_embeddings, attention_mask):
     """
     Performs mean pooling on token embeddings.
@@ -864,8 +917,8 @@ def main():
     parser.add_argument("--model_name", type=str, default=None, 
                        help="Path to pretrained model or model ID. Supported models: "
                             "allenai/specter2_base, patentbert, mpi-inno-comp/paecter, "
-                            "anferico/bert-for-patents, naver/splade-v2, bm25, bm25f, "
-                            "sparse_coverage, or checkpoint paths.")
+                            "anferico/bert-for-patents, datalyes/patembed-large, naver/splade-v2, bm25, bm25f, "
+                            "sparse_coverage, SentenceTransformer checkpoint dir (e.g. checkpoint-1142), or other checkpoint paths.")
     parser.add_argument("--output_dir", type=str, default='./baseline_eval', help="Output directory for evaluation results.")
     parser.add_argument("--local_rank", type=int, default=0, help="Local rank for distributed training")
     
@@ -1139,6 +1192,78 @@ def main():
             # save the embeddings
             torch.save(query_embeddings, f'{priorart_temp_dir}/query_embeddings.pt', pickle_protocol=4)
             torch.save(document_embeddings, f'{priorart_temp_dir}/document_embeddings.pt', pickle_protocol=4)
+
+        query_embeddings = query_embeddings.astype('float32')
+        document_embeddings = document_embeddings.astype('float32')
+        prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types)
+
+
+########################################################################################################################################################
+########################################################################################################################################################
+    elif args.model_name.lower() in ["datalyes/patembed-large", "patembed-large"]:
+        # Patembed-large: sentence-transformers bi-encoder (PatenTEB, arxiv 2510.22264)
+        # Paper Sec 5.2 & Table 11: retrieval evaluation MUST use task-specific prompt prefixes;
+        # Table 16 shows DAPFAM NDCG@100 0.377 with prompt vs 0.044 without.
+        #
+        # Model loads 16 prompts (model.prompts keys):
+        #   Retrieval: retrieval_IN, retrieval_OUT, retrieval_MIXED, retrieval_inventor,
+        #              title2full, problem2full, effect2full, effect2substance, problem2solution
+        #   Paraphrase: para_problem, para_solution
+        #   Classification: class_text2ipc3, class_bloom, class_nli_oldnew
+        #   Clustering: clusters_ext_full_ipc, clusters_inventor
+        # Usage: encode_query(texts, prompt_name="...") / encode_document(texts, prompt_name="...") use task prompts.
+        # Prior-art: citations span same/mixed/different domains (unstratified) → use retrieval_MIXED (not IN/OUT).
+        from sentence_transformers import SentenceTransformer
+
+        actual_model_id = "datalyes/patembed-large"
+        print(f"\n🔍 Loading Patembed (bi-encoder): {actual_model_id}")
+        model = SentenceTransformer(actual_model_id)
+        embedding_dim = model.get_sentence_embedding_dimension()
+        model.to(device)
+
+        # Use model's built-in retrieval_MIXED prompt (prior-art = unstratified, mixed domain)
+        PATEN_TEB_RETRIEVAL_PROMPT_NAME = "retrieval_MIXED"
+        print(f"   Using PatenTEB retrieval prompts: prompt_name={PATEN_TEB_RETRIEVAL_PROMPT_NAME} (required for best performance)")
+
+        # Cache with _prompted suffix so we never reuse old unprompted embeddings
+        query_cache = os.path.join(priorart_temp_dir, "query_embeddings_prompted.pt")
+        doc_cache = os.path.join(priorart_temp_dir, "document_embeddings_prompted.pt")
+        ############################ Prior-art Search evaluation ############################
+        if os.path.exists(query_cache) and os.path.exists(doc_cache):
+            print("Embeddings already created (with prompts)!")
+            query_embeddings = torch.load(query_cache, weights_only=False)
+            document_embeddings = torch.load(doc_cache, weights_only=False)
+        else:
+            query_embeddings_dict = {}
+            doc_embeddings_dict = {}
+            sep = getattr(model.tokenizer, 'sep_token', ' [SEP] ')
+            for texttype in ["abstract", "claim", "invention"]:
+                if texttype == "abstract":
+                    raw_query = [queries_df.iloc[i]['title'] + sep + queries_df.iloc[i][texttype] for i in range(len(queries_df))]
+                    raw_doc = [documents_df.iloc[i]['title'] + sep + documents_df.iloc[i][texttype] for i in range(len(documents_df))]
+                else:
+                    raw_query = [queries_df.iloc[i][texttype] for i in range(len(queries_df))]
+                    raw_doc = [documents_df.iloc[i][texttype] for i in range(len(documents_df))]
+                # Use built-in task prompts: encode_query(..., prompt_name) / encode_document(..., prompt_name)
+                try:
+                    query_embs = model.encode_query(raw_query, prompt_name=PATEN_TEB_RETRIEVAL_PROMPT_NAME, batch_size=256, show_progress_bar=True, convert_to_numpy=True)
+                    doc_embs = model.encode_document(raw_doc, prompt_name=PATEN_TEB_RETRIEVAL_PROMPT_NAME, batch_size=256, show_progress_bar=True, convert_to_numpy=True)
+                except Exception as e:
+                    # Fallback: manual prompts per PatenTEB Table 11 retrieval_MIXED (if model.prompts structure differs)
+                    PROMPT_QUERY = "encode query for mixed document retrieval: "
+                    PROMPT_DOC = "encode document for mixed retrieval: "
+                    query_texts = [PROMPT_QUERY + t for t in raw_query]
+                    doc_texts = [PROMPT_DOC + t for t in raw_doc]
+                    query_embs = model.encode(query_texts, batch_size=256, show_progress_bar=True, convert_to_numpy=True)
+                    doc_embs = model.encode(doc_texts, batch_size=256, show_progress_bar=True, convert_to_numpy=True)
+                query_embeddings_dict[texttype] = query_embs
+                doc_embeddings_dict[texttype] = doc_embs
+
+            query_embeddings = np.concatenate([query_embeddings_dict["abstract"], query_embeddings_dict["claim"], query_embeddings_dict["invention"]], axis=0)
+            document_embeddings = np.concatenate([doc_embeddings_dict["abstract"], doc_embeddings_dict["claim"], doc_embeddings_dict["invention"]], axis=0)
+            print(query_embeddings.shape, document_embeddings.shape)
+            torch.save(query_embeddings, query_cache, pickle_protocol=4)
+            torch.save(document_embeddings, doc_cache, pickle_protocol=4)
 
         query_embeddings = query_embeddings.astype('float32')
         document_embeddings = document_embeddings.astype('float32')
@@ -1836,6 +1961,46 @@ def main():
                                     citation_mapping, query_types, doc_types, model)
         
         print("\n✅ SPLADE-v2 evaluation completed!")
+
+
+########################################################################################################################################################
+########################################################################################################################################################
+    elif _is_sentence_transformer_checkpoint(args.model_name):
+        # SentenceTransformer-style checkpoint (e.g. checkpoint-1142): transformer + pooling only.
+        # No prompts, no special tokens, no separator; abstract = title + space + text, claim/invention = plain text.
+        _checkpoint_path = _resolve_st_checkpoint_path(args.model_name)
+        print(f"\n🔍 Loading SentenceTransformer checkpoint: {_checkpoint_path}")
+        model = load_checkpoint_model(_checkpoint_path, max_length=512, hf_model_name=None)
+        embedding_dim = model.get_sentence_embedding_dimension()
+        model.to(device)
+
+        if os.path.exists(f'{priorart_temp_dir}/query_embeddings.pt') and os.path.exists(f'{priorart_temp_dir}/document_embeddings.pt'):
+            print("Embeddings already created!")
+            query_embeddings = torch.load(f'{priorart_temp_dir}/query_embeddings.pt', weights_only=False)
+            document_embeddings = torch.load(f'{priorart_temp_dir}/document_embeddings.pt', weights_only=False)
+        else:
+            query_embeddings_dict = {}
+            doc_embeddings_dict = {}
+            for texttype in ["abstract", "claim", "invention"]:
+                if texttype == "abstract":
+                    raw_query = [queries_df.iloc[i]['title'] + " " + queries_df.iloc[i][texttype] for i in range(len(queries_df))]
+                    raw_doc = [documents_df.iloc[i]['title'] + " " + documents_df.iloc[i][texttype] for i in range(len(documents_df))]
+                else:
+                    raw_query = [queries_df.iloc[i][texttype] for i in range(len(queries_df))]
+                    raw_doc = [documents_df.iloc[i][texttype] for i in range(len(documents_df))]
+                query_embs = model.encode(raw_query, batch_size=256, show_progress_bar=True, convert_to_numpy=True)
+                doc_embs = model.encode(raw_doc, batch_size=256, show_progress_bar=True, convert_to_numpy=True)
+                query_embeddings_dict[texttype] = query_embs
+                doc_embeddings_dict[texttype] = doc_embs
+            query_embeddings = np.concatenate([query_embeddings_dict["abstract"], query_embeddings_dict["claim"], query_embeddings_dict["invention"]], axis=0)
+            document_embeddings = np.concatenate([doc_embeddings_dict["abstract"], doc_embeddings_dict["claim"], doc_embeddings_dict["invention"]], axis=0)
+            print(query_embeddings.shape, document_embeddings.shape)
+            torch.save(query_embeddings, f'{priorart_temp_dir}/query_embeddings.pt', pickle_protocol=4)
+            torch.save(document_embeddings, f'{priorart_temp_dir}/document_embeddings.pt', pickle_protocol=4)
+
+        query_embeddings = query_embeddings.astype('float32')
+        document_embeddings = document_embeddings.astype('float32')
+        prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types)
 
 
 ########################################################################################################################################################
