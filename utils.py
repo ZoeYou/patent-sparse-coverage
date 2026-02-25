@@ -3,13 +3,12 @@ Utility functions for patent document processing.
 """
 
 import json
+import os
 import re
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import torch
 import numpy as np
 from tqdm import tqdm
-import spacy
-from transformers import AutoTokenizer, AutoModel
 
 
 
@@ -19,6 +18,8 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Global spaCy model (initialized in main)
 NLP = None
+# Batch size for NLP.pipe(); 1create_N_embeddings sets this from --spacy_batch_size
+SPACY_PIPE_BATCH_SIZE = 64
 
 
 
@@ -52,6 +53,86 @@ def ensure_section_tokens(tokenizer, model):
     for token in section_tokens:
         token_id = tokenizer.convert_tokens_to_ids(token)
         assert token_id != tokenizer.unk_token_id, f"Failed to add token {token}"
+
+
+# -----------------------------------------------------------------------------
+# Encoder input format by model (single source of truth for embeddings + query)
+# -----------------------------------------------------------------------------
+ENCODER_FORMAT_SECTION_TOKENS = "section_tokens"   # title SEP [abstract] abstract, [claim] claim, [invention] invention
+ENCODER_FORMAT_TITLE_SEP_ONLY = "title_sep_only"   # title SEP abstract (no section tokens)
+
+DEFAULT_SEP = " [SEP] "  # fallback when tokenizer not available
+
+
+# Models that use title + sep + text only (no [abstract]/[claim]/[invention]). Aligned with baselines.py dense retrieval.
+_TITLE_SEP_ONLY_MODEL_IDS = (
+    "allenai/specter2_base",
+    "patentbert",
+    "mpi-inno-comp/paecter",
+    "datalyes/patembed-large",
+    "patembed-large",
+)
+
+
+def get_encoder_format_scheme(model_id: str) -> str:
+    """
+    Return the encoder input format scheme for a given model.
+    Aligned with baselines.py: specter2/patentbert use title+sep+text; paecter same; patembed same;
+    bert-for-patents uses [SEP] [abstract] / [claim] / [invention]; PatentMap (sparse_coverage default) uses section_tokens.
+    """
+    if not model_id:
+        return ENCODER_FORMAT_SECTION_TOKENS
+    mid = (model_id or "").strip().lower().replace("\\", "/")
+    for candidate in _TITLE_SEP_ONLY_MODEL_IDS:
+        if candidate.lower() in mid or mid.endswith(candidate.lower().split("/")[-1]):
+            return ENCODER_FORMAT_TITLE_SEP_ONLY
+    return ENCODER_FORMAT_SECTION_TOKENS
+
+
+def get_encoder_sep_for_model(model_id: str, tokenizer=None) -> str:
+    """
+    Return the separator string between title and abstract for this model.
+    When tokenizer is provided, uses tokenizer.sep_token so that models with
+    different separators (e.g. not "[SEP]") stay coherent. When tokenizer is
+    None, returns DEFAULT_SEP.
+    """
+    if tokenizer is None:
+        return DEFAULT_SEP
+    sep_token = getattr(tokenizer, "sep_token", None) or "[SEP]"
+    s = str(sep_token).strip()
+    return f" {s} " if s else DEFAULT_SEP
+
+
+def format_abstract_for_encoder(scheme: str, title: str, abstract: str, sep: str = DEFAULT_SEP) -> str:
+    """Format title+abstract for encoder input. sep is the model's separator (see get_encoder_sep_for_model)."""
+    title = (title or "").strip()
+    abstract = (abstract or "").strip()
+    if scheme == ENCODER_FORMAT_TITLE_SEP_ONLY:
+        return f"{title}{sep}{abstract}".strip() if (title or abstract) else ""
+    return f"{title}{sep}[abstract] {abstract}".strip()
+
+
+def format_claim_for_encoder(scheme: str, claim: str) -> str:
+    """Format claim for encoder input."""
+    claim = (claim or "").strip()
+    if scheme == ENCODER_FORMAT_TITLE_SEP_ONLY:
+        return claim
+    return f"[claim] {claim}".strip()
+
+
+def format_invention_for_encoder(scheme: str, invention: str) -> str:
+    """Format invention for encoder input."""
+    invention = (invention or "").strip()
+    if scheme == ENCODER_FORMAT_TITLE_SEP_ONLY:
+        return invention
+    return f"[invention] {invention}".strip()
+
+
+def get_chunk_sep_marker(scheme: str, sep: str = DEFAULT_SEP) -> str:
+    """Separator used to split title vs abstract when chunking. Must match format_abstract_for_encoder."""
+    if scheme == ENCODER_FORMAT_TITLE_SEP_ONLY:
+        return sep
+    return sep + "[abstract] "
 
 
 def remove_escape_and_decode(text: str) -> str:
@@ -123,20 +204,23 @@ def load_corpus(file_path: str) -> dict:
     return corpus
 
 
-def collect_doc_texts(documents: dict, max_docs: int = None) -> List[Tuple[str, str, str]]:
+def collect_doc_texts(
+    documents: dict,
+    max_docs: int = None,
+    format_scheme: Optional[str] = None,
+    sep: Optional[str] = None,
+    max_section_chars: Optional[int] = None,
+) -> List[Tuple[str, str, str]]:
     """
     Build ONE encoder input per document section (doc-level encoding).
-    
-    Each document is expanded into 3 section-specific inputs:
-    - abstract: "title [SEP] [abstract] <abstract>"
-    - claim: "[claim] <claim>"
-    - invention: "[invention] <invention>"
-    
-    Critical behavior: downstream we will truncate to max_length (default 512) tokens in the tokenizer,
-    and spaCy will only see the corresponding visible substring. So it's fine if these strings are long.
-
-    Returns: List of (doc_id, section, formatted_text)
+    format_scheme and sep (from get_encoder_sep_for_model) keep indexing and retrieval coherent.
+    max_section_chars: if set, truncate each section text to this many characters before encoding
+                       (encoder still sees only first max_length tokens; this bounds spaCy and tokenizer input).
     """
+    if format_scheme is None:
+        format_scheme = ENCODER_FORMAT_SECTION_TOKENS
+    if sep is None:
+        sep = DEFAULT_SEP
     items = []
     doc_items = list(documents.items())
 
@@ -144,22 +228,29 @@ def collect_doc_texts(documents: dict, max_docs: int = None) -> List[Tuple[str, 
         doc_items = doc_items[:max_docs]
         print(f"Processing only first {max_docs} documents")
 
+    def _trunc(s: str) -> str:
+        if max_section_chars is not None and len(s) > max_section_chars:
+            return s[:max_section_chars]
+        return s
+
     for doc_id, doc in doc_items:
         title = (doc.get('title', '') or '').strip()
         abstract = (doc.get('abstract', '') or '').strip()
         claim = (doc.get('claim', '') or '').strip()
         invention = (doc.get('invention', '') or '').strip()
 
-        # claim2all: expand each document into 3 section-specific inputs
         if abstract:
-            formatted_abs = f"{title} [SEP] [abstract] {abstract}".strip()
-            items.append((doc_id, "abstract", formatted_abs))
+            formatted_abs = format_abstract_for_encoder(format_scheme, title, abstract, sep=sep)
+            if formatted_abs:
+                items.append((doc_id, "abstract", _trunc(formatted_abs)))
         if claim:
-            formatted_claim = f"[claim] {claim}".strip()
-            items.append((doc_id, "claim", formatted_claim))
+            formatted_claim = format_claim_for_encoder(format_scheme, claim)
+            if formatted_claim:
+                items.append((doc_id, "claim", _trunc(formatted_claim)))
         if invention:
-            formatted_inv = f"[invention] {invention}".strip()
-            items.append((doc_id, "invention", formatted_inv))
+            formatted_inv = format_invention_for_encoder(format_scheme, invention)
+            if formatted_inv:
+                items.append((doc_id, "invention", _trunc(formatted_inv)))
 
     return items
 
@@ -167,31 +258,45 @@ def collect_doc_texts(documents: dict, max_docs: int = None) -> List[Tuple[str, 
 
 
 
-def create_contextual_span_embeddings(documents: dict, model, tokenizer, unit: str, max_docs: int = None, batch_size: int = 64, max_length: int = 512, keep_cls: bool = True, layer: str = "last", span_pooling: str = "mean") -> Tuple[dict, List[dict]]:
+def create_contextual_span_embeddings(
+    documents: dict,
+    model,
+    tokenizer,
+    unit: str,
+    max_docs: int = None,
+    batch_size: int = 64,
+    max_length: int = 512,
+    keep_cls: bool = True,
+    layer: str = "last",
+    span_pooling: str = "mean",
+    format_scheme: Optional[str] = None,
+    sep: Optional[str] = None,
+    keep_doc_mean: bool = False,
+    max_section_chars: Optional[int] = None,
+) -> Tuple[dict, List[dict]]:
     """
     Create contextual span embeddings for all documents using batch processing.
-    
-    Returns:
-        embeddings_by_section: dict with keys 'abstract', 'claim', 'invention', each containing np.array [N, hidden_dim]
-        metadata: List of dicts with span info
+    format_scheme and sep keep format coherent with retrieval. keep_doc_mean: one span per section = mean of tokens.
+    max_section_chars: if set, truncate each section text to this many chars before encoding (bounds spaCy/tokenizer input).
     """
+    if format_scheme is None:
+        format_scheme = ENCODER_FORMAT_SECTION_TOKENS
+    if sep is None:
+        sep = DEFAULT_SEP
     model.eval()
-    # Separate embeddings by section - use lists of numpy arrays for chunked accumulation
     all_embeddings_by_section = {
         'abstract': [],
         'claim': [],
         'invention': []
     }
-    # Temporary lists for accumulating embeddings before chunking
     temp_embeddings_by_section = {
         'abstract': [],
         'claim': [],
         'invention': []
     }
     all_metadata = []
-    
-    # Collect doc-level texts (ONE per doc-section)
-    doc_data = collect_doc_texts(documents, max_docs=max_docs)
+
+    doc_data = collect_doc_texts(documents, max_docs=max_docs, format_scheme=format_scheme, sep=sep, max_section_chars=max_section_chars)
     from collections import Counter
     section_counts = Counter(item[1] for item in doc_data)
     n_abs = section_counts.get("abstract", 0)
@@ -243,7 +348,8 @@ def create_contextual_span_embeddings(documents: dict, model, tokenizer, unit: s
                 max_length=max_length,
                 keep_cls=keep_cls,
                 layer=layer,
-                span_pooling=span_pooling
+                span_pooling=span_pooling,
+                keep_doc_mean=keep_doc_mean,
             )
             
             # Store results with proper metadata tracking, separated by section
@@ -478,6 +584,90 @@ def filter_span_quality(span_text: str) -> bool:
 
 
 
+def chunk_query_text(
+    full_text: str,
+    tokenizer,
+    max_length: int = 512,
+    title_prefix_max: int = 64,
+    stride_ratio: float = 1.0,
+    format_scheme: Optional[str] = None,
+    sep: Optional[str] = None,
+) -> List[Tuple[str, int]]:
+    """
+    Split a long query (title + sep + abstract) into chunks that fit within max_length tokens.
+    format_scheme and sep (from get_encoder_sep_for_model) must match format_abstract_for_encoder.
+    """
+    if not full_text or not full_text.strip():
+        return [("", 0)]
+
+    if format_scheme is None:
+        format_scheme = ENCODER_FORMAT_SECTION_TOKENS
+    if sep is None:
+        sep = DEFAULT_SEP
+    sep_marker = get_chunk_sep_marker(format_scheme, sep)
+    if sep_marker not in full_text:
+        # No [abstract] format: treat as single chunk (caller may truncate elsewhere)
+        return [(full_text.strip(), 0)]
+
+    parts = full_text.split(sep_marker, 1)
+    title_part = (parts[0] or "").strip()
+    abstract_part = (parts[1] or "").strip()
+    prefix_text = title_part + sep_marker
+
+    # Tokenize without special tokens to get content token counts
+    prefix_enc = tokenizer(
+        prefix_text,
+        add_special_tokens=False,
+        return_tensors=None,
+        return_offsets_mapping=False,
+    )
+    abstract_enc = tokenizer(
+        abstract_part,
+        add_special_tokens=False,
+        return_tensors=None,
+        return_offsets_mapping=False,
+    )
+    prefix_ids = prefix_enc if isinstance(prefix_enc, list) else prefix_enc["input_ids"]
+    abstract_ids = abstract_enc if isinstance(abstract_enc, list) else abstract_enc["input_ids"]
+    if not isinstance(prefix_ids, list):
+        prefix_ids = prefix_ids.tolist()
+    if not isinstance(abstract_ids, list):
+        abstract_ids = abstract_ids.tolist()
+    # Handle batch-of-one from tokenizer
+    if prefix_ids and isinstance(prefix_ids[0], list):
+        prefix_ids = prefix_ids[0]
+    if abstract_ids and isinstance(abstract_ids[0], list):
+        abstract_ids = abstract_ids[0]
+
+    # Truncate prefix to leave room for abstract in each chunk
+    content_max = max_length - 2  # [CLS] and [SEP] added by encoder
+    prefix_ids = prefix_ids[:title_prefix_max]
+    chunk_content_size = content_max - len(prefix_ids)
+    if chunk_content_size <= 0:
+        chunk_content_size = 1
+
+    if len(abstract_ids) <= chunk_content_size:
+        # Single chunk
+        chunk_ids = prefix_ids + abstract_ids
+        chunk_text = tokenizer.decode(chunk_ids, skip_special_tokens=False)
+        return [(chunk_text, 0)]
+
+    stride = max(1, int(chunk_content_size * stride_ratio))
+    out = []
+    start = 0
+    while start < len(abstract_ids):
+        end = min(start + chunk_content_size, len(abstract_ids))
+        segment_ids = abstract_ids[start:end]
+        chunk_ids = prefix_ids + segment_ids
+        chunk_text = tokenizer.decode(chunk_ids, skip_special_tokens=False)
+        global_offset_base = len(prefix_ids) + start
+        out.append((chunk_text, global_offset_base))
+        if end >= len(abstract_ids):
+            break
+        start += stride
+    return out
+
+
 def _visible_char_end_from_offset_mapping(offset_map_1d: torch.Tensor,
                                          input_ids_1d: torch.Tensor,
                                          special_token_ids: set) -> int:
@@ -506,22 +696,22 @@ def process_doc_batch(doc_texts: List[str],
                       doc_ids: List[str],
                       sections: List[str],
                       unit: str,
-                      model, tokenizer, device, max_length: int = 512, keep_cls: bool = True, layer: str = "last", span_pooling: str = "mean") -> List[Tuple[str, str, str, str, str, np.ndarray]]:
+                      model, tokenizer, device, max_length: int = 512, keep_cls: bool = True, layer: str = "last", span_pooling: str = "mean",
+                      keep_doc_mean: bool = False) -> List[Tuple[str, str, str, str, str, np.ndarray]]:
     """
     Process a batch of doc-section texts (one encoder pass per doc-section):
     1) Encode doc_texts in batch (max_length parameter, default 512)
     2) Derive visible char range from offset_mapping; truncate text to what encoder saw
-    3) Run spaCy on truncated text ONLY; extract semantic units (token/sentence/doc/noun_chunk)
+    3) Run spaCy on truncated text ONLY; extract semantic units (token/sentence/noun_chunk)
     4) Map unit char spans -> token spans via offset_mapping
-    5) Pool token embeddings for each unit using specified method (mean or max)
+    5) Pool token embeddings for each unit (mean or max)
+    6) If keep_doc_mean: append one span per doc = mean of all content token embeddings
 
     Args:
-        span_pooling: Pooling method for aggregating token embeddings within a span.
-                     'mean' (default): averages all tokens in the span
-                     'max': takes maximum value across tokens for each dimension
+        span_pooling: 'mean' or 'max' for aggregating token embeddings within a span.
+        keep_doc_mean: If True, keep one span per doc-section = mean over all content tokens (symmetric with keep_cls).
 
     Returns: List of (doc_id, section, doc_text, span_text_raw, span_text_canonical, span_embedding)
-             section is one of {"abstract","claim","invention"} (matching baselines.py style).
     """
     # Encode doc texts
     encoding = tokenizer(
@@ -579,14 +769,15 @@ def process_doc_batch(doc_texts: List[str],
     # Run spaCy only if needed (encoder_token bypasses spaCy entirely)
     docs_spacy = None
     if unit != "encoder_token":
-        docs_spacy = list(NLP.pipe(visible_texts, batch_size=64))
+        docs_spacy = list(NLP.pipe(visible_texts, batch_size=SPACY_PIPE_BATCH_SIZE))
 
     all_span_embeddings = []
     if unit == "encoder_token":
         for i, (doc_id, section, doc_text, vis_text) in enumerate(
             zip(doc_ids, sections, doc_texts, visible_texts)
         ):
-            if not vis_text:
+            st = (vis_text or "").strip()
+            if not st or not re.search(r"[a-zA-Z]", st):
                 continue
 
             token_embeddings = batch_embeddings[i]   # [seq_len, hidden_dim]
@@ -612,12 +803,30 @@ def process_doc_batch(doc_texts: List[str],
 
                 all_span_embeddings.append((doc_id, section, doc_text, tok_str, tok_canonical, tok_emb))
 
+        if keep_doc_mean:
+            for i in range(len(doc_ids)):
+                doc_id, section, doc_text = doc_ids[i], sections[i], doc_texts[i]
+                token_embeddings = batch_embeddings[i]
+                seq_input_ids = input_ids[i]
+                seq_attention = attention_mask[i]
+                embs = []
+                for tok_idx in range(seq_attention.shape[0]):
+                    if int(seq_attention[tok_idx].item()) == 0:
+                        continue
+                    if int(seq_input_ids[tok_idx].item()) in filtered_special_token_ids:
+                        continue
+                    embs.append(token_embeddings[tok_idx].cpu().numpy())
+                if embs:
+                    mean_emb = np.mean(embs, axis=0).astype(np.float32)
+                    mean_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
+                    all_span_embeddings.append((doc_id, section, doc_text, "[DOC_MEAN]", "[DOC_MEAN]", mean_emb))
         return all_span_embeddings
 
     for i, (doc_id, section, doc_text, vis_text, doc_spacy) in enumerate(
         zip(doc_ids, sections, doc_texts, visible_texts, docs_spacy)
     ):
-        if not vis_text:
+        st = (vis_text or "").strip()
+        if not st or not re.search(r"[a-zA-Z]", st):
             continue
 
         token_embeddings = batch_embeddings[i]  # [seq_len, hidden_dim]
@@ -629,7 +838,7 @@ def process_doc_batch(doc_texts: List[str],
         if unit == "spacy_token":
             # Strategy: noun_chunks are merged (one embedding per chunk),
             # other tokens remain individual (one embedding per token).
-            # Step 1: Collect all noun_chunks
+            # Step 1: Collect all noun_chunks (spaCy yields non-overlapping spans)
             noun_chunk_spans = []
             for chunk in doc_spacy.noun_chunks:
                 chunk_start = chunk.start_char
@@ -660,21 +869,19 @@ def process_doc_batch(doc_texts: List[str],
                 if not token_in_chunk:
                     char_spans.append((tok_start, tok_end, tok.text))
         elif unit == "spacy_sentence":
-            # For abstract section, split by [SEP] first, then process title and abstract separately
-            if section == "abstract" and "[SEP]" in vis_text:
-                # Split by [SEP] to separate title and abstract
-                sep_pos = vis_text.find("[SEP]")
+            # For abstract section, split by model's separator first (e.g. [SEP], </s>), then process title and abstract separately
+            sep_str = get_encoder_sep_for_model("", tokenizer)
+            if section == "abstract" and sep_str.strip() and sep_str in vis_text:
+                sep_pos = vis_text.find(sep_str)
                 if sep_pos >= 0:
-                    # Extract title part (before [SEP])
+                    # Extract title part (before separator)
                     title_part_raw = vis_text[:sep_pos]
                     title_part = title_part_raw.strip()
                     
-                    # Extract abstract part (after [SEP], keep [abstract] token if present)
-                    after_sep = vis_text[sep_pos + len("[SEP]"):]
-                    # Keep [abstract] token in abstract_part - don't remove it
+                    # Extract abstract part (after separator, keep [abstract] token if present)
+                    after_sep = vis_text[sep_pos + len(sep_str):]
                     abstract_part = after_sep.strip()
-                    # Find where abstract content starts in vis_text (including [abstract] token)
-                    abstract_content_start = sep_pos + len("[SEP]")
+                    abstract_content_start = sep_pos + len(sep_str)
                     # Skip leading whitespace
                     leading_ws_len = len(after_sep) - len(after_sep.lstrip())
                     abstract_content_start += leading_ws_len
@@ -721,7 +928,7 @@ def process_doc_batch(doc_texts: List[str],
                             char_spans.append((sent_start, sent_end, t))
                             sentences_found = True
                 else:
-                    # Fallback: if [SEP] not found, process normally
+                    # Fallback: if separator not found, process whole doc as one
                     sentences_found = False
                     for sent in doc_spacy.sents:
                         t = sent.text.strip()
@@ -734,7 +941,7 @@ def process_doc_batch(doc_texts: List[str],
                         char_spans.append((sent.start_char, sent.end_char, t))
                         sentences_found = True
             else:
-                # For non-abstract sections or abstract without [SEP], process normally
+                # For non-abstract sections or abstract without separator, process normally
                 sentences_found = False
                 for sent in doc_spacy.sents:
                     t = sent.text.strip()
@@ -755,10 +962,7 @@ def process_doc_batch(doc_texts: List[str],
             if not sentences_found and vis_text and len(vis_text.strip()) > 0:
                 # vis_text exists but no sentences found - this is okay, we'll just have CLS token
                 pass
-        elif unit == "doc":
-            t = vis_text.strip()
-            if t:
-                char_spans.append((0, len(vis_text), t))
+
         elif unit == "noun_chunk":
             for chunk in doc_spacy.noun_chunks:
                 t = chunk.text.strip()
@@ -827,7 +1031,25 @@ def process_doc_batch(doc_texts: List[str],
                 continue
 
             all_span_embeddings.append((doc_id, section, doc_text, span_text, span_text_canonical, span_emb))
-    
+
+    if keep_doc_mean:
+        for i in range(len(doc_ids)):
+            doc_id, section, doc_text = doc_ids[i], sections[i], doc_texts[i]
+            token_embeddings = batch_embeddings[i]
+            seq_input_ids = input_ids[i]
+            seq_attention = attention_mask[i]
+            embs = []
+            for tok_idx in range(seq_attention.shape[0]):
+                if int(seq_attention[tok_idx].item()) == 0:
+                    continue
+                if int(seq_input_ids[tok_idx].item()) in filtered_special_token_ids:
+                    continue
+                embs.append(token_embeddings[tok_idx].cpu().numpy())
+            if embs:
+                mean_emb = np.mean(embs, axis=0).astype(np.float32)
+                mean_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
+                all_span_embeddings.append((doc_id, section, doc_text, "[DOC_MEAN]", "[DOC_MEAN]", mean_emb))
+
     # Clean up intermediate tensors and variables to free memory
     del batch_embeddings
     del input_ids
@@ -1003,3 +1225,108 @@ def l2_normalize_inplace(X: np.ndarray, eps: float = 1e-12):
     """
     norms = np.linalg.norm(X, axis=1, keepdims=True)
     X /= np.clip(norms, eps, None)
+
+
+# ================== Evaluation / formatting helpers (used by baselines.py) ==================
+
+def log_embeddings_shape(embeddings_dict, context=""):
+    """Log embedding shapes consistently."""
+    if context:
+        print(f"{context}:")
+    for name, embeddings in embeddings_dict.items():
+        print(f"  {name}: {embeddings.shape}")
+
+
+def print_subsection_header(title, width=60):
+    """Print a formatted subsection header."""
+    print(f"\n{'-' * width}")
+    print(f" {title}")
+    print(f"{'-' * width}")
+
+
+def print_metric_table(results_dict, task_name, precision=4):
+    """
+    Print results in a clean table format.
+    results_dict: metric names -> values; task_name: evaluation task name.
+    """
+    print(f"\n📊 {task_name} Results:")
+    print("-" * 50)
+    if not results_dict:
+        print("   No results available")
+        return
+
+    def metric_sort_key(metric_name):
+        match = re.match(r'([^@]+)@?(\d+)?', metric_name)
+        if match:
+            base_name = match.group(1)
+            number = int(match.group(2)) if match.group(2) else 0
+            return (base_name, number)
+        return (metric_name, 0)
+
+    sorted_keys = sorted(results_dict.keys(), key=metric_sort_key)
+    for key in sorted_keys:
+        value = results_dict[key]
+        if isinstance(value, float):
+            formatted_value = f"{value:.6f}" if abs(value) < 0.001 else f"{value:.{precision}f}"
+        elif isinstance(value, dict):
+            formatted_value = str(value)
+        else:
+            formatted_value = str(value)
+        print(f"   📋 {key:<25}: {formatted_value}")
+
+
+def mean_pooling(token_embeddings, attention_mask):
+    """Mean pooling on token embeddings. Returns (batch_size, hidden_dim)."""
+    input_mask_expanded = attention_mask.unsqueeze(-1).to(token_embeddings.device)
+    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+
+
+def cls_pooling(model_output, attention_mask):
+    """CLS token as sentence representation."""
+    return model_output.last_hidden_state[:, 0]
+
+
+def compute_rankings(top_indices):
+    """Convert top_k indices to rank matrix (1-based)."""
+    rankings = np.empty_like(top_indices)
+    for query_idx, doc_order in enumerate(top_indices):
+        rankings[query_idx, doc_order] = np.arange(1, len(doc_order) + 1)
+    return rankings
+
+
+def find_centers(dense_model: str, tokenization_unit: str, include_cls: bool, search_dir: str = ".",
+                 mode: str = "abstract2abstract", layer: str = "last", centers_suffix: str = "") -> tuple:
+    """
+    Find centers directory and .npy file for sparse_coverage eval.
+    Returns (centers_path, centers_dir).
+    """
+    import glob
+    model_name = dense_model.strip("/").split("/")[-1].replace("/", "_").replace("\\", "_")
+    cls_suffix = "cls" if include_cls else "nocls"
+    expected_dir_pattern = f"centers_greedy_{mode}_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}{centers_suffix}"
+    search_pattern = os.path.join(search_dir, expected_dir_pattern)
+    matching_dirs = glob.glob(search_pattern)
+    if not matching_dirs:
+        matching_dirs = glob.glob(os.path.join(search_dir, "**", expected_dir_pattern), recursive=True)
+    if not matching_dirs:
+        raise FileNotFoundError(
+            f"Could not find centers directory matching: {expected_dir_pattern}\n"
+            f"Searched in: {os.path.abspath(search_dir)}\n"
+            f"  dense_model={dense_model}\n  tokenization_unit={tokenization_unit}\n"
+            f"  include_cls={include_cls}\n  mode={mode}\n  layer={layer}"
+        )
+    centers_dir = matching_dirs[0]
+    if len(matching_dirs) > 1:
+        matching_dirs.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        centers_dir = matching_dirs[0]
+        print(f"⚠️  Found {len(matching_dirs)} matching directories, using: {centers_dir}")
+    centers_pattern = os.path.join(centers_dir, "centers_greedy_r*.npy")
+    centers_files = glob.glob(centers_pattern)
+    if not centers_files:
+        raise FileNotFoundError(f"Could not find centers file in: {centers_dir}\nExpected pattern: centers_greedy_r*.npy")
+    centers_path = centers_files[0]
+    if len(centers_files) > 1:
+        centers_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        centers_path = centers_files[0]
+        print(f"⚠️  Found {len(centers_files)} centers files, using: {centers_path}")
+    return centers_path, centers_dir
