@@ -7,11 +7,9 @@ It loads a pretrained model and computes tokenization and embeddings on-the-fly 
 If precomputed embeddings are present in the expected temp directories, the script will load them to
 speed up repeated runs instead of recomputing embeddings.
 
-When evaluating checkpoint model directories the loader will try to load a tokenizer from the
-checkpoint and (if missing) reconstruct a tokenizer temporarily for evaluation purposes.
 
 Usage example:
-    python evaluate.py --model_name <path_or_model_id> --output_dir ./results
+    python evaluate.py --model_name <path_or_model_id> --temp_dir ./temp
 """
 
 from __future__ import absolute_import, division, unicode_literals
@@ -83,17 +81,15 @@ except ImportError as e:
 
 # Evaluation/formatting and sparse_coverage helpers (from utils)
 from utils import (
-    log_embeddings_shape,
     print_subsection_header,
     print_metric_table,
     mean_pooling,
     cls_pooling,
-    compute_rankings,
-    find_centers,
     get_encoder_format_scheme,
     ENCODER_FORMAT_SECTION_TOKENS,
     format_claim_for_encoder,
     format_invention_for_encoder,
+    find_centers,
 )
 
 
@@ -129,15 +125,14 @@ def _save_rankings_paths_from_args(args):
     )
 
 
-def prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=None, save_rankings_claim2all_path=None, eval_query_ids=None):
+def prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=None, save_rankings_claim2all_path=None, model_label="Dense"):
     """
-    Evaluate prior art search performance. 
-    
-    - If save_rankings_path is set, save abstract->abstract rankings. 
-    - If save_rankings_claim2all_path is set, save claim->all rankings. 
-    Format: {query_id: [doc_id, ...]}. 
-    
-    - If eval_query_ids is set (a set of query ID strings), only those queries are used for metric computation.
+    Evaluate prior art search performance.
+
+    - If save_rankings_path is set, save abstract->abstract rankings.
+    - If save_rankings_claim2all_path is set, save claim->all rankings.
+    Format: {query_id: [doc_id, ...]}.
+    - model_label: used for FLOPs/efficiency reporting (e.g. "Dense", "Specter2").
     """
     assert len(query_ids) == len(query_embeddings), f"query_ids and query_embeddings length mismatch: {len(query_ids)} vs {len(query_embeddings)}"
     assert len(doc_ids) == len(document_embeddings), f"doc_ids and document_embeddings length mismatch: {len(doc_ids)} vs {len(document_embeddings)}"
@@ -166,6 +161,7 @@ def prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_e
 
     faiss.normalize_L2(Q_emb)  # Normalize before similarity computation
     faiss.normalize_L2(D_emb)
+    _report_dense_flops(Q_emb, D_emb, "abstract->abstract", model_label=model_label)
     distances = Q_emb @ D_emb.T  # FAISS optimized cosine similarity
 
     # For each query row, we get top_k doc indices (sorted ascending by distance)
@@ -178,9 +174,6 @@ def prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_e
     for q_idx, retrieved_docs_indices in enumerate(top_k_indices):
         # 1) The query ID string, e.g. 'Q1'
         q_id_str = query_ids[q_idx]
-        # Skip queries not in the evaluation fold (if fold filter is active)
-        if eval_query_ids is not None and str(q_id_str) not in eval_query_ids:
-            continue
         # 2) The set of true doc IDs for that query, e.g. ['D3', 'D27']
         #    Make sure your citation_mapping stores them as a set/list
         true_labels = citation_mapping.get(q_id_str, [])
@@ -201,21 +194,7 @@ def prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_e
 
     # Compute metrics
     results_key = "abstract->abstract"
-    results[results_key] = {
-        'recall@10':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=10),
-        'recall@20':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=20),
-        'recall@50':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=50),
-        'recall@100': mean_recall_at_k(true_labels_list, predicted_labels_list, k=100),
-
-        'ndcg@10':  mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=10),
-        'ndcg@20':  mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=20),
-        'ndcg@50':  mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=50),
-        'ndcg@100': mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=100),
-
-        'mrr@10': mean_mrr_at_k(true_labels_list, predicted_labels_list, k=10),
-        'map': mean_average_precision(true_labels_list, predicted_labels_list, k=100),
-        'pres@100': mean_pres_at_k(true_labels_list, predicted_labels_list, k=100, N_max=100),
-    }
+    results[results_key] = _make_prior_art_metrics(true_labels_list, predicted_labels_list)
 
 
     ######## Task2: Claim-to-All evaluation ########
@@ -231,14 +210,13 @@ def prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_e
     D_ids = doc_ids
     faiss.normalize_L2(Q_emb)
     faiss.normalize_L2(D_emb)
+    _report_dense_flops(Q_emb, D_emb, "claim->all", model_label=model_label)
     distances = Q_emb @ D_emb.T
 
     top_k_indices = np.argsort(-distances, axis=1)[:, :300]  # top_k * 3 to ensure we have enough candidates
     true_labels_list, predicted_labels_list = [], []
     for q_idx, retrieved_docs_indices in enumerate(top_k_indices):
         q_id_str = query_ids[original_query_count + q_idx]  # qid for claim queries
-        if eval_query_ids is not None and str(q_id_str) not in eval_query_ids:
-            continue
         true_labels = citation_mapping.get(q_id_str, [])
         # Map indices to doc IDs (same doc can appear as abstract/claim/invention → dedupe by first occurrence)
         raw_predicted = [D_ids[d_idx] for d_idx in retrieved_docs_indices]
@@ -255,22 +233,10 @@ def prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_e
 
     # Compute metrics
     results_key = "claim->all"
-    results[results_key] = {
-            'recall@10':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=10),
-            'recall@20':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=20),
-            'recall@50':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=50),
-            'recall@100': mean_recall_at_k(true_labels_list, predicted_labels_list, k=100),
-
-            'ndcg@10':  mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=10),
-            'ndcg@20':  mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=20),
-            'ndcg@50':  mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=50),
-            'ndcg@100': mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=100),
-
-            'mrr@10': mean_mrr_at_k(true_labels_list, predicted_labels_list, k=10),
-            'map': mean_average_precision(true_labels_list, predicted_labels_list, k=100),
-            'pres@100': mean_pres_at_k(true_labels_list, predicted_labels_list, k=100, N_max=100),
-            'retrieved_sections': f"[{len(retrieved_sections)} queries with retrieved sections]"  # summary instead of full list
-        }
+    results[results_key] = _make_prior_art_metrics(
+        true_labels_list, predicted_labels_list,
+        retrieved_sections=f"[{len(retrieved_sections)} queries with retrieved sections]",
+    )
 
     # Optionally save claim->all rankings for hybrid fusion
     if save_rankings_claim2all_path:
@@ -317,6 +283,7 @@ def clefip_passage_evaluation(
     passage_embeddings,
     qrels_passage_ids,
     k=100,
+    model_label="Dense",
 ):
     """
     Evaluate CLEF-IP claims-to-passages: rank passages per query and compute metrics.
@@ -330,6 +297,7 @@ def clefip_passage_evaluation(
     assert Q.shape[1] == D.shape[1]
     faiss.normalize_L2(Q)
     faiss.normalize_L2(D)
+    _report_dense_flops(Q, D, "CLEF-IP passage", model_label=model_label)
     sim = Q @ D.T
     top_k_indices = np.argsort(-sim, axis=1)[:, :k]
     true_labels_list = []
@@ -337,19 +305,7 @@ def clefip_passage_evaluation(
     for q_idx, qid in enumerate(query_ids):
         true_labels_list.append(qrels_passage_ids.get(qid, []))
         predicted_labels_list.append([passage_ids[j] for j in top_k_indices[q_idx]])
-    results = {
-        'recall@10':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=10),
-        'recall@20':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=20),
-        'recall@50':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=50),
-        'recall@100': mean_recall_at_k(true_labels_list, predicted_labels_list, k=100),
-        'ndcg@10':  mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=10),
-        'ndcg@20':  mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=20),
-        'ndcg@50':  mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=50),
-        'ndcg@100': mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=100),
-        'mrr@10': mean_mrr_at_k(true_labels_list, predicted_labels_list, k=10),
-        'map': mean_average_precision(true_labels_list, predicted_labels_list, k=100),
-        'pres@100': mean_pres_at_k(true_labels_list, predicted_labels_list, k=100, N_max=100),
-    }
+    results = _make_prior_art_metrics(true_labels_list, predicted_labels_list)
     print_subsection_header("CLEF-IP 2013 EN claims-to-passages")
     print_metric_table(results, "Passage retrieval")
     return results
@@ -392,26 +348,108 @@ def _clefip_format_for_model(query_texts, passage_ids, passage_texts, model_name
     return query_fmt, passage_fmt
 
 
-def _report_bm25_posting_stats(retriever, label: str):
-    """Report posting list (doc-level) length stats for a bm25s.BM25() index. BM25 uses inverted index (term -> doc postings)."""
+def _report_flops_and_postings_one_line(
+    total_postings: int,
+    n_non_empty_terms: int,
+    n_terms: int,
+    label: str,
+    total_flops: Optional[int] = None,
+    n_queries: int = 0,
+    model_label: str = "Sparse",
+):
+    """Report FLOPs (if available) and one line: total postings + non-empty term count. FLOPs = 2 * sum over queries of (sum of |L_t| for t in supp(q))."""
+    print(f"\n📊 Efficiency — {model_label} {label}")
+    if total_flops is not None and n_queries > 0:
+        print(f"   FLOPs: total={total_flops:,}, mean per query={total_flops // n_queries:,} (2 × sum of posting lengths per query term)")
+    else:
+        raise RuntimeError(
+            f"FLOPs evaluation required but not available for {model_label} {label}: "
+            "query term ids or vocab mapping unavailable. Ensure query_tokens_list is passed and retriever supports get_tokens_ids()."
+        )
+    print(f"   Total postings: {total_postings:,}, non-empty terms: {n_non_empty_terms:,} / {n_terms:,}")
+
+
+def _report_dense_flops(Q_emb, D_emb, label: str, model_label: str = "Dense"):
+    """Dense retrieval: FLOPs = 2 × n_queries × n_docs × dim (similarity matrix Q @ D.T)."""
+    n_q, dim = Q_emb.shape[0], Q_emb.shape[1]
+    n_d = D_emb.shape[0]
+    total_flops = 2 * n_q * n_d * dim
+    print(f"\n📊 Efficiency — {model_label} {label}")
+    print(f"   FLOPs: total={total_flops:,}, mean per query={total_flops // n_q if n_q else 0:,} (2×Q×N×d similarity)")
+    print(f"   Documents: {n_d:,}, dimension: {dim:,}")
+
+
+def _report_bm25_posting_stats(retriever, label: str, query_tokens_list=None):
+    """Report total postings + non-empty terms; if query_tokens_list is provided, compute FLOPs.
+    bm25s: tokenize() returns a Tokenized object (.ids, .vocab); use retriever.get_tokens_ids() to map query tokens to index term ids for FLOPs."""
     doc_freq = getattr(retriever, "doc_freq", None)
+    if doc_freq is None and hasattr(retriever, "scores") and isinstance(getattr(retriever, "scores", None), dict):
+        indptr = retriever.scores.get("indptr")
+        if indptr is not None:
+            doc_freq = np.diff(np.asarray(indptr)).astype(np.float64)
     if doc_freq is None:
-        print(f"\n📊 BM25 ({label}): inverted index built (library does not expose posting list lengths).")
+        print(f"\n📊 BM25 ({label}): inverted index built (posting lengths not exposed by library).")
         return
     pl_lens = np.asarray(doc_freq).ravel().astype(np.float64)
-    non_empty = pl_lens[pl_lens > 0]
     n_empty = int(np.sum(pl_lens == 0))
     total_entries = int(np.sum(pl_lens))
     V = len(pl_lens)
-    print(f"\n📊 Posting list (doc-level) length statistics — BM25 {label}")
-    print(f"   Terms: {V:,} total, {n_empty:,} zero-df, {V - n_empty:,} non-zero")
-    print(f"   Total postings: {total_entries:,}")
-    if len(non_empty) > 0:
-        print(f"   Length (non-zero df): min={int(non_empty.min()):,}, max={int(non_empty.max()):,}, "
-              f"mean={float(non_empty.mean()):.1f}, median={int(np.median(non_empty)):,}")
-        for p in (90, 95, 99):
-            print(f"   p{p}: {int(np.percentile(non_empty, p)):,}")
-    print(f"   (Length = document frequency per term; affects retrieval cost.)")
+    total_flops = None
+    n_queries = 0
+    if query_tokens_list is not None and hasattr(retriever, "get_tokens_ids"):
+        # Normalise to list of list of token strings so we can use retriever.get_tokens_ids()
+        queries_as_str_lists = []
+        if hasattr(query_tokens_list, "ids") and hasattr(query_tokens_list, "vocab"):
+            # bm25s Tokenized: .vocab can be token->id or id->token; .ids is list of list of id
+            vocab = getattr(query_tokens_list, "vocab", {})
+            if not vocab:
+                pass
+            else:
+                sample_k = next(iter(vocab.keys()))
+                if isinstance(sample_k, (int, np.integer)):
+                    id2token = vocab
+                else:
+                    id2token = {v: k for k, v in vocab.items()}
+                for q_ids in query_tokens_list.ids:
+                    queries_as_str_lists.append([id2token.get(i, "") for i in q_ids if i in id2token])
+        elif isinstance(query_tokens_list, (list, tuple)) and len(query_tokens_list) > 0:
+            first = query_tokens_list[0]
+            if isinstance(first, (list, tuple)):
+                if len(first) > 0 and isinstance(first[0], str):
+                    queries_as_str_lists = list(query_tokens_list)
+                else:
+                    # list of list of int: need id->token from retriever to get strings
+                    id2token = getattr(retriever, "vocab_dict", None)
+                    if id2token is not None and not callable(id2token) and id2token:
+                        # vocab_dict can be token->id; if keys are int then it's id->token
+                        sample_k = next(iter(id2token.keys()))
+                        if isinstance(sample_k, (int, np.integer)):
+                            queries_as_str_lists = [[id2token.get(i, "") for i in q] for q in query_tokens_list]
+                        else:
+                            queries_as_str_lists = []
+                    else:
+                        queries_as_str_lists = []
+            else:
+                queries_as_str_lists = []
+        if queries_as_str_lists:
+            n_queries = len(queries_as_str_lists)
+            flops_sum = 0
+            for q_tokens in queries_as_str_lists:
+                if not q_tokens:
+                    continue
+                try:
+                    ids = retriever.get_tokens_ids(list(q_tokens))
+                except Exception:
+                    continue
+                ids = [i for i in ids if 0 <= i < len(pl_lens)]
+                for t in set(ids):
+                    flops_sum += int(pl_lens[t])
+            if flops_sum > 0:
+                total_flops = 2 * flops_sum
+    _report_flops_and_postings_one_line(
+        int(total_entries), V - n_empty, V, label,
+        total_flops=total_flops, n_queries=n_queries, model_label="BM25"
+    )
 
 
 def _splade_build_inverted_index(doc_sparse, vocab_size: int):
@@ -475,21 +513,36 @@ def _splade_retrieve_with_index(query_sparse, posting_lists, top_k: int):
     return top_indices
 
 
-def _report_splade_posting_stats(posting_lists, label: str):
-    """Report posting list length for SPLADE inverted index."""
-    pl_lens = np.array([len(pl) for pl in posting_lists], dtype=np.float64)
-    non_empty = pl_lens[pl_lens > 0]
-    n_empty = int(np.sum(pl_lens == 0))
-    total_entries = int(np.sum(pl_lens))
-    V = len(pl_lens)
-    print(f"\n📊 Posting list (doc-level) — SPLADE {label}")
-    print(f"   Terms: {V:,} total, {n_empty:,} zero-df, {V - n_empty:,} non-zero")
-    print(f"   Total postings: {total_entries:,}")
-    if len(non_empty) > 0:
-        print(f"   Length (non-zero df): min={int(non_empty.min()):,}, max={int(non_empty.max()):,}, mean={float(non_empty.mean()):.1f}, median={int(np.median(non_empty)):,}")
-        for p in (90, 95, 99):
-            print(f"   p{p}: {int(np.percentile(non_empty, p)):,}")
-    print(f"   (Inverted index: term -> (doc_idx, weight).)")
+def _report_splade_flops_and_postings(posting_lists, query_sparse, label: str):
+    """FLOPs = 2 * sum over queries of (sum of |L_t| for t in supp(q)). Plus one line: total postings, non-empty terms."""
+    from collections import defaultdict
+    if hasattr(query_sparse, "is_sparse") and query_sparse.is_sparse:
+        query_sparse = query_sparse.coalesce()
+        q_row = query_sparse.indices()[0].cpu().numpy()
+        q_col = query_sparse.indices()[1].cpu().numpy()
+    else:
+        if isspmatrix(query_sparse):
+            coo = query_sparse.tocoo()
+            q_row, q_col = coo.row, coo.col
+        else:
+            arr = np.asarray(query_sparse)
+            q_row, q_col = np.where(arr != 0)
+    q_terms = defaultdict(set)
+    for i in range(len(q_row)):
+        q_terms[int(q_row[i])].add(int(q_col[i]))
+    n_queries = max(q_terms.keys()) + 1 if q_terms else 0
+    total_flops = 0
+    for q_idx in range(n_queries):
+        for t in q_terms.get(q_idx, []):
+            if t < len(posting_lists):
+                total_flops += 2 * len(posting_lists[t])
+    total_postings = sum(len(pl) for pl in posting_lists)
+    n_non_empty = sum(1 for pl in posting_lists if len(pl) > 0)
+    V = len(posting_lists)
+    _report_flops_and_postings_one_line(
+        total_postings, n_non_empty, V, label,
+        total_flops=total_flops if n_queries > 0 else None, n_queries=n_queries, model_label="SPLADE"
+    )
 
 
 def _to_numpy_if_torch(*arrays):
@@ -545,31 +598,20 @@ def run_clefip_eval(args):
     model_name = args.model_name.lower() if hasattr(args.model_name, "lower") else str(args.model_name).lower()
 
     if model_name == "bm25":
-        from rank_bm25 import BM25Okapi
-        tokenized_passages = [t.split() for t in passage_texts]
-        bm25 = BM25Okapi(tokenized_passages)
+        # Use same BM25 stack as prior-art: bm25s + stemmer, one logic for both tasks
+        import bm25s
+        import snowballstemmer
+        stemmer = snowballstemmer.stemmer("english")
+        passage_tokens = bm25s.tokenize(passage_texts, stopwords="en", stemmer=stemmer)
+        query_tokens = bm25s.tokenize(query_texts, stemmer=stemmer)
+        retriever = bm25s.BM25()
+        retriever.index(passage_tokens)
+        _report_bm25_posting_stats(retriever, "CLEF-IP passage", query_tokens_list=query_tokens)
         k = 100
-        true_labels_list = []
-        predicted_labels_list = []
-        for qid, qtext in zip(query_ids, query_texts):
-            tokenized_q = qtext.split()
-            scores = bm25.get_scores(tokenized_q)
-            top_k = np.argsort(-scores)[:k]
-            predicted_labels_list.append([passage_ids[j] for j in top_k])
-            true_labels_list.append(qrels_passage_ids.get(qid, []))
-        results = {
-            "recall@10":  mean_recall_at_k(true_labels_list, predicted_labels_list, k=10),
-            "recall@20":  mean_recall_at_k(true_labels_list, predicted_labels_list, k=20),
-            "recall@50":  mean_recall_at_k(true_labels_list, predicted_labels_list, k=50),
-            "recall@100": mean_recall_at_k(true_labels_list, predicted_labels_list, k=100),
-            "ndcg@10":  mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=10),
-            "ndcg@20":  mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=20),
-            "ndcg@50":  mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=50),
-            "ndcg@100": mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=100),
-            "mrr@10": mean_mrr_at_k(true_labels_list, predicted_labels_list, k=10),
-            "map": mean_average_precision(true_labels_list, predicted_labels_list, k=100),
-            "pres@100": mean_pres_at_k(true_labels_list, predicted_labels_list, k=100, N_max=100),
-        }
+        clefip_results, _ = retriever.retrieve(query_tokens, k=k)
+        predicted_labels_list = [[passage_ids[j] for j in result] for result in clefip_results]
+        true_labels_list = [qrels_passage_ids.get(qid, []) for qid in query_ids]
+        results = _make_prior_art_metrics(true_labels_list, predicted_labels_list)
         print_subsection_header("CLEF-IP 2013 EN claims-to-passages")
         print_metric_table(results, "BM25 passage retrieval")
         return
@@ -601,7 +643,8 @@ def run_clefip_eval(args):
             return np.vstack(embs)
         query_emb = _encode(query_texts)
         passage_emb = _encode(passage_texts)
-        clefip_passage_evaluation(query_ids, passage_ids, query_emb, passage_emb, qrels_passage_ids, k=100)
+        _cl_label = "Specter2" if "specter" in model_name else "PatentBERT"
+        clefip_passage_evaluation(query_ids, passage_ids, query_emb, passage_emb, qrels_passage_ids, k=100, model_label=_cl_label)
         return
 
     if model_name in ["mpi-inno-comp/paecter", "anferico/bert-for-patents"]:
@@ -622,7 +665,8 @@ def run_clefip_eval(args):
             return np.vstack(embs)
         query_emb = _encode(query_texts)
         passage_emb = _encode(passage_texts)
-        clefip_passage_evaluation(query_ids, passage_ids, query_emb, passage_emb, qrels_passage_ids, k=100)
+        _cl_label = "PAECTer" if "paecter" in model_name else "bert-for-patents"
+        clefip_passage_evaluation(query_ids, passage_ids, query_emb, passage_emb, qrels_passage_ids, k=100, model_label=_cl_label)
         return
 
     if model_name in ["datalyes/patembed-large", "patembed-large"]:
@@ -637,7 +681,7 @@ def run_clefip_eval(args):
         except Exception:
             query_emb = model.encode(query_texts, batch_size=256, show_progress_bar=True, convert_to_numpy=True)
             passage_emb = model.encode(passage_texts, batch_size=256, show_progress_bar=True, convert_to_numpy=True)
-        clefip_passage_evaluation(query_ids, passage_ids, query_emb, passage_emb, qrels_passage_ids, k=100)
+        clefip_passage_evaluation(query_ids, passage_ids, query_emb, passage_emb, qrels_passage_ids, k=100, model_label="Patembed")
         return
 
     # Fallback: generic AutoModel + mean pooling (raw formatted text with section tags)
@@ -656,7 +700,7 @@ def run_clefip_eval(args):
         return np.vstack(embs)
     query_emb = _encode(query_texts)
     passage_emb = _encode(passage_texts)
-    clefip_passage_evaluation(query_ids, passage_ids, query_emb, passage_emb, qrels_passage_ids, k=100)
+    clefip_passage_evaluation(query_ids, passage_ids, query_emb, passage_emb, qrels_passage_ids, k=100, model_label="Dense")
 
 
 def main():
@@ -666,7 +710,7 @@ def main():
                             "allenai/specter2_base, patentbert, mpi-inno-comp/paecter, "
                             "anferico/bert-for-patents, datalyes/patembed-large, naver/splade-v2, bm25, "
                             "sparse_coverage, SentenceTransformer checkpoint dir (e.g. checkpoint-1142), or other checkpoint paths.")
-    parser.add_argument("--output_dir", type=str, default='./baseline_eval', help="Output directory for evaluation results.")
+    parser.add_argument("--temp_dir", type=str, default="./temp", help="Temporary directory for embeddings creation and evaluation.")
     parser.add_argument("--local_rank", type=int, default=0, help="Local rank for distributed training")
     
     # Parameters for sparse_coverage model
@@ -745,15 +789,11 @@ def main():
                        help="If set (directory path), save rankings for hybrid fusion: "
                             "rankings_abstract2abstract.json and rankings_claim2all.json. "
                             "Format: {query_id: [doc_id, ...]}. Use with dense or sparse_coverage runs.")
-    parser.add_argument("--kfold", action="store_true", default=False,
-                       help="Enable 5-fold cross-validation. Automatically loads (or generates) "
-                            "query_folds/folds_meta.json. Runs evaluation for each fold's test set "
-                            "and reports per-fold metrics plus mean±std. Document indexing runs once; "
-                            "only metric computation is repeated per fold.")
     parser.add_argument("--clefip_doc_root", type=str, default='./clefip2013/01_document_collection/01_extracted',
                        help="Path to extracted CLEF-IP 01 document collection. If set, official CLEF-IP EN evaluation runs after prior-art. If unset, CLEF-IP is skipped. Extract with: bash clefip2013/extract_01_collection.sh")
 
     args = parser.parse_args()
+    save_rankings_abs, save_rankings_claim = _save_rankings_paths_from_args(args)
 
     print(f"Running evaluation for model: {args.model_name}")
     print("=============================================>>>>>>>>>")
@@ -763,38 +803,23 @@ def main():
         print("Error: --model_name is required")
         return
 
-    # Initialize temp directories for all models (not just non-bm25/non-checkpoint)
-    model_basename = args.model_name.strip("/").split("/")[-1]
-    priorart_temp_dir = os.path.join(args.output_dir, f'priorart_temp_{model_basename}')
+    # Initialize temp directories for all models (sanitize model_name so HF IDs like org/repo do not create nested dirs)
+    _temp_suffix = (args.model_name or "").replace("/", "_").strip("_") or "model"
+    priorart_temp_dir = os.path.join(args.temp_dir, f'priorart_temp_{_temp_suffix}')
     
     # Create directories if they don't exist (for non-BM25 models)
-    if not ("bm25" in args.model_name):
+    if not (args.model_name and "bm25" in args.model_name.lower()):
         for temp_dir in [priorart_temp_dir]:
             if not os.path.exists(temp_dir):
                 os.makedirs(temp_dir)
                 print(f"Created directory: {temp_dir}")
 
-    # Load k-fold cross-validation metadata
-    args._kfold_meta = None
-    args._eval_query_ids_set = None
-    if getattr(args, "kfold", False):
-        kfold_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "query_folds", "folds_meta.json")
-        if not os.path.exists(kfold_path):
-            print(f"📊 K-fold metadata not found at {kfold_path}, generating...")
-            import subprocess
-            gen_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generate_query_folds.py")
-            subprocess.check_call([sys.executable, gen_script])
-        with open(kfold_path, "r") as f:
-            args._kfold_meta = json.load(f)
-        n_folds = args._kfold_meta["n_folds"]
-        print(f"📊 K-fold CV enabled: {n_folds} folds, {args._kfold_meta['n_queries']} queries")
-
     # Print evaluation header
     print(f"📋 Model: {args.model_name}")
-    print(f"📁 Output Directory: {args.output_dir}")
+    print(f"📁 Output Directory: {args.temp_dir}")
 
 
-    ############################################## crete dataset for prior-art search ##################################################
+    ############################################## create dataset for prior-art search ##################################################
     print("Running Prior-art search task.")
     Prior_art_dataset_dir = './patentmap_eval/data/downstream/perf200'
 
@@ -890,7 +915,7 @@ def main():
         )
         query_embeddings = query_embeddings.astype('float32')
         document_embeddings = document_embeddings.astype('float32')
-        prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=_save_rankings_paths_from_args(args)[0], save_rankings_claim2all_path=_save_rankings_paths_from_args(args)[1], eval_query_ids=getattr(args, '_eval_query_ids_set', None))
+        prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=save_rankings_abs, save_rankings_claim2all_path=save_rankings_claim, model_label="Specter2")
 
 
 ########################################################################################################################################################
@@ -955,7 +980,8 @@ def main():
         )
         query_embeddings = query_embeddings.astype('float32')
         document_embeddings = document_embeddings.astype('float32')
-        prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=_save_rankings_paths_from_args(args)[0], save_rankings_claim2all_path=_save_rankings_paths_from_args(args)[1], eval_query_ids=getattr(args, '_eval_query_ids_set', None))
+        _paecter_label = "PAECTer" if "paecter" in args.model_name.lower() else "bert-for-patents"
+        prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=save_rankings_abs, save_rankings_claim2all_path=save_rankings_claim, model_label=_paecter_label)
 
 
 ########################################################################################################################################################
@@ -1019,12 +1045,12 @@ def main():
         )
         query_embeddings = query_embeddings.astype('float32')
         document_embeddings = document_embeddings.astype('float32')
-        prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=_save_rankings_paths_from_args(args)[0], save_rankings_claim2all_path=_save_rankings_paths_from_args(args)[1], eval_query_ids=getattr(args, '_eval_query_ids_set', None))
+        prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=save_rankings_abs, save_rankings_claim2all_path=save_rankings_claim, model_label="Patembed")
 
 
 ########################################################################################################################################################
 ########################################################################################################################################################
-    elif args.model_name == "bm25":
+    elif args.model_name and args.model_name.lower() == "bm25":
         import bm25s
         import snowballstemmer
 
@@ -1045,11 +1071,9 @@ def main():
         # Create and index BM25 model
         abstract_retriever = bm25s.BM25()
         abstract_retriever.index(abstract_corpus_tokens)
-        # Posting list (doc-level) stats: BM25 uses inverted index (term -> doc postings)
-        _report_bm25_posting_stats(abstract_retriever, "Abstract-to-Abstract")
-
-        # Tokenize queries and retrieve
+        # Tokenize queries then report efficiency (postings + FLOPs when query term ids available)
         abstract_queries_tokens = bm25s.tokenize(abstract_test_corpus.tolist(), stemmer=stemmer)
+        _report_bm25_posting_stats(abstract_retriever, "Abstract-to-Abstract", query_tokens_list=abstract_queries_tokens)
         abstract_results, _ = abstract_retriever.retrieve(abstract_queries_tokens, k=100)
         
         # Map results back to document IDs (only abstract docs)
@@ -1059,21 +1083,13 @@ def main():
         query_ids_list = list(queries.keys())
         true_labels_list = [citation_mapping.get(q, []) for q in query_ids_list]
         
-        bm25_abstract_results = {}
-        for k in [10, 20, 50, 100]:
-            bm25_abstract_results[f'recall@{k}'] = mean_recall_at_k(true_labels_list, abstract_retrieved_ids, k=k)
-        bm25_abstract_results['ndcg@10'] = mean_ndcg_at_k(true_labels_list, abstract_retrieved_ids, k=10)
-        bm25_abstract_results['mrr@10'] = mean_mrr_at_k(true_labels_list, abstract_retrieved_ids, k=10)
-        bm25_abstract_results['map'] = mean_average_precision(true_labels_list, abstract_retrieved_ids, k=100)
-        bm25_abstract_results['pres@100'] = mean_pres_at_k(true_labels_list, abstract_retrieved_ids, k=100, N_max=100)
-        
+        bm25_abstract_results = _make_prior_art_metrics(true_labels_list, abstract_retrieved_ids)
         print_metric_table(bm25_abstract_results, "BM25: Abstract → Abstract")
-        path_abs, path_claim = _save_rankings_paths_from_args(args)
-        if path_abs:
+        if save_rankings_abs:
             ranking_dict = {str(query_ids_list[i]): abstract_retrieved_ids[i] for i in range(len(abstract_retrieved_ids))}
-            with open(path_abs, "w") as f:
+            with open(save_rankings_abs, "w") as f:
                 json.dump(ranking_dict, f, indent=0)
-            print(f"   Saved abstract->abstract rankings to {path_abs} ({len(abstract_retrieved_ids)} queries)")
+            print(f"   Saved abstract->abstract rankings to {save_rankings_abs} ({len(abstract_retrieved_ids)} queries)")
         
         # 2) Claim-to-All evaluation (like other models' claim->all)
         print("\nBM25 Evaluation 2: Claim-to-All retrieval")
@@ -1087,9 +1103,8 @@ def main():
         all_corpus_tokens = bm25s.tokenize(all_train_corpus, stopwords="en", stemmer=stemmer)
         all_retriever = bm25s.BM25()
         all_retriever.index(all_corpus_tokens)
-        _report_bm25_posting_stats(all_retriever, "Claim-to-All")
-
         claim_queries_tokens = bm25s.tokenize(claim_test_corpus, stemmer=stemmer)
+        _report_bm25_posting_stats(all_retriever, "Claim-to-All", query_tokens_list=claim_queries_tokens)
         claim_results, _ = all_retriever.retrieve(claim_queries_tokens, k=300)
         
         original_doc_count = len(original_doc_ids)
@@ -1107,20 +1122,13 @@ def main():
             unique_doc_ids = list(dict.fromkeys(doc_ids_for_query))[:100]
             claim_retrieved_ids.append(unique_doc_ids)
         
-        bm25_claim_results = {}
-        for k in [10, 20, 50, 100]:
-            bm25_claim_results[f'recall@{k}'] = mean_recall_at_k(true_labels_list, claim_retrieved_ids, k=k)
-        bm25_claim_results['ndcg@10'] = mean_ndcg_at_k(true_labels_list, claim_retrieved_ids, k=10)
-        bm25_claim_results['mrr@10'] = mean_mrr_at_k(true_labels_list, claim_retrieved_ids, k=10)
-        bm25_claim_results['map'] = mean_average_precision(true_labels_list, claim_retrieved_ids, k=100)
-        bm25_claim_results['pres@100'] = mean_pres_at_k(true_labels_list, claim_retrieved_ids, k=100, N_max=100)
-        
+        bm25_claim_results = _make_prior_art_metrics(true_labels_list, claim_retrieved_ids)
         print_metric_table(bm25_claim_results, "BM25: Claim → All Sections")
-        if path_claim:
+        if save_rankings_claim:
             ranking_dict = {str(query_ids_list[i]): claim_retrieved_ids[i] for i in range(len(claim_retrieved_ids))}
-            with open(path_claim, "w") as f:
+            with open(save_rankings_claim, "w") as f:
                 json.dump(ranking_dict, f, indent=0)
-            print(f"   Saved claim->all rankings to {path_claim} ({len(claim_retrieved_ids)} queries)")
+            print(f"   Saved claim->all rankings to {save_rankings_claim} ({len(claim_retrieved_ids)} queries)")
         
         print("\n📝 Note: BM25 evaluation completed.")
 
@@ -1287,7 +1295,7 @@ def main():
             D_abs, Q_abs = _to_numpy_if_torch(D_abs, Q_abs)
             vocab_size = D_abs.shape[1]
             posting_abs, _ = _splade_build_inverted_index(csr_matrix(D_abs), vocab_size)
-            _report_splade_posting_stats(posting_abs, "Abstract-to-Abstract")
+            _report_splade_flops_and_postings(posting_abs, csr_matrix(Q_abs), "Abstract-to-Abstract")
             top_k_list_abs = _splade_retrieve_with_index(csr_matrix(Q_abs), posting_abs, top_k=100)
 
             # Build true/predicted labels using ORIGINAL IDs (abstract: doc index = original doc index)
@@ -1309,7 +1317,7 @@ def main():
             D_all = doc_dense  # All document sections (abstract, claim, invention)
             D_all, Q_claim = _to_numpy_if_torch(D_all, Q_claim)
             posting_all, _ = _splade_build_inverted_index(csr_matrix(D_all), D_all.shape[1])
-            _report_splade_posting_stats(posting_all, "Claim-to-All")
+            _report_splade_flops_and_postings(posting_all, csr_matrix(Q_claim), "Claim-to-All")
             top_k_list_claim = _splade_retrieve_with_index(csr_matrix(Q_claim), posting_all, top_k=300)
             # Pad to 300 with -1 so zero-result queries don't pollute; skip d_idx < 0 in loop
             top_k_indices = np.full((len(top_k_list_claim), 300), -1, dtype=np.int64)
@@ -1383,112 +1391,29 @@ def main():
 
 ########################################################################################################################################################
 ########################################################################################################################################################
-    elif "checkpoint" in args.model_name or "bestmodel" in args.model_name or "patentmap" in args.model_name.lower():
-        def load_checkpoint_model_and_tokenizer(checkpoint_path):
-            """Smart checkpoint loader that handles tokenizer and model loading intelligently."""
-            from transformers import AutoConfig
-            from dataclasses import dataclass
-            
-            @dataclass
-            class ModelArguments:
-                do_mlm: bool = False
-                regularization: Optional[str] = None
-                temperature: float = 0.05
-                pooler_type: str = "cls"
-                mlp_only_train: bool = True
-                model_name_or_path: Optional[str] = None
-            
-            print(f"🔄 Loading checkpoint: {checkpoint_path}")
-            
-            # Step 1: Try loading tokenizer from checkpoint, fallback to reconstruction
-            try:
-                tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
-                print(f"✅ Loaded tokenizer from checkpoint ({len(tokenizer)} tokens)")
-            except:
-                print("⚠️  Tokenizer not found in checkpoint, reconstructing...")
-                tokenizer = reconstruct_tokenizer(checkpoint_path)
-            
-            # Step 2: Load model with proper config
-            model_args = ModelArguments(model_name_or_path=checkpoint_path)
-            config = AutoConfig.from_pretrained("anferico/bert-for-patents")
-            config.vocab_size = len(tokenizer)
-            
-            # Step 3: Load model with smart error handling
-            model = load_model_with_fallback(checkpoint_path, config, model_args)
-            
-            # Step 4: Ensure vocab size consistency
-            if model.get_input_embeddings().num_embeddings != len(tokenizer):
-                model.resize_token_embeddings(len(tokenizer))
-                print(f"🔧 Resized model embeddings to {len(tokenizer)} tokens")
-            
-            return model, tokenizer, model.config.hidden_size
+    elif "patentmap" in args.model_name.lower():
+        def _is_hf_model_id(name: str) -> bool:
+            """True if name looks like a Hugging Face model ID (org/repo) and is not an existing local path."""
+            if not name or "/" not in name:
+                return False
+            if os.path.exists(name) and os.path.isdir(name):
+                return False
+            return True
 
-        def reconstruct_tokenizer(checkpoint_path):
-            """Reconstruct tokenizer by inferring settings from checkpoint path."""
-            special_tokens = {"abstract": "[abstract]", "claim": "[claim]", "summary": "[summary]",
-                            "background": "[invention]", "drawing": "[drawing]", "detailed_description": "[description]"}
-            
-            tokenizer = AutoTokenizer.from_pretrained("anferico/bert-for-patents")
-            
-            # Smart view inference from path
-            views_match = re.search(r'views-([^/]*?)(?:_reg-|/|$)', checkpoint_path)
-            if views_match and views_match.group(1):
-                additional_views = views_match.group(1).split('+')
-                print(f"📊 Inferred views from path: {additional_views}")
-            else:
-                additional_views = []
-                print(f"📊 No views specified in path - using minimal tokenizer to match training vocab_size")
-            
-            # Add required special tokens
-            tokens_to_add = []
-            for view in ['abstract'] + additional_views:
-                if view in special_tokens:
-                    token = special_tokens[view]
-                    if tokenizer.convert_tokens_to_ids(token) == tokenizer.unk_token_id:
-                        tokens_to_add.append(token)
-            
-            # Handle detailed_description dependency on drawing
-            if "detailed_description" in additional_views and "drawing" not in additional_views:
-                drawing_token = special_tokens["drawing"]
-                if drawing_token not in tokens_to_add and tokenizer.convert_tokens_to_ids(drawing_token) == tokenizer.unk_token_id:
-                    tokens_to_add.append(drawing_token)
-            
-            if tokens_to_add:
-                tokenizer.add_special_tokens({'additional_special_tokens': tokens_to_add})
-                print(f"➕ Added tokens: {tokens_to_add}")
-            else:
-                print(f"✅ Using base tokenizer without additional tokens (vocab_size: {len(tokenizer)})")
-            
-            return tokenizer
+        model_name_or_path = args.model_name.strip()
+        if not _is_hf_model_id(model_name_or_path):
+            raise ValueError(
+                f"PatentMap/checkpoint models must be loaded from Hugging Face. "
+                f"Use a model ID like ZoeYou/PatentMap-V0-Dropout (not a local path). Got: {model_name_or_path!r}"
+            )
+        print(f"🔄 Loading from Hugging Face: {model_name_or_path}")
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        model = AutoModel.from_pretrained(model_name_or_path, trust_remote_code=True)
+        embedding_dim = model.config.hidden_size
+        print(f"✅ Loaded tokenizer ({len(tokenizer)} tokens) and model (dim={embedding_dim})")
 
-        def load_model_with_fallback(checkpoint_path, config, model_args):
-            """Load model with progressive fallback strategies."""
-            from patentmap.models import BertForCL
-            
-            is_local = os.path.exists(checkpoint_path)
-            loading_strategies = [
-                # Strategy 1: Standard loading
-                {"local_files_only": is_local, "trust_remote_code": True, "ignore_mismatched_sizes": True},
-                # Strategy 2: Minimal parameters
-                {"ignore_mismatched_sizes": True, "local_files_only": is_local},
-                # Strategy 3: Basic fallback
-                {"ignore_mismatched_sizes": True}
-            ]
-            
-            for i, kwargs in enumerate(loading_strategies, 1):
-                try:
-                    print(f"🔄 Trying loading strategy {i}...")
-                    return BertForCL.from_pretrained(checkpoint_path, config=config, model_args=model_args, **kwargs)
-                except Exception as e:
-                    print(f"❌ Strategy {i} failed: {e}")
-                    if i == len(loading_strategies):
-                        raise RuntimeError(f"All loading strategies failed for {checkpoint_path}")
-            
-        # Main loading execution
-        model, tokenizer, embedding_dim = load_checkpoint_model_and_tokenizer(args.model_name)
         batch_size = 512
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+        # device already set at start of main()
         # Setup model for inference
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1496,11 +1421,8 @@ def main():
         print(f"🚀 Model ready on {device}")
 
         ############################ Prior-art Search evaluation ############################
-        # check if the embeddings are already created
-        priorart_temp_dir = os.path.join(args.output_dir, f'priorart_temp_{args.model_name}')
         if not os.path.exists(priorart_temp_dir):
             os.makedirs(priorart_temp_dir)
-
         if os.path.exists(f'{priorart_temp_dir}/query_embeddings.pt') and os.path.exists(f'{priorart_temp_dir}/document_embeddings.pt'):
             print("Embeddings already created!")
             query_embeddings = torch.load(f'{priorart_temp_dir}/query_embeddings.pt', weights_only=False)
@@ -1529,16 +1451,22 @@ def main():
                 query_embs = np.zeros((len(query_encodings['input_ids']), embedding_dim))
                 doc_embs = np.zeros((len(doc_encodings['input_ids']), embedding_dim))
                 
+                def _get_embeddings(batch):
+                    """Pooler output (BertForCL) or CLS token (standard Bert); supports HF-loaded PatentMap models."""
+                    try:
+                        out = model(**batch, output_hidden_states=True, return_dict=True, sent_emb=True)
+                        return out.pooler_output
+                    except TypeError:
+                        out = model(**batch, output_hidden_states=True, return_dict=True)
+                        return out.last_hidden_state[:, 0]
+
                 with torch.no_grad():
                     for i in trange(0, len(query_encodings['input_ids']), batch_size, desc=f"Computing {texttype} query embeddings"):
                         batch = {key: val[i:i+batch_size].to(device) for key, val in query_encodings.items()}
-                        outputs = model(**batch, output_hidden_states=True, return_dict=True, sent_emb=True)
-                        query_embs[i:i+batch_size] = outputs.pooler_output.detach().cpu().numpy()
-
+                        query_embs[i:i+batch_size] = _get_embeddings(batch).detach().cpu().numpy()
                     for i in trange(0, len(doc_encodings['input_ids']), batch_size, desc=f"Computing {texttype} document embeddings"):
                         batch = {key: val[i:i+batch_size].to(device) for key, val in doc_encodings.items()}
-                        outputs = model(**batch, output_hidden_states=True, return_dict=True, sent_emb=True)
-                        doc_embs[i:i+batch_size] = outputs.pooler_output.detach().cpu().numpy()
+                        doc_embs[i:i+batch_size] = _get_embeddings(batch).detach().cpu().numpy()
                 
                 # Store embeddings by text type
                 query_embeddings_dict[texttype] = query_embs
@@ -1551,19 +1479,10 @@ def main():
 
             print(query_embeddings.shape, document_embeddings.shape)
 
-            # save the embeddings in both formats for compatibility
             torch.save(query_embeddings, f'{priorart_temp_dir}/query_embeddings.pt')
             torch.save(document_embeddings, f'{priorart_temp_dir}/document_embeddings.pt')
-            
-            # Also save the text-type separated embeddings (matching patent.py format)
             np.savez(f'{priorart_temp_dir}/query_embeddings_by_type.npz', **query_embeddings_dict)
             np.savez(f'{priorart_temp_dir}/doc_embeddings_by_type.npz', **doc_embeddings_dict)
-
-            print(query_embeddings.shape, document_embeddings.shape)
-
-            # save the embeddings
-            torch.save(query_embeddings, f'{priorart_temp_dir}/query_embeddings.pt')
-            torch.save(document_embeddings, f'{priorart_temp_dir}/document_embeddings.pt')
 
         query_embeddings = query_embeddings.astype('float32')
         document_embeddings = document_embeddings.astype('float32')
@@ -1573,8 +1492,8 @@ def main():
         print("This ensures exact consistency with training-time evaluation results.")
         
         # Use the standard evaluation for now, but note that minor differences may exist
-        # due to different data organization methods between baseline.py and patent.py
-        prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=_save_rankings_paths_from_args(args)[0], save_rankings_claim2all_path=_save_rankings_paths_from_args(args)[1], eval_query_ids=getattr(args, '_eval_query_ids_set', None))
+        # due to different data organization methods between evaluate.py and patent.py
+        prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=save_rankings_abs, save_rankings_claim2all_path=save_rankings_claim, model_label="PatentMap")
 
 
 ########################################################################################################################################################
@@ -2269,21 +2188,11 @@ def main():
                     doc_postings[center_idx].append((doc_id, float(weight), float(proj)))
                     doc_centers_hit[doc_id] = doc_centers_hit.get(doc_id, 0) + 1
             
-            # Posting list length statistics (sparse retrieval index)
+            # For efficiency report: total postings and non-empty count (FLOPs computed after query_sparse)
             pl_lens = np.array([len(pl) for pl in doc_postings], dtype=np.float64)
-            non_empty = pl_lens[pl_lens > 0]
             n_empty = int(np.sum(pl_lens == 0))
             total_entries = int(np.sum(pl_lens))
-            print(f"\n📊 Posting list (doc-level) length statistics")
-            print(f"   Centers: {V:,} total, {n_empty:,} empty, {V - n_empty:,} non-empty")
-            print(f"   Total postings: {total_entries:,}")
-            if len(non_empty) > 0:
-                print(f"   Length (non-empty lists): min={int(non_empty.min()):,}, max={int(non_empty.max()):,}, "
-                      f"mean={float(non_empty.mean()):.1f}, median={int(np.median(non_empty)):,}")
-                for p in (90, 95, 99):
-                    print(f"   p{p}: {int(np.percentile(non_empty, p)):,}")
-            print(f"   (Length = number of (doc_id, weight) entries per center; affects retrieval cost.)")
-            
+
             N_docs = len(documents_df)
             df = np.array([len(set(e[0] for e in pl)) if pl else 0 for pl in doc_postings], dtype=np.float32)
             idf = (np.log((N_docs + 1.0) / (df + 1.0)) + 1.0).astype(np.float32)
@@ -2314,7 +2223,14 @@ def main():
                 query_spans = _encode_query_spans(query_texts, section=query_section, d=d)
                 query_span_weights = None
             query_sparse = _assign_query_spans_to_centers(query_spans, center_index=center_index, V=V, sim_threshold=sim_threshold, idf=idf, center_pca_dirs=center_pca_dirs, query_span_weights=query_span_weights)
-            
+            # FLOPs = 2 * sum over queries of (sum of |L_t| for t in query terms)
+            total_flops = sum(2 * sum(len(doc_postings[t]) for t in qpack[0]) for qpack in query_sparse)
+            n_queries_flops = len(query_sparse)
+            _report_flops_and_postings_one_line(
+                int(total_entries), V - n_empty, V, mode,
+                total_flops=total_flops, n_queries=n_queries_flops, model_label="sparse_coverage"
+            )
+
             # Length normalization setup
             length_norm = getattr(args, "length_norm", "none")
             length_norm_exp = getattr(args, "length_norm_exponent", 0.5)
@@ -2403,63 +2319,23 @@ def main():
                 res["pres@100"] = mean_pres_at_k(tl, rl, k=100)
                 return res, len(tl), rl
 
-            kfold_meta = getattr(args, "_kfold_meta", None)
             task_label = "Abstract -> Abstract" if mode == "abstract2abstract" else "Claim -> All"
+            results, _, retrieved_ids_list = _compute_metrics_for_qids(None)
 
-            if kfold_meta is not None:
-                # ---- K-fold cross-validation ----
-                n_folds = kfold_meta["n_folds"]
-                folds = kfold_meta["folds"]
-                all_fold_results = []
-                for fold_id in sorted(folds.keys(), key=int):
-                    test_qids = set(str(q) for q in folds[fold_id])
-                    fold_res, n_eval, _ = _compute_metrics_for_qids(test_qids)
-                    all_fold_results.append(fold_res)
-                    print(f"   Fold {fold_id}: {n_eval} queries | map={fold_res['map']:.4f} recall@100={fold_res['recall@100']:.4f}")
-
-                # Compute mean ± std across folds
-                metric_names = list(all_fold_results[0].keys())
-                cv_results = {}
-                print(f"\n   {'='*60}")
-                print(f"   {n_folds}-Fold CV Summary for {task_label}:")
-                print(f"   {'='*60}")
-                for m in metric_names:
-                    vals = [r[m] for r in all_fold_results]
-                    mean_val = float(np.mean(vals))
-                    std_val = float(np.std(vals))
-                    cv_results[m] = mean_val
-                    cv_results[f"{m}_std"] = std_val
-                    print(f"   {m:>15s}: {mean_val:.4f} ± {std_val:.4f}")
-                print(f"   {'='*60}")
-
-                # Also compute full-set results for comparison
-                full_res, n_full, retrieved_ids_list = _compute_metrics_for_qids(None)
-                print(f"\n   Full set ({n_full} queries) for reference:")
-                for m in metric_names:
-                    print(f"   {m:>15s}: {full_res[m]:.4f}")
-
-                results = full_res  # use full results for display/ranking save
-            else:
-                # ---- Standard evaluation on all queries ----
-                results, _, retrieved_ids_list = _compute_metrics_for_qids(None)
-
-            fold_tag = f" [{kfold_meta['n_folds']}-fold CV]" if kfold_meta is not None else ""
-
-            path_abs, path_claim = _save_rankings_paths_from_args(args)
             if mode == "abstract2abstract":
-                print_metric_table(results, f"Sparse Coverage: {task_label}{fold_tag}")
-                if path_abs:
+                print_metric_table(results, f"Sparse Coverage: {task_label}")
+                if save_rankings_abs:
                     ranking_dict = {str(queries_df.index[i]): retrieved_ids_list[i] for i in range(len(retrieved_ids_list))}
-                    with open(path_abs, "w") as f:
+                    with open(save_rankings_abs, "w") as f:
                         json.dump(ranking_dict, f, indent=0)
-                    print(f"   Saved abstract->abstract rankings to {path_abs} ({len(retrieved_ids_list)} queries)")
+                    print(f"   Saved abstract->abstract rankings to {save_rankings_abs} ({len(retrieved_ids_list)} queries)")
             else:
-                print_metric_table(results, f"Sparse Coverage: {task_label}{fold_tag}")
-                if path_claim:
+                print_metric_table(results, f"Sparse Coverage: {task_label}")
+                if save_rankings_claim:
                     ranking_dict = {str(queries_df.index[i]): retrieved_ids_list[i] for i in range(len(retrieved_ids_list))}
-                    with open(path_claim, "w") as f:
+                    with open(save_rankings_claim, "w") as f:
                         json.dump(ranking_dict, f, indent=0)
-                    print(f"   Saved claim->all rankings to {path_claim} ({len(retrieved_ids_list)} queries)")
+                    print(f"   Saved claim->all rankings to {save_rankings_claim} ({len(retrieved_ids_list)} queries)")
             
             print(f"\n✅ Task {mode} evaluation completed")
         

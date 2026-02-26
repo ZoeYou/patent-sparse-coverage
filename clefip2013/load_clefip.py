@@ -208,7 +208,23 @@ def load_clefip_en_qrels(clefip_root: str) -> Dict[str, List[Tuple[str, str]]]:
     return qrels
 
 
-def _resolve_doc_path(doc_id: str, clefip_root: str, doc_collection_root: Optional[str]) -> Optional[str]:
+def _build_doc_collection_index(doc_collection_root: str) -> Dict[str, str]:
+    """One-time walk of doc_collection_root: build doc_id -> absolute path for every .xml. Use for fast lookup."""
+    index: Dict[str, str] = {}
+    for root, _dirs, files in os.walk(doc_collection_root):
+        for f in files:
+            if f.endswith(".xml"):
+                doc_id = f[:-4]  # strip .xml
+                index[doc_id] = os.path.join(root, f)
+    return index
+
+
+def _resolve_doc_path(
+    doc_id: str,
+    clefip_root: str,
+    doc_collection_root: Optional[str],
+    doc_collection_index: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
     """Return path to XML file for doc_id, or None if not found."""
     # 1) tfiles: doc_id + .xml
     tfiles_dir = os.path.join(clefip_root, TOPICS_DIR, TEST_DIR, TFILES_DIR)
@@ -220,9 +236,11 @@ def _resolve_doc_path(doc_id: str, clefip_root: str, doc_collection_root: Option
     p = os.path.join(tfam_dir, doc_id + ".xml")
     if os.path.isfile(p):
         return p
-    # 3) doc_collection_root (extracted 01): try subdirs then flat
+    # 3) doc_collection_root (extracted 01): use prebuilt index if provided (fast); else try direct then walk
     if doc_collection_root and os.path.isdir(doc_collection_root):
-        for sub in ("ep0", "ep1", "wo", "ep", "clef-ip-2012-ep0", "clef-ip-2012-ep1", "clef-ip-2012-wo"):
+        if doc_collection_index is not None:
+            return doc_collection_index.get(doc_id)
+        for sub in ("ep0", "ep1", "wo", "ep", "EP", "clef-ip-2012-ep0", "clef-ip-2012-ep1", "clef-ip-2012-wo"):
             d = os.path.join(doc_collection_root, sub)
             if os.path.isdir(d):
                 p = os.path.join(d, doc_id + ".xml")
@@ -237,6 +255,9 @@ def _resolve_doc_path(doc_id: str, clefip_root: str, doc_collection_root: Option
         p = os.path.join(doc_collection_root, doc_id + ".xml")
         if os.path.isfile(p):
             return p
+        for root, _dirs, files in os.walk(doc_collection_root):
+            if (doc_id + ".xml") in files:
+                return os.path.join(root, doc_id + ".xml")
     return None
 
 
@@ -262,10 +283,16 @@ def load_clefip_passage_corpus(
             if key not in seen:
                 seen.add(key)
                 order.append(key)
+    # One-time index for doc_collection_root so we don't os.walk per doc_id (slow on huge 01_extracted)
+    doc_collection_index: Optional[Dict[str, str]] = None
+    if doc_collection_root and os.path.isdir(doc_collection_root):
+        print("Building doc_id -> path index for 01 collection (one-time walk)...", flush=True)
+        doc_collection_index = _build_doc_collection_index(doc_collection_root)
+        print(f"  Indexed {len(doc_collection_index):,} XML files.", flush=True)
     pid_to_text = {}
     for doc_id, xpath in order:
         pid = f"{doc_id}::{xpath}"
-        xml_path = _resolve_doc_path(doc_id, clefip_root, doc_collection_root)
+        xml_path = _resolve_doc_path(doc_id, clefip_root, doc_collection_root, doc_collection_index=doc_collection_index)
         if xml_path:
             text = _get_passage_text_from_xml(xml_path, xpath)
             if text:

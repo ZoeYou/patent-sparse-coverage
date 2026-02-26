@@ -58,6 +58,32 @@ echo "Extracting dtds.7z..."
 echo "Done. Extracted to: $OUT_DIR"
 echo "Directory layout:"
 ls -la "$OUT_DIR" 2>/dev/null | head -20
+
+# Verify: 01 collection has EP (EPO) and WO (WIPO); dtds may be inside or alongside
+echo ""
+echo "Verification:"
+OK=1
+for sub in EP WO ep0 ep1 wo; do
+  if [[ -d "$OUT_DIR/$sub" ]]; then
+    echo "  [OK] $OUT_DIR/$sub exists"
+  else
+    if [[ "$sub" == "EP" ]] || [[ "$sub" == "WO" ]]; then
+      echo "  [MISSING] $OUT_DIR/$sub (expected from ep0/ep1 or wo)"
+      OK=0
+    fi
+  fi
+done
+XML_COUNT=$(find "$OUT_DIR" -type f -name "*.xml" 2>/dev/null | wc -l)
+echo "  XML files under $OUT_DIR: $XML_COUNT"
+if [[ "$XML_COUNT" -lt 1000 ]]; then
+  echo "  [WARN] Expected hundreds of thousands of XMLs; re-run if extraction was interrupted."
+  OK=0
+fi
+if [[ $OK -eq 1 ]]; then
+  echo "  All expected top-level dirs present."
+else
+  echo "  Some content missing; re-run script and check for 7z errors (ep0, ep1, wo, dtds)."
+fi
 echo ""
 echo "Use for evaluation:"
-echo "  python evaluate.py --model_name bm25 --dataset clefip --clefip_doc_root $OUT_DIR"
+echo "  python evaluate.py --model_name bm25 --clefip_doc_root $OUT_DIR"

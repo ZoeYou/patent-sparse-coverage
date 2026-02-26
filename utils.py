@@ -64,7 +64,7 @@ ENCODER_FORMAT_TITLE_SEP_ONLY = "title_sep_only"   # title SEP abstract (no sect
 DEFAULT_SEP = " [SEP] "  # fallback when tokenizer not available
 
 
-# Models that use title + sep + text only (no [abstract]/[claim]/[invention]). Aligned with baselines.py dense retrieval.
+# Models that use title + sep + text only (no [abstract]/[claim]/[invention]). Aligned with evaluate.py dense retrieval.
 _TITLE_SEP_ONLY_MODEL_IDS = (
     "allenai/specter2_base",
     "patentbert",
@@ -77,7 +77,7 @@ _TITLE_SEP_ONLY_MODEL_IDS = (
 def get_encoder_format_scheme(model_id: str) -> str:
     """
     Return the encoder input format scheme for a given model.
-    Aligned with baselines.py: specter2/patentbert use title+sep+text; paecter same; patembed same;
+    Aligned with evaluate.py: specter2/patentbert use title+sep+text; paecter same; patembed same;
     bert-for-patents uses [SEP] [abstract] / [claim] / [invention]; PatentMap (sparse_coverage default) uses section_tokens.
     """
     if not model_id:
@@ -1227,7 +1227,7 @@ def l2_normalize_inplace(X: np.ndarray, eps: float = 1e-12):
     X /= np.clip(norms, eps, None)
 
 
-# ================== Evaluation / formatting helpers (used by baselines.py) ==================
+# ================== Evaluation / formatting helpers (used by evaluate.py) ==================
 
 def log_embeddings_shape(embeddings_dict, context=""):
     """Log embedding shapes consistently."""
