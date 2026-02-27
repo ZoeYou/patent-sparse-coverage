@@ -146,6 +146,106 @@ def remove_escape_and_decode(text: str) -> str:
 
 
 
+def _parse_epo_txt_file(file_path: str) -> Optional[dict]:
+    """
+    Parse a single EPO .txt file (FIELD ::: value format, multi-line values).
+    Returns dict with keys title, abstract, claim, invention, or None if unparseable.
+    """
+    result = {"title": "", "abstract": "", "claim": "", "invention": ""}
+    current_key = None
+    current_lines = []
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if " ::: " in line:
+                if current_key is not None and current_key in result and current_lines:
+                    text = "\n".join(current_lines).strip()
+                    result[current_key] = text
+                parts = line.split(" ::: ", 1)
+                key = parts[0].strip().upper()
+                value = parts[1].strip() if len(parts) > 1 else ""
+                current_lines = [value] if value else []
+                if key == "TITLE":
+                    current_key = "title"
+                elif key == "ABSTR":
+                    current_key = "abstract"
+                elif key == "CLAIM1":
+                    current_key = "claim"
+                elif key == "DESCR":
+                    current_key = "invention"
+                else:
+                    current_key = None
+            else:
+                if current_key is not None and current_key in result:
+                    current_lines.append(line)
+        if current_key is not None and current_key in result and current_lines:
+            text = "\n".join(current_lines).strip()
+            result[current_key] = text
+    if not result["abstract"] and not result["claim"] and not result["invention"]:
+        return None
+    return result
+
+
+def load_corpus_epo(
+    data_dir: str,
+    max_docs: Optional[int] = None,
+    year_min: Optional[int] = None,
+    year_max: Optional[int] = None,
+    sample_seed: Optional[int] = None,
+) -> dict:
+    """
+    Load EPO epo_en corpus: data_dir contains year subdirs (1978, 1979, ...), each with .txt files.
+    Each .txt is "FIELD ::: value" format (TITLE, ABSTR, DESCR, CLAIM1).
+    Optional year_min/year_max: only include subdirs in [year_min, year_max] (inclusive).
+    When max_docs is set and total files in range exceed it, sample proportionally per year
+    (sample_seed for reproducibility).
+    Returns dict doc_id -> {'title', 'abstract', 'claim', 'invention'} (same as load_corpus).
+    """
+    import glob
+    corpus = {}
+    subdirs = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d)) and d.isdigit()])
+    if year_min is not None:
+        subdirs = [d for d in subdirs if int(d) >= year_min]
+    if year_max is not None:
+        subdirs = [d for d in subdirs if int(d) <= year_max]
+    if not subdirs:
+        patterns = [os.path.join(data_dir, "*.txt")]
+    else:
+        patterns = [os.path.join(data_dir, d, "*.txt") for d in subdirs]
+    rng = np.random.default_rng(sample_seed) if sample_seed is not None else None
+    year_caps = None
+    if max_docs is not None and rng is not None and patterns:
+        counts = []
+        for pattern in patterns:
+            counts.append(sum(1 for _ in glob.iglob(pattern)))
+        total_count = sum(counts)
+        if total_count > max_docs:
+            fracs = np.array(counts, dtype=np.float64) / max(total_count, 1)
+            caps = (fracs * max_docs).astype(np.int64)
+            remainder = max_docs - caps.sum()
+            for i in range(min(remainder, len(caps))):
+                caps[i] += 1
+            year_caps = {d: int(caps[i]) for i, d in enumerate(subdirs)}
+    total = 0
+    for i, pattern in enumerate(patterns):
+        files = list(glob.iglob(pattern))
+        year_key = subdirs[i] if (subdirs and i < len(subdirs)) else None
+        if year_caps is not None and year_key is not None:
+            cap = year_caps.get(year_key, len(files))
+            if len(files) > cap:
+                files = rng.choice(files, size=cap, replace=False).tolist()
+        for fp in files:
+            if max_docs is not None and total >= max_docs:
+                return corpus
+            doc = _parse_epo_txt_file(fp)
+            if doc is None:
+                continue
+            doc_id = os.path.splitext(os.path.basename(fp))[0]
+            corpus[doc_id] = doc
+            total += 1
+    return corpus
+
+
 def load_corpus(file_path: str) -> dict:
     """
     Load JSON corpus file (JSONL format) and normalize to unified structure.
@@ -325,6 +425,8 @@ def create_contextual_span_embeddings(
                 import gc
                 gc.collect()
     
+    # Per-section embedding row index (i) for metadata; matches row index in embeddings_by_section[section]
+    section_idx = {'abstract': 0, 'claim': 0, 'invention': 0}
     # Note: We'll process embeddings per section after all batches are done
     for batch_idx in tqdm(range(num_batches), desc="Processing batches"):
         start_idx = batch_idx * batch_size
@@ -356,9 +458,12 @@ def create_contextual_span_embeddings(
             for doc_id, section, doc_text, span_text_raw, span_text_canonical, span_emb in batch_results:
                 if section in temp_embeddings_by_section:
                     temp_embeddings_by_section[section].append(span_emb)
+                i = section_idx[section]  # 0-based row index within this section (embedding row index)
+                section_idx[section] += 1
                 all_metadata.append({
                     'doc_id': doc_id,
                     'section': section,
+                    'i': i,
                     'sentence': doc_text[:100],  # Keep key name for backwards compatibility (first 100 chars)
                     'unit': unit,
                     'span_text_raw': span_text_raw,  # Original span text
@@ -406,6 +511,32 @@ def create_contextual_span_embeddings(
     
     if total_embeddings == 0:
         raise ValueError("No embeddings were created. Check your input data and processing pipeline.")
+    
+    # Ensure metadata and embeddings are aligned: same order and length per section
+    # (metadata_by_section order must match embeddings_by_section row order for downstream doc-soft / evaluate)
+    _sections = ['abstract', 'claim', 'invention']
+    _metadata_by_section = {s: [] for s in _sections}
+    for meta in all_metadata:
+        s = meta.get('section')
+        if s in _metadata_by_section:
+            _metadata_by_section[s].append(meta)
+    for _sec in _sections:
+        _n_emb = embeddings_by_section[_sec].shape[0] if embeddings_by_section.get(_sec) is not None else 0
+        _n_meta = len(_metadata_by_section.get(_sec, []))
+        assert _n_emb == _n_meta, (
+            f"Section '{_sec}': embeddings count ({_n_emb}) != metadata count ({_n_meta}). "
+            "Metadata and embeddings must stay in the same order (create_contextual_span_embeddings return order)."
+        )
+    # Spot-check: first/last metadata entry per section has correct section label
+    for _sec in _sections:
+        _meta_list = _metadata_by_section.get(_sec, [])
+        if _meta_list:
+            assert _meta_list[0].get('section') == _sec, (
+                f"Spot-check failed for section '{_sec}': first metadata has section '{_meta_list[0].get('section')}'"
+            )
+            assert _meta_list[-1].get('section') == _sec, (
+                f"Spot-check failed for section '{_sec}': last metadata has section '{_meta_list[-1].get('section')}'"
+            )
     
     # Force cleanup
     import gc
@@ -760,13 +891,16 @@ def process_doc_batch(doc_texts: List[str],
         else:
             raise ValueError(f"Invalid layer parameter: {layer}. Must be 'last' or 'second_last'")
 
-    # Compute visible text substrings for spaCy (exactly what encoder saw)
+    # Compute visible text substrings for spaCy (exactly what encoder saw after max_length truncation).
+    # We run spaCy ONLY on visible_texts, so every extracted span is guaranteed to lie within the
+    # encoder's window; no span from "text beyond 512 tokens" can appear, avoiding span_text vs
+    # embedding misalignment.
     visible_texts = []
     for i in range(len(doc_texts)):
         char_end = _visible_char_end_from_offset_mapping(offset_mapping[i], input_ids[i], special_token_ids)
         visible_texts.append(doc_texts[i][:char_end] if char_end > 0 else "")
 
-    # Run spaCy only if needed (encoder_token bypasses spaCy entirely)
+    # Run spaCy only on visible text (encoder-visible window only)
     docs_spacy = None
     if unit != "encoder_token":
         docs_spacy = list(NLP.pipe(visible_texts, batch_size=SPACY_PIPE_BATCH_SIZE))

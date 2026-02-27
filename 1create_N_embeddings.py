@@ -18,9 +18,20 @@ Unit types (only these are supported):
 
 Output directory name includes: model name, unit, keep_cls, layer, and optionally _meanpool when keep_doc_mean=1.
 
+Use cases:
+  1. Center-building only (e.g. EPO): default --save_metadata 0, no doc_id mapping needed.
+  2. When this output will be used as the document corpus in evaluate (--embeddings_dir): use
+     --save_metadata 1 so evaluate can build span->doc_id aggregation. Prior-art/clefip runs need this.
+
+EPO epo_en: If data_dir does not contain content/documents.json, the script tries EPO layout:
+  data_dir/<year>/*.txt. Each .txt is "FIELD ::: value" format (TITLE, ABSTR, DESCR, CLAIM1).
+  Use --epo_year_min/--epo_year_max to restrict to a year range (e.g. 2000-2020) and --max_docs
+  to sample documents (proportional per year); --epo_sample_seed for reproducibility.
+
 Usage:
     python 1create_N_embeddings.py --layer last
     python 1create_N_embeddings.py --unit noun_chunk --keep_doc_mean 1
+    python 1create_N_embeddings.py --data_dir /path/to/EPO/epo_en --save_metadata 0  # centers only
 """
 
 import os
@@ -35,7 +46,9 @@ from utils import (
     get_encoder_format_scheme,
     get_encoder_sep_for_model,
     load_corpus,
+    load_corpus_epo,
     create_contextual_span_embeddings,
+    l2_normalize_inplace,
     DEVICE,
 )
 
@@ -59,16 +72,21 @@ def main():
                             "Encoder still sees only first max_length (512) tokens. Default: 32768.")
 
     parser.add_argument("--max_docs", type=int, default=None,
-                       help="Maximum number of documents to process (for testing)")
+                       help="Maximum number of documents to process (for testing / EPO sampling)")
+    parser.add_argument("--epo_year_min", type=int, default=None,
+                       help="[EPO only] Minimum year (inclusive), e.g. 2000. Only year subdirs >= this are loaded.")
+    parser.add_argument("--epo_year_max", type=int, default=None,
+                       help="[EPO only] Maximum year (inclusive), e.g. 2020. Only year subdirs <= this are loaded.")
+    parser.add_argument("--epo_sample_seed", type=int, default=None,
+                       help="[EPO only] Random seed when sampling to max_docs (proportional per year). For reproducibility.")
     parser.add_argument("--max_spans", type=int, default=5000000,
                        help="Maximum number of spans (embeddings) to extract")
 
-    parser.add_argument("--compress", action="store_true",
-                       help="Save as compressed .npz file (gzip) to reduce file size without precision loss")
     parser.add_argument("--embed_dtype", type=str, default="float32", choices=["float32", "float16"],
                        help="Storage dtype for embeddings: float32 (default, full precision), float16 (half size, minimal quality loss for retrieval).")
-    parser.add_argument("--save_metadata", type=int, default=1, choices=[0, 1],
-                       help="Whether to save metadata (0=no, 1=yes). Default: 1. Metadata is saved AFTER sampling.")
+    parser.add_argument("--save_metadata", type=int, default=0, choices=[0, 1],
+                       help="Save metadata (0=no, 1=yes). Default: 0. Use 1 when this output will be used as the document corpus in evaluate "
+                            "(--embeddings_dir), so span->doc_id aggregation can be built. Saved AFTER sampling.")
     parser.add_argument("--unit", type=str, default="spacy_token",
                        choices=["spacy_token", "spacy_sentence", "noun_chunk"],
                        help="Semantic unit: spacy_token (tokens + merged noun_chunks), "
@@ -76,8 +94,8 @@ def main():
                             "noun_chunk (only noun-chunk spans, no standalone tokens).")
     parser.add_argument("--keep_cls", type=int, default=1, choices=[0, 1],
                        help="Whether to keep [CLS] token in output (1=yes, 0=no). Default: 1.")
-    parser.add_argument("--keep_doc_mean", type=int, default=0, choices=[0, 1],
-                       help="If 1, keep one extra span per doc-section = mean of all token embeddings (sequence-level vector). Default: 0. Symmetric with --keep_cls.")
+    parser.add_argument("--keep_doc_mean", type=int, default=1, choices=[0, 1],
+                       help="If 1, keep one extra span per doc-section = mean of all token embeddings (sequence-level vector). Default: 1. Both cls and doc_mean are then in metadata as span_kind.")
     parser.add_argument("--layer", type=str, default="last", choices=["last", "second_last"],
                        help="Which layer to use for embeddings: 'last' (default) for last layer, 'second_last' for second-to-last layer")
     parser.add_argument("--output_dir", type=str, default=None,
@@ -136,7 +154,7 @@ def main():
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
 
-    file_ext = "npz" if args.compress else "npy"
+    file_ext = "npz"  # always save compressed for smaller on-disk size
     save_dtype = np.float32 if args.embed_dtype == "float32" else np.float16
     
     # Build output filenames per section
@@ -172,8 +190,28 @@ def main():
     # Load corpus
     print("\n[2/4] Loading corpus...")
     documents_path = os.path.join(args.data_dir, "content/documents.json")
-    documents = load_corpus(documents_path)
-    print(f"Loaded {len(documents)} documents")
+    if os.path.isfile(documents_path):
+        documents = load_corpus(documents_path)
+        print(f"   Loaded {len(documents):,} documents from {documents_path}")
+    else:
+        # EPO epo_en: year subdirs with .txt files (FIELD ::: value format)
+        documents = load_corpus_epo(
+            args.data_dir,
+            max_docs=args.max_docs,
+            year_min=getattr(args, "epo_year_min", None),
+            year_max=getattr(args, "epo_year_max", None),
+            sample_seed=getattr(args, "epo_sample_seed", None),
+        )
+        if not documents:
+            raise FileNotFoundError(
+                f"No corpus found. Expected either:\n  - {documents_path} (JSONL)\n  - or EPO layout: {args.data_dir}/<year>/*.txt"
+            )
+        print(f"   Loaded {len(documents):,} documents from EPO dir {args.data_dir}")
+        if getattr(args, "epo_year_min", None) is not None or getattr(args, "epo_year_max", None) is not None:
+            print(f"   Year range: [{getattr(args, 'epo_year_min', 'any')}, {getattr(args, 'epo_year_max', 'any')}]")
+        if args.max_docs and getattr(args, "epo_sample_seed", None) is not None:
+            print(f"   Sampled to max_docs={args.max_docs} (seed={args.epo_sample_seed})")
+    print(f"Loaded {len(documents):,} documents")
 
     # Create embeddings (same format_scheme and sep as query time in baselines for coherence)
     print(f"\n[3/4] Creating contextual span embeddings...")
@@ -183,9 +221,11 @@ def main():
         keep_cls=keep_cls, layer=args.layer, format_scheme=format_scheme, sep=sep,
         keep_doc_mean=keep_doc_mean,
         max_section_chars=args.max_section_chars,
+        max_spans=args.max_spans,
     )
     
-    # Separate metadata by section for sampling and saving
+    # Separate metadata by section for sampling and saving.
+    # Order within each section must match embeddings_by_section row order (asserted in utils.create_contextual_span_embeddings).
     metadata_by_section = {s: [] for s in SECTIONS}
     for meta in metadata:
         section = meta['section']
@@ -268,9 +308,6 @@ def main():
         print(f"✓ Total sampled spans: {sum(len(emb) if emb is not None else 0 for emb in embeddings_by_section.values()):,}")
         print(f"{'='*80}\n")
     
-    if args.compress:
-        print(f"Compression enabled: files will be saved as .npz (gzip compressed)")
-        print(f"Expected compression ratio: 30-50% (depending on data)")
     if args.embed_dtype == "float16":
         print(f"Storage dtype: float16 (half size; downstream will cast to float32 on load)")
 
@@ -302,22 +339,18 @@ def main():
         else:
             print(f"  Uncompressed size: {estimated_size_mb:.1f} MB")
         
-        # Save embeddings
-        if args.compress:
-            np.savez_compressed(output_files[section], embeddings=to_save)
-            print(f"  ✓ Saved compressed embeddings to: {output_files[section]}")
-            actual_size_mb = os.path.getsize(output_files[section]) / (1024 ** 2)
-            actual_size_gb = actual_size_mb / 1024
-            if actual_size_gb >= 1.0:
-                print(f"  Actual compressed size: {actual_size_gb:.2f} GB")
-                compression_ratio = (1 - actual_size_gb / estimated_size_gb) * 100
-            else:
-                print(f"  Actual compressed size: {actual_size_mb:.1f} MB")
-                compression_ratio = (1 - actual_size_mb / estimated_size_mb) * 100
-            print(f"  Compression ratio: {compression_ratio:.1f}%")
+        # Save embeddings (always .npz gzip-compressed for smaller size)
+        np.savez_compressed(output_files[section], embeddings=to_save)
+        print(f"  ✓ Saved compressed embeddings to: {output_files[section]}")
+        actual_size_mb = os.path.getsize(output_files[section]) / (1024 ** 2)
+        actual_size_gb = actual_size_mb / 1024
+        if actual_size_gb >= 1.0:
+            print(f"  Actual compressed size: {actual_size_gb:.2f} GB")
+            compression_ratio = (1 - actual_size_gb / estimated_size_gb) * 100
         else:
-            np.save(output_files[section], to_save)
-            print(f"  ✓ Saved embeddings to: {output_files[section]}")
+            print(f"  Actual compressed size: {actual_size_mb:.1f} MB")
+            compression_ratio = (1 - actual_size_mb / estimated_size_mb) * 100
+        print(f"  Compression ratio: {compression_ratio:.1f}%")
         
         # Save metadata
         if args.save_metadata:
@@ -326,6 +359,8 @@ def main():
                     compact = {
                         'd': meta['doc_id'],
                         's': meta['section'],
+                        'i': meta.get('i', -1),  # 0-based row index within section (embedding row index)
+                        'k': meta.get('span_kind', 'content'),  # content | cls | doc_mean (retrievable for filtering)
                         'r': meta['span_text_raw'],
                         'u': meta.get('unit', '')
                     }
