@@ -18,6 +18,9 @@ Unit types (only these are supported):
 
 Output directory name includes: model name, unit, keep_cls, layer, and optionally _meanpool when keep_doc_mean=1.
 
+Storage: embeddings are saved as .npy (uncompressed) for fast I/O and memmap-friendly loading in center-building;
+metadata as .jsonl. For compression use system-level tools (e.g. zstd) or chunked files.
+
 Use cases:
   1. Center-building only (e.g. EPO): default --save_metadata 0, no doc_id mapping needed.
   2. When this output will be used as the document corpus in evaluate (--embeddings_dir): use
@@ -39,7 +42,6 @@ import json
 import numpy as np
 import argparse
 from transformers import AutoTokenizer, AutoModel
-import spacy
 import utils
 from utils import (
     ensure_section_tokens,
@@ -48,7 +50,7 @@ from utils import (
     load_corpus,
     load_corpus_epo,
     create_contextual_span_embeddings,
-    l2_normalize_inplace,
+    load_span_cache,
     DEVICE,
 )
 
@@ -100,31 +102,47 @@ def main():
                        help="Which layer to use for embeddings: 'last' (default) for last layer, 'second_last' for second-to-last layer")
     parser.add_argument("--output_dir", type=str, default=None,
                        help="Output directory for embeddings. If not specified, will be auto-generated based on model and parameters.")
+    parser.add_argument("--span_cache_dir", type=str, default=None,
+                       help="Directory with pre-computed spaCy spans (from 0cache_spacy_spans.py). "
+                            "When set, spaCy is NOT loaded or run; spans come from the cache. "
+                            "Saves significant time when creating embeddings for multiple models.")
     
     # spaCy model parameters
-    parser.add_argument("--spacy_model", type=str, default="sm", choices=["sm", "md", "lg"],
-                       help="spaCy English model: sm (fast), md (better), lg (best, slow). Requires en_core_web_*.")
+    parser.add_argument("--spacy_model", type=str, default="sci_lg",
+                        choices=["sm", "md", "lg", "sci_sm", "sci_md", "sci_lg"],
+                        help="spaCy model: sm/md/lg (en_core_web_*), sci_sm/sci_md/sci_lg (en_core_sci_*). Default: sci_lg.")
     parser.add_argument("--spacy_batch_size", type=int, default=128,
                        help="Batch size for spaCy nlp.pipe(). Larger = faster, more memory. Default: 128.")
     parser.add_argument("--spacy_disable_extra", type=int, default=1, choices=[0, 1],
-                       help="If 1 (default), disable lemmatizer and attribute_ruler for speed. Set 0 to keep full pipeline.")
+                       help="If 1 (default), disable lemmatizer for speed (attribute_ruler is kept for POS tags / noun_chunks). Set 0 to keep full pipeline.")
     args = parser.parse_args()
 
-    # Initialize global spaCy model (utils.NLP) so process_doc_batch can use it
-    print("Loading spaCy model...")
-    spacy_model_name = f"en_core_web_{args.spacy_model}"
-    disable = ["ner", "textcat"]
-    if args.spacy_disable_extra:
-        disable.extend(["lemmatizer", "attribute_ruler"])  # not needed for sents/noun_chunks; speeds up
-    try:
-        utils.NLP = spacy.load(spacy_model_name, disable=disable)
-    except OSError:
-        print(f"   Run: python -m spacy download {spacy_model_name}")
-        raise
-    utils.NLP.max_length = args.max_section_chars + 10000  # spaCy cap (input already truncated to max_section_chars)
-    utils.SPACY_PIPE_BATCH_SIZE = getattr(args, "spacy_batch_size", 128)  # used in process_doc_batch
-    assert utils.NLP.has_pipe("parser"), "spaCy parser is required for noun_chunks extraction"
-    print(f"✓ spaCy loaded: {spacy_model_name}, pipe batch_size={utils.SPACY_PIPE_BATCH_SIZE}, disabled={disable}")
+    # Load span cache if provided (Phase 2: skip spaCy entirely)
+    span_cache = None
+    if args.span_cache_dir:
+        print(f"Loading span cache from {args.span_cache_dir} (unit={args.unit})...")
+        span_cache = load_span_cache(args.span_cache_dir, args.unit)
+        print(f"✓ Span cache loaded: {len(span_cache):,} entries — spaCy will NOT be loaded")
+    else:
+        # Initialize global spaCy model (utils.NLP) so process_doc_batch can use it
+        import spacy
+        print("Loading spaCy model...")
+        if args.spacy_model.startswith("sci_"):
+            spacy_model_name = f"en_core_sci_{args.spacy_model[4:]}"
+        else:
+            spacy_model_name = f"en_core_web_{args.spacy_model}"
+        disable = ["ner", "textcat"]
+        if args.spacy_disable_extra:
+            disable.append("lemmatizer")
+        try:
+            utils.NLP = spacy.load(spacy_model_name, disable=disable)
+        except OSError:
+            print(f"   Run: python -m spacy download {spacy_model_name}")
+            raise
+        utils.NLP.max_length = args.max_section_chars + 10000
+        utils.SPACY_PIPE_BATCH_SIZE = getattr(args, "spacy_batch_size", 128)
+        assert utils.NLP.has_pipe("parser"), "spaCy parser is required for noun_chunks extraction"
+        print(f"✓ spaCy loaded: {spacy_model_name}, pipe batch_size={utils.SPACY_PIPE_BATCH_SIZE}, disabled={disable}")
     
     # Extract model name from model_path (handle both paths and HuggingFace IDs)
     model_name = args.model_path.strip("/").split("/")[-1].replace("/", "_").replace("\\", "_")
@@ -154,19 +172,20 @@ def main():
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
 
-    file_ext = "npz"  # always save compressed for smaller on-disk size
+    # .npy = fast write/read and memmap-friendly for center-building; metadata stays .jsonl
+    # For compression use system-level (e.g. zstd) or chunked files; avoid np.savez_compressed at scale
+    file_ext = "npy"
     save_dtype = np.float32 if args.embed_dtype == "float32" else np.float16
-    
+
     # Build output filenames per section
     output_files = {}
     metadata_files = {}
     for section in SECTIONS:
-        # Format: {section}_{unit}.{ext}
         output_files[section] = os.path.join(output_dir, f"{section}_{args.unit}.{file_ext}")
         metadata_files[section] = os.path.join(output_dir, f"{section}_{args.unit}_metadata.jsonl")
     
     print(f"=" * 80)
-    print(f"Creating Contextual Span Embeddings (mode: claim2all)")
+    print(f"Creating Contextual Span Embeddings")
     print(f"Device: {DEVICE}")
     print(f"Model: {args.model_path}")
     print(f"Unit: {args.unit}")
@@ -174,6 +193,7 @@ def main():
     print(f"Batch size: {args.batch_size}, Max length: {args.max_length}, Max section chars: {args.max_section_chars}")
     print(f"Keep [CLS]: {keep_cls}")
     print(f"Keep doc mean: {keep_doc_mean}")
+    print(f"Span cache: {args.span_cache_dir or 'none (spaCy at runtime)'}")
     print(f"Output directory: {output_dir}")
     print(f"=" * 80)
     
@@ -222,16 +242,19 @@ def main():
         keep_doc_mean=keep_doc_mean,
         max_section_chars=args.max_section_chars,
         max_spans=args.max_spans,
+        span_cache=span_cache,
     )
     
     # Separate metadata by section for sampling and saving.
     # Order within each section must match embeddings_by_section row order (asserted in utils.create_contextual_span_embeddings).
     metadata_by_section = {s: [] for s in SECTIONS}
     for meta in metadata:
-        section = meta['section']
+        section = meta["section"]
         if section in metadata_by_section:
             metadata_by_section[section].append(meta)
-    
+    # Rebuild flat metadata in section order (abstract, claim, invention) so sample display and downstream use are consistent
+    metadata = [m for sec in SECTIONS for m in metadata_by_section.get(sec, [])]
+
     # Truncate/sample per section if needed
     total_spans = sum(len(emb) if emb is not None else 0 for emb in embeddings_by_section.values())
     if total_spans > args.max_spans:
@@ -311,6 +334,13 @@ def main():
     if args.embed_dtype == "float16":
         print(f"Storage dtype: float16 (half size; downstream will cast to float32 on load)")
 
+    # Assert alignment before saving (each section: embedding rows == metadata rows)
+    for sec in SECTIONS:
+        emb = embeddings_by_section.get(sec)
+        if emb is not None:
+            n_meta = len(metadata_by_section.get(sec, []))
+            assert n_meta == len(emb), f"Section '{sec}': metadata count {n_meta} != embedding rows {len(emb)}"
+
     print(f"\n[4/4] Saving results per section...")
     
     # Save embeddings and metadata per section
@@ -335,22 +365,18 @@ def main():
         print(f"  Embedding dimension: {to_save.shape[1]}")
         print(f"  Data type: {to_save.dtype}")
         if estimated_size_gb >= 1.0:
-            print(f"  Uncompressed size: {estimated_size_gb:.2f} GB")
+            print(f"  Size: {estimated_size_gb:.2f} GB")
         else:
-            print(f"  Uncompressed size: {estimated_size_mb:.1f} MB")
-        
-        # Save embeddings (always .npz gzip-compressed for smaller size)
-        np.savez_compressed(output_files[section], embeddings=to_save)
-        print(f"  ✓ Saved compressed embeddings to: {output_files[section]}")
+            print(f"  Size: {estimated_size_mb:.1f} MB")
+
+        # Save embeddings as .npy (fast I/O, memmap-friendly for center-building; compress with zstd if needed)
+        np.save(output_files[section], to_save, allow_pickle=False)
+        print(f"  ✓ Saved embeddings to: {output_files[section]}")
         actual_size_mb = os.path.getsize(output_files[section]) / (1024 ** 2)
-        actual_size_gb = actual_size_mb / 1024
-        if actual_size_gb >= 1.0:
-            print(f"  Actual compressed size: {actual_size_gb:.2f} GB")
-            compression_ratio = (1 - actual_size_gb / estimated_size_gb) * 100
+        if actual_size_mb >= 1024:
+            print(f"  Actual size: {actual_size_mb / 1024:.2f} GB")
         else:
-            print(f"  Actual compressed size: {actual_size_mb:.1f} MB")
-            compression_ratio = (1 - actual_size_mb / estimated_size_mb) * 100
-        print(f"  Compression ratio: {compression_ratio:.1f}%")
+            print(f"  Actual size: {actual_size_mb:.1f} MB")
         
         # Save metadata
         if args.save_metadata:
@@ -379,14 +405,28 @@ def main():
             emb = embeddings_by_section[section]
             print(f"  - {section}: {len(emb):,} spans, shape {emb.shape}, mean={emb.mean():.4f}, std={emb.std():.4f}")
     
-    # Show sample spans (in-memory meta has span_text_raw and span_text)
-    print(f"\n  Sample spans (raw):")
-    for i, meta in enumerate(metadata):
-        if i >= 10:
+    # Show sample spans: 2–3 content spans per section (skip cls/doc_mean so we see real spaCy output)
+    print(f"\n  Sample spans (raw, content only):")
+    shown_per_section = {s: 0 for s in SECTIONS}
+    max_per_section = 3
+    for meta in metadata:
+        if all(shown_per_section[s] >= max_per_section for s in SECTIONS):
             break
-        raw = (meta.get("span_text_raw") or "")[:40]
-        print(f"    - {raw} ({meta['section']})")
-    
+        if meta.get("span_kind") in ("cls", "doc_mean"):
+            continue
+        sec = meta.get("section")
+        if sec not in shown_per_section or shown_per_section[sec] >= max_per_section:
+            continue
+        raw = (meta.get("span_text_raw") or "")[:50]
+        print(f"    - [{sec}] {raw}")
+        shown_per_section[sec] += 1
+    # No content spans in metadata despite having embeddings => pipeline bug (e.g. only cls/doc_mean)
+    if total_spans > 0 and sum(shown_per_section.values()) == 0:
+        raise RuntimeError(
+            "No content spans in metadata although total_spans > 0. "
+            "All spans are cls/doc_mean or metadata is misaligned (pipeline bug)."
+        )
+
     print(f"=" * 80)
     print(f"✓ Done! Embeddings saved to: {output_dir}")
 

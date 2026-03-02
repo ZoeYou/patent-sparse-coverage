@@ -86,9 +86,12 @@ from utils import (
     mean_pooling,
     cls_pooling,
     get_encoder_format_scheme,
+    get_encoder_sep_for_model,
     ENCODER_FORMAT_SECTION_TOKENS,
+    format_abstract_for_encoder,
     format_claim_for_encoder,
     format_invention_for_encoder,
+    collect_doc_texts,
     find_centers,
 )
 
@@ -575,6 +578,204 @@ def _make_prior_art_metrics(true_labels_list, predicted_labels_list, k=100, **ex
     return metrics
 
 
+def _run_clefip_sparse_coverage(args, query_ids, query_texts, passage_ids, passage_texts, qrels_passage_ids):
+    """Sparse-coverage retrieval for CLEF-IP: passages are 'documents', queries are claims."""
+    import utils
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if args.dense_model is None:
+        raise ValueError("--dense_model is required for sparse_coverage on CLEF-IP")
+
+    # Load model
+    tokenizer = AutoTokenizer.from_pretrained(args.dense_model)
+    model = AutoModel.from_pretrained(args.dense_model, trust_remote_code=True)
+    utils.ensure_section_tokens(tokenizer, model)
+    model.to(device).eval()
+    d = model.config.hidden_size
+
+    # SpaCy
+    if args.tokenization_unit != "encoder_token":
+        import spacy
+        if args.spacy_model.startswith("sci_"):
+            spacy_name = f"en_core_sci_{args.spacy_model[4:]}"
+        else:
+            spacy_name = f"en_core_web_{args.spacy_model}"
+        nlp = spacy.load(spacy_name, disable=["ner", "textcat", "lemmatizer"])
+        nlp.max_length = 1_000_000
+        utils.NLP = nlp
+
+    process_doc_batch = utils.process_doc_batch
+    include_cls = True
+
+    # Find centers (claim2all mode — queries are claims, passages are mixed sections)
+    try:
+        centers_path, _centers_dir = find_centers(
+            dense_model=args.dense_model,
+            tokenization_unit=args.tokenization_unit,
+            include_cls=include_cls,
+            search_dir=".",
+            mode="claim2all",
+            layer=getattr(args, "layer", "last"),
+            centers_suffix=getattr(args, "centers_suffix", ""),
+        )
+    except FileNotFoundError:
+        print("CLEF-IP sparse_coverage: no centers found for claim2all; skipping.")
+        return
+
+    centers = np.load(centers_path).astype(np.float32)
+    V, d_c = centers.shape
+    if d_c != d:
+        raise ValueError(f"Dimension mismatch: model={d}, centers={d_c}")
+    centers_json = centers_path.replace(".npy", ".json")
+    centers_info = {}
+    if os.path.exists(centers_json):
+        with open(centers_json, "r") as f:
+            centers_info = json.load(f)
+    r = float(centers_info.get("r", 0.1))
+    sim_threshold = 1.0 - r
+
+    centers_norm = centers.copy()
+    faiss.normalize_L2(centers_norm)
+    center_index = faiss.IndexFlatIP(d)
+    center_index.add(centers_norm.astype(np.float32))
+    print(f"CLEF-IP sparse_coverage: {V:,} centers, r={r:.4f}")
+
+    # Derive section per passage and format text with section tokens
+    format_scheme = get_encoder_format_scheme(args.dense_model)
+    passage_sections_raw = [_clefip_passage_section(pid) for pid in passage_ids]
+    section_map = {"abstract": "abstract", "description": "invention", "claim": "claim"}
+
+    def _format_passage(text: str, sec_raw: str) -> str:
+        sec = section_map.get(sec_raw, sec_raw)
+        if sec == "claim":
+            return format_claim_for_encoder(format_scheme, text)
+        elif sec == "invention":
+            return format_invention_for_encoder(format_scheme, text)
+        return f"[abstract] {text}".strip() if format_scheme != "title_sep_only" else text
+
+    formatted_passages = [_format_passage(t, s) for t, s in zip(passage_texts, passage_sections_raw)]
+
+    # Encode passages grouped by section
+    print("Encoding passages...")
+    passage_embs: list[np.ndarray] = [None] * len(passage_ids)
+    for sec_raw in ["abstract", "claim", "description"]:
+        sec = section_map.get(sec_raw, sec_raw)
+        idxs = [i for i, s in enumerate(passage_sections_raw) if s == sec_raw]
+        if not idxs:
+            continue
+        texts = [formatted_passages[i] for i in idxs]
+        pids = [passage_ids[i] for i in idxs]
+        for b_start in tqdm(range(0, len(texts), 32), desc=f"  passages ({sec})", leave=False):
+            b_end = min(b_start + 32, len(texts))
+            results = process_doc_batch(
+                doc_texts=texts[b_start:b_end],
+                doc_ids=pids[b_start:b_end],
+                sections=[sec] * (b_end - b_start),
+                unit=args.tokenization_unit,
+                model=model, tokenizer=tokenizer, device=device,
+                max_length=512, keep_cls=include_cls, span_pooling="mean",
+                layer=getattr(args, "layer", "last"),
+            )
+            span_groups: dict[str, list[np.ndarray]] = {}
+            for doc_id, _s, _dt, _sr, _sc, emb in results:
+                span_groups.setdefault(doc_id, []).append(emb)
+            for local_i, pid in enumerate(pids[b_start:b_end]):
+                spans = span_groups.get(pid, [])
+                if spans:
+                    passage_embs[idxs[b_start + local_i]] = np.stack(spans).astype(np.float32)
+                else:
+                    passage_embs[idxs[b_start + local_i]] = np.zeros((0, d), dtype=np.float32)
+
+    # Build posting lists (passage-level): for each center, list of (passage_idx, weight)
+    print("Building posting lists...")
+    posting_lists: list[list[tuple[int, float]]] = [[] for _ in range(V)]
+    weight_agg = getattr(args, "weight_aggregation", "max")
+    for p_idx, p_spans in enumerate(tqdm(passage_embs, desc="  passages -> centers", leave=False)):
+        if p_spans is None or p_spans.shape[0] == 0:
+            continue
+        p_norm = p_spans.astype(np.float32).copy()
+        faiss.normalize_L2(p_norm)
+        lims, D, I = center_index.range_search(p_norm, sim_threshold)
+        center_weights: dict[int, float] = {}
+        for span_i in range(p_norm.shape[0]):
+            start, end = int(lims[span_i]), int(lims[span_i + 1])
+            for j in range(start, end):
+                c = int(I[j])
+                sim = float(D[j])
+                if sim <= 0:
+                    continue
+                if weight_agg == "sum":
+                    center_weights[c] = center_weights.get(c, 0.0) + sim
+                else:
+                    if sim > center_weights.get(c, 0.0):
+                        center_weights[c] = sim
+        for c, w in center_weights.items():
+            posting_lists[c].append((p_idx, w))
+
+    N_passages = len(passage_ids)
+    df = np.array([len(set(e[0] for e in pl)) if pl else 0 for pl in posting_lists], dtype=np.float32)
+    idf = (np.log((N_passages + 1.0) / (df + 1.0)) + 1.0).astype(np.float32)
+    idf_exponent = float(getattr(args, "idf_exponent", 1.0))
+
+    # Encode queries (claims — format with section tokens)
+    formatted_queries = [format_claim_for_encoder(format_scheme, qt) for qt in query_texts]
+    print("Encoding queries...")
+    query_spans_list: list[np.ndarray] = []
+    for b_start in tqdm(range(0, len(formatted_queries), 32), desc="  queries", leave=False):
+        b_end = min(b_start + 32, len(formatted_queries))
+        results = process_doc_batch(
+            doc_texts=formatted_queries[b_start:b_end],
+            doc_ids=[f"q_{i}" for i in range(b_start, b_end)],
+            sections=["claim"] * (b_end - b_start),
+            unit=args.tokenization_unit,
+            model=model, tokenizer=tokenizer, device=device,
+            max_length=512, keep_cls=include_cls, span_pooling="mean",
+            layer=getattr(args, "layer", "last"),
+        )
+        q_groups: dict[str, list[np.ndarray]] = {}
+        for doc_id, _s, _dt, _sr, _sc, emb in results:
+            q_groups.setdefault(doc_id, []).append(emb)
+        for qi in range(b_start, b_end):
+            spans = q_groups.get(f"q_{qi}", [])
+            if spans:
+                query_spans_list.append(np.stack(spans).astype(np.float32))
+            else:
+                query_spans_list.append(np.zeros((0, d), dtype=np.float32))
+
+    # Retrieve: score passages per query
+    print("Retrieving...")
+    top_k = 100
+    predicted_labels: list[list[str]] = []
+    for q_idx, q_spans in enumerate(query_spans_list):
+        if q_spans.shape[0] == 0:
+            predicted_labels.append([])
+            continue
+        q_norm = q_spans.astype(np.float32).copy()
+        faiss.normalize_L2(q_norm)
+        lims, D, I = center_index.range_search(q_norm, sim_threshold)
+        q_center_weights: dict[int, float] = {}
+        for si in range(q_norm.shape[0]):
+            start, end = int(lims[si]), int(lims[si + 1])
+            for j in range(start, end):
+                c = int(I[j])
+                sim = float(D[j])
+                if sim > q_center_weights.get(c, 0.0):
+                    q_center_weights[c] = sim
+        passage_scores: dict[int, float] = {}
+        for c, q_sim in q_center_weights.items():
+            idf_t = float(idf[c]) ** idf_exponent
+            for p_idx, p_sim in posting_lists[c]:
+                score = q_sim * p_sim * idf_t
+                passage_scores[p_idx] = passage_scores.get(p_idx, 0.0) + score
+        sorted_p = sorted(passage_scores.items(), key=lambda x: -x[1])[:top_k]
+        predicted_labels.append([passage_ids[pi] for pi, _ in sorted_p])
+
+    true_labels = [qrels_passage_ids.get(qid, []) for qid in query_ids]
+    results = _make_prior_art_metrics(true_labels, predicted_labels)
+    print_subsection_header("CLEF-IP 2013 EN claims-to-passages")
+    print_metric_table(results, "Sparse Coverage (CLEF-IP)")
+
+
 def run_clefip_eval(args):
     """Load CLEF-IP EN data, run the selected model, and evaluate passage retrieval."""
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -596,6 +797,10 @@ def run_clefip_eval(args):
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_name = args.model_name.lower() if hasattr(args.model_name, "lower") else str(args.model_name).lower()
+
+    if model_name == "sparse_coverage":
+        _run_clefip_sparse_coverage(args, query_ids, query_texts, passage_ids, passage_texts, qrels_passage_ids)
+        return
 
     if model_name == "bm25":
         # Use same BM25 stack as prior-art: bm25s + stemmer, one logic for both tasks
@@ -771,6 +976,13 @@ def main():
                        help="Suffix appended to centers directory name for discovery. Required when centers were "
                             "built with a suffix: greedy (e.g. '_soft', '_percenter'), k-means (e.g. '_kmeans_V50000'), "
                             "k-center (e.g. '_kcenter_V25000'), or quantile (e.g. '_quantile'). Must match build script output.")
+    parser.add_argument("--embeddings_dir", type=str, default=None,
+                       help="Path to directory containing pre-computed doc-side embeddings and metadata. "
+                            "Must contain {section}_{unit}.npy/.npz and {section}_{unit}_metadata.jsonl. "
+                            "If unset, documents from the evaluation corpus (perf200/clefip) are encoded at runtime.")
+    parser.add_argument("--spacy_model", type=str, default="sci_lg",
+                       choices=["sm", "md", "lg", "sci_sm", "sci_md", "sci_lg"],
+                       help="SpaCy model for span tokenization (sparse_coverage). Default: sci_lg.")
     parser.add_argument("--posting_list_batch_size", type=int, default=256,
                        help="For doc soft: batch size for range_search when building posting lists. "
                             "Larger = fewer FAISS calls, may use more memory. Default: 256.")
@@ -1502,9 +1714,9 @@ def main():
         """
         Sparse Coverage Retrieval
         
-        Uses pre-built vocabulary centers and posting lists for efficient sparse retrieval.
-        Documents are already indexed via posting lists saved during center construction.
-        Only queries need to be encoded and assigned to centers.
+        Uses pre-built vocabulary centers for sparse retrieval.
+        Documents from the evaluation corpus are encoded at runtime (or loaded from cache/--embeddings_dir).
+        Both queries and documents are encoded and assigned to centers.
         """
         print(f"\n🔍 Sparse Coverage Retrieval")
         
@@ -1537,10 +1749,15 @@ def main():
         # Initialize spaCy if needed
         if args.tokenization_unit != "encoder_token":
             import spacy
-            nlp = spacy.load("en_core_web_sm", disable=["ner", "textcat"])
-            nlp.max_length = 1000000
-            # Set global NLP in utils module so process_doc_batch can use it
+            if args.spacy_model.startswith("sci_"):
+                spacy_name = f"en_core_sci_{args.spacy_model[4:]}"
+            else:
+                spacy_name = f"en_core_web_{args.spacy_model}"
+            disable = ["ner", "textcat", "lemmatizer"]
+            nlp = spacy.load(spacy_name, disable=disable)
+            nlp.max_length = 1_000_000
             utils.NLP = nlp
+            print(f"   SpaCy model: {spacy_name}")
         else:
             nlp = None
             utils.NLP = None
@@ -1638,6 +1855,8 @@ def main():
             return r, sim_threshold
         
         def _embeddings_dir_name() -> str:
+            if getattr(args, "embeddings_dir", None):
+                return os.path.abspath(args.embeddings_dir)
             model_name_clean = args.dense_model.strip("/").split("/")[-1].replace("/", "_").replace("\\", "_")
             cls_suffix = "cls" if include_cls else "nocls"
             layer = getattr(args, "layer", "last")
@@ -1664,6 +1883,138 @@ def main():
                         raise ValueError(f"Empty .npz file: {file_path}")
                     return data[keys[0]].astype(np.float32)
             return np.load(file_path).astype(np.float32)
+        
+        def _encode_doc_spans(
+            documents: dict,
+            doc_sections: list[str],
+            batch_size: int = 32,
+        ) -> tuple[dict[str, np.ndarray], dict[int, str], set[int]]:
+            """Encode evaluation-corpus documents at runtime.
+
+            Returns:
+                embeddings_by_section: {section_name: np.ndarray of shape (n_spans, d)}
+                span_to_doc: {global_span_idx: doc_id}
+                exclude_cls_indices: set of global indices for CLS spans
+            """
+            format_scheme = get_encoder_format_scheme(args.dense_model)
+            sep = get_encoder_sep_for_model(args.dense_model, tokenizer)
+            doc_items = collect_doc_texts(documents, format_scheme=format_scheme, sep=sep)
+
+            items_by_section: dict[str, list[tuple[str, str, str]]] = {}
+            for doc_id, section, text in doc_items:
+                if section in doc_sections:
+                    items_by_section.setdefault(section, []).append((doc_id, section, text))
+
+            embeddings_by_section: dict[str, np.ndarray] = {}
+            span_to_doc: dict[int, str] = {}
+            exclude_cls_indices: set[int] = set()
+            exclude_cls = getattr(args, "exclude_cls_spans", False)
+            current_idx = 0
+
+            for section in doc_sections:
+                items = items_by_section.get(section, [])
+                if not items:
+                    embeddings_by_section[section] = np.zeros((0, model.config.hidden_size), dtype=np.float32)
+                    continue
+
+                sec_ids = [it[0] for it in items]
+                sec_sections = [it[1] for it in items]
+                sec_texts = [it[2] for it in items]
+                section_embs: list[np.ndarray] = []
+                section_meta: list[dict] = []
+
+                for b_start in tqdm(range(0, len(sec_texts), batch_size),
+                                    desc=f"Encoding doc {section}", leave=False):
+                    b_end = min(b_start + batch_size, len(sec_texts))
+                    results = process_doc_batch(
+                        doc_texts=sec_texts[b_start:b_end],
+                        doc_ids=sec_ids[b_start:b_end],
+                        sections=sec_sections[b_start:b_end],
+                        unit=args.tokenization_unit,
+                        model=model,
+                        tokenizer=tokenizer,
+                        device=device,
+                        max_length=512,
+                        keep_cls=include_cls,
+                        span_pooling="mean",
+                        keep_doc_mean=False,
+                        layer=getattr(args, "layer", "last"),
+                    )
+                    for doc_id, _sec, _dtxt, span_raw, span_canon, emb in results:
+                        section_embs.append(emb)
+                        is_cls = (span_canon or "").strip().lower() == "cls" or (span_raw or "").strip() == "[CLS]"
+                        section_meta.append({"d": doc_id, "s": section, "r": span_raw or "", "is_cls": is_cls})
+
+                for meta in section_meta:
+                    span_to_doc[current_idx] = meta["d"]
+                    if exclude_cls and meta["is_cls"]:
+                        exclude_cls_indices.add(current_idx)
+                    current_idx += 1
+
+                embeddings_by_section[section] = np.stack(section_embs).astype(np.float32) if section_embs else np.zeros((0, model.config.hidden_size), dtype=np.float32)
+                print(f"   {section}: {len(section_embs):,} spans from {len(items):,} docs")
+
+            return embeddings_by_section, span_to_doc, exclude_cls_indices
+        
+        def _doc_cache_dir(mode: str) -> str:
+            model_clean = args.dense_model.strip("/").split("/")[-1].replace("/", "_").replace("\\", "_")
+            layer = getattr(args, "layer", "last")
+            return os.path.join(priorart_temp_dir, f"sparse_doc_{model_clean}_{args.tokenization_unit}_{layer}_{mode}")
+        
+        def _save_doc_cache(
+            cache_dir: str,
+            doc_sections: list[str],
+            embeddings_by_section: dict[str, np.ndarray],
+            span_to_doc: dict[int, str],
+            exclude_cls_indices: set[int],
+        ) -> None:
+            os.makedirs(cache_dir, exist_ok=True)
+            for sec in doc_sections:
+                emb = embeddings_by_section.get(sec)
+                if emb is not None and emb.shape[0] > 0:
+                    np.save(os.path.join(cache_dir, f"{sec}_{args.tokenization_unit}.npy"), emb, allow_pickle=False)
+            meta_path = os.path.join(cache_dir, f"span_to_doc_{args.tokenization_unit}.jsonl")
+            with open(meta_path, "w") as f:
+                for idx in sorted(span_to_doc.keys()):
+                    entry = {"i": idx, "d": span_to_doc[idx]}
+                    if idx in exclude_cls_indices:
+                        entry["cls"] = True
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            print(f"   Cached doc embeddings to {cache_dir}")
+
+        def _load_doc_cache(
+            cache_dir: str,
+            doc_sections: list[str],
+        ) -> tuple[dict[str, np.ndarray], dict[int, str], set[int], int]:
+            """Load cached doc embeddings.
+
+            Returns (embeddings_by_section, span_to_doc, exclude_cls_indices, total_loaded).
+            Raises FileNotFoundError if any section file is missing.
+            """
+            embeddings_by_section: dict[str, np.ndarray] = {}
+            total_loaded = 0
+            for sec in doc_sections:
+                p = os.path.join(cache_dir, f"{sec}_{args.tokenization_unit}.npy")
+                if not os.path.exists(p):
+                    raise FileNotFoundError(p)
+                arr = np.load(p).astype(np.float32)
+                embeddings_by_section[sec] = arr
+                total_loaded += arr.shape[0]
+
+            span_to_doc: dict[int, str] = {}
+            exclude_cls_indices: set[int] = set()
+            meta_path = os.path.join(cache_dir, f"span_to_doc_{args.tokenization_unit}.jsonl")
+            if not os.path.exists(meta_path):
+                raise FileNotFoundError(meta_path)
+            with open(meta_path, "r") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    entry = json.loads(line)
+                    span_to_doc[entry["i"]] = entry["d"]
+                    if entry.get("cls"):
+                        exclude_cls_indices.add(entry["i"])
+            return embeddings_by_section, span_to_doc, exclude_cls_indices, total_loaded
         
         def _encode_query_spans(texts: list[str], section: str, d: int, batch_size: int = 32) -> list[np.ndarray]:
             all_query_spans: list[np.ndarray] = []
@@ -1976,71 +2327,101 @@ def main():
                 doc_sections = ["abstract"]
                 query_section = "abstract"
             
-            # Load metadata (span -> doc_id) and optionally mark CLS spans to exclude
-            print(f"\n📦 Loading embeddings metadata...")
+            # ---- Obtain doc-side embeddings + span_to_doc mapping ----
+            # Priority: 1) --embeddings_dir (pre-computed), 2) cached runtime embeddings, 3) encode at runtime
+            exclude_cls_spans = getattr(args, "exclude_cls_spans", False)
+            embeddings_by_section: dict[str, np.ndarray] = {}
             span_to_doc: dict[int, str] = {}
             exclude_cls_span_indices: set[int] = set()
-            current_span_idx = 0
-            total_spans_in_metadata = 0
-            exclude_cls_spans = getattr(args, "exclude_cls_spans", False)
+            total_loaded = 0
 
-            def _is_cls_span(meta: dict) -> bool:
-                t = (meta.get("t") or "").strip().lower()
-                r = (meta.get("r") or "").strip()
-                return t == "cls" or r == "[CLS]"
+            use_precomputed = False
+            if getattr(args, "embeddings_dir", None):
+                try:
+                    _emb_dir = os.path.abspath(args.embeddings_dir)
+                    for sec in doc_sections:
+                        _embeddings_path(sec)  # will raise if missing
+                    use_precomputed = True
+                except FileNotFoundError:
+                    print(f"   --embeddings_dir set but files missing; falling back to runtime encoding")
 
-            for section_name in doc_sections:
-                mp = _metadata_path(section_name)
-                if not os.path.exists(mp):
-                    raise FileNotFoundError(f"Could not find metadata file: {mp}")
-                section_span_count = 0
-                print(f"   Loading metadata from {section_name}: {mp}")
-                with open(mp, "r") as f:
-                    for line in f:
-                        if not line.strip():
-                            continue
-                        meta = json.loads(line)
-                        doc_id = meta.get("d", meta.get("doc_id", ""))
-                        span_to_doc[current_span_idx] = doc_id
-                        if exclude_cls_spans and _is_cls_span(meta):
-                            exclude_cls_span_indices.add(current_span_idx)
-                        current_span_idx += 1
-                        section_span_count += 1
-                total_spans_in_metadata += section_span_count
-                print(f"     Loaded {section_span_count:,} spans from {section_name}")
+            if use_precomputed:
+                _emb_dir = os.path.abspath(args.embeddings_dir)
+                print(f"\n📦 Loading pre-computed doc embeddings from: {_emb_dir}")
+                current_span_idx = 0
+
+                def _is_cls_span(meta: dict) -> bool:
+                    t = (meta.get("t") or "").strip().lower()
+                    r = (meta.get("r") or "").strip()
+                    return t == "cls" or r == "[CLS]"
+
+                for section_name in doc_sections:
+                    ep = _embeddings_path(section_name)
+                    sec_emb = _load_embeddings(ep)
+                    embeddings_by_section[section_name] = sec_emb
+                    total_loaded += sec_emb.shape[0]
+                    mp = _metadata_path(section_name)
+                    if os.path.exists(mp):
+                        with open(mp, "r") as f:
+                            for line in f:
+                                if not line.strip():
+                                    continue
+                                meta = json.loads(line)
+                                doc_id = meta.get("d", meta.get("doc_id", ""))
+                                span_to_doc[current_span_idx] = doc_id
+                                if exclude_cls_spans and _is_cls_span(meta):
+                                    exclude_cls_span_indices.add(current_span_idx)
+                                current_span_idx += 1
+                    else:
+                        raise FileNotFoundError(f"Metadata file not found alongside embeddings: {mp}")
+                    print(f"   {section_name}: {sec_emb.shape[0]:,} spans")
+            else:
+                cache_dir = _doc_cache_dir(mode)
+                try:
+                    print(f"\n📦 Trying cached doc embeddings from: {cache_dir}")
+                    embeddings_by_section, span_to_doc, exclude_cls_span_indices, total_loaded = _load_doc_cache(cache_dir, doc_sections)
+                    print(f"   Loaded {total_loaded:,} spans from cache")
+                    for sec in doc_sections:
+                        print(f"   {sec}: {embeddings_by_section[sec].shape[0]:,} spans")
+                except FileNotFoundError:
+                    print(f"\n📦 Encoding documents at runtime (first run; will cache for reuse)")
+                    embeddings_by_section, span_to_doc, exclude_cls_span_indices = _encode_doc_spans(
+                        documents, doc_sections, batch_size=32
+                    )
+                    total_loaded = sum(e.shape[0] for e in embeddings_by_section.values())
+                    _save_doc_cache(cache_dir, doc_sections, embeddings_by_section, span_to_doc, exclude_cls_span_indices)
+
             if exclude_cls_spans:
-                print(f"   Excluding {len(exclude_cls_span_indices):,} CLS spans (--exclude_cls_spans)")
-            print(f"   Total loaded {len(span_to_doc):,} span-to-document mappings")
+                print(f"   Excluding {len(exclude_cls_span_indices):,} CLS spans")
+            print(f"   Total: {len(span_to_doc):,} span-to-doc mappings, {total_loaded:,} embedding rows")
 
-            # Build doc_span_count for length normalization (spans per document; exclude CLS when flag set)
+            # Build doc_span_count for length normalization
             doc_span_count: dict[str, int] = {}
             for span_idx, doc_id in span_to_doc.items():
                 if exclude_cls_spans and span_idx in exclude_cls_span_indices:
                     continue
                 doc_span_count[doc_id] = doc_span_count.get(doc_id, 0) + 1
             
-            # Load embeddings for document sections; build posting lists (doc hard = nearest center only, doc soft = sphere/range_search)
+            # ---- Build posting lists ----
             document_assignment = getattr(args, "document_assignment", "soft")
             print(f"\n🔨 Computing posting lists for {V:,} centers...")
             print(f"   Document assignment: {document_assignment}")
             
-            embeddings_files = [(sec, _embeddings_path(sec)) for sec in doc_sections]
             posting_lists: list[list[tuple[int, float]]] = []
             centers_norm_for_pl = centers.copy()
             faiss.normalize_L2(centers_norm_for_pl)
-            total_loaded = 0
             
             if document_assignment == "hard":
-                # Doc hard: each span -> nearest center only (Voronoi); no embeddings_index needed
                 print(f"   Building posting lists: each span -> nearest center (k=1)")
                 posting_lists = [[] for _ in range(V)]
                 span_offset = 0
-                for section_name, ep in embeddings_files:
-                    print(f"   Loading {section_name} embeddings: {ep}")
-                    sec_emb = _load_embeddings(ep)
+                for section_name in doc_sections:
+                    sec_emb = embeddings_by_section[section_name]
+                    if sec_emb.shape[0] == 0:
+                        continue
                     if sec_emb.shape[1] != d:
                         raise ValueError(f"Embedding dimension mismatch for {section_name}: {sec_emb.shape[1]} != {d}")
-                    sec_emb = sec_emb.astype(np.float32)
+                    sec_emb = sec_emb.astype(np.float32).copy()
                     faiss.normalize_L2(sec_emb)
                     sims, assigned = center_index.search(sec_emb, 1)
                     for j in range(sec_emb.shape[0]):
@@ -2052,37 +2433,34 @@ def main():
                         if sim > 0:
                             proj = float(sec_emb[j] @ center_pca_dirs[c]) if center_pca_dirs is not None else 0.0
                             posting_lists[c].append((global_idx, sim, proj))
-                    total_loaded += sec_emb.shape[0]
                     span_offset += sec_emb.shape[0]
-                    print(f"     ✅ {sec_emb.shape[0]:,} spans assigned (total: {total_loaded:,})")
-                    del sec_emb
-                print(f"   ✅ Total spans: {total_loaded:,}")
+                    print(f"     {section_name}: {sec_emb.shape[0]:,} spans assigned")
+                print(f"   Total spans: {total_loaded:,}")
             else:
-                # Doc soft: sphere (range_search) per center; build embeddings_index section-by-section
+                # Doc soft: sphere (range_search) per center
                 print(f"   Using radius r={r:.6f} for range search")
-                use_section_by_section = len(doc_sections) > 1
-                if use_section_by_section:
-                    print(f"   claim2all: building FAISS index section-by-section to reduce peak memory")
+                idx_size = 0
                 embeddings_index = faiss.IndexFlatIP(d)
-                for section_name, ep in embeddings_files:
-                    print(f"   Loading {section_name} embeddings: {ep}")
-                    sec_emb = _load_embeddings(ep)
+                for section_name in doc_sections:
+                    sec_emb = embeddings_by_section[section_name]
+                    if sec_emb.shape[0] == 0:
+                        continue
                     if sec_emb.shape[1] != d:
                         raise ValueError(f"Embedding dimension mismatch for {section_name}: {sec_emb.shape[1]} != {d}")
-                    sec_emb = sec_emb.astype(np.float32)
-                    faiss.normalize_L2(sec_emb)
-                    embeddings_index.add(sec_emb)
-                    total_loaded += sec_emb.shape[0]
-                    print(f"     ✅ Loaded {sec_emb.shape[0]:,} (index size: {total_loaded:,})")
-                    del sec_emb
-                print(f"   ✅ Total in index: {total_loaded:,}")
+                    sec_emb_n = sec_emb.astype(np.float32).copy()
+                    faiss.normalize_L2(sec_emb_n)
+                    embeddings_index.add(sec_emb_n)
+                    idx_size += sec_emb_n.shape[0]
+                    print(f"     {section_name}: {sec_emb_n.shape[0]:,} (index size: {idx_size:,})")
+                    del sec_emb_n
+                print(f"   Total in index: {idx_size:,}")
                 r_per_center = centers_info.get("r_per_center", None)
                 if r_per_center is not None:
                     if len(r_per_center) < V:
                         r_per_center = None
                     else:
                         if len(r_per_center) > V:
-                            r_per_center = r_per_center[:V]  # truncate to match centers after coverage truncation
+                            r_per_center = r_per_center[:V]
                         print(f"   Using per-center radius (r_per_center from centers JSON)")
                 sim_thresh_default = 1.0 - r
                 batch_size = max(1, int(getattr(args, "posting_list_batch_size", 256)))
@@ -2090,7 +2468,6 @@ def main():
                 for batch_start in tqdm(range(0, V, batch_size), desc="Computing posting lists"):
                     batch_end = min(batch_start + batch_size, V)
                     centers_batch = centers_norm_for_pl[batch_start:batch_end].astype(np.float32)
-                    # Use most permissive threshold for batch; filter per-center later
                     if r_per_center is not None:
                         sim_thresh_batch = float(np.min([1.0 - r_per_center[i] for i in range(batch_start, batch_end)]))
                     else:
@@ -2110,38 +2487,33 @@ def main():
                             entries = [(idx, s) for idx, s in entries if idx not in exclude_cls_span_indices]
                         posting_lists.append(entries)
                 
-                # Add PCA projections: second pass over embeddings when center_pca_dirs is set
+                # PCA projections: second pass over in-memory embeddings
                 if center_pca_dirs is not None:
                     span_to_centers: dict[int, list[tuple[int, float]]] = {}
                     for c in range(V):
                         for (span_idx, sim) in posting_lists[c]:
                             span_to_centers.setdefault(span_idx, []).append((c, sim))
                     posting_lists_new: list[list[tuple[int, float, float]]] = [[] for _ in range(V)]
-                    emb_batch_size = max(1, int(getattr(args, "posting_list_batch_size", 256)) * 4)
                     span_offset = 0
-                    for section_name, ep in embeddings_files:
-                        arr = _load_embeddings(ep)
-                        arr = arr.astype(np.float32)
+                    for section_name in doc_sections:
+                        arr = embeddings_by_section[section_name].astype(np.float32).copy()
                         faiss.normalize_L2(arr)
-                        for start in range(0, arr.shape[0], emb_batch_size):
-                            end = min(start + emb_batch_size, arr.shape[0])
-                            batch = arr[start:end]
-                            for j in range(batch.shape[0]):
-                                global_idx = span_offset + start + j
-                                for (c, sim) in span_to_centers.get(global_idx, []):
-                                    proj = float(batch[j] @ center_pca_dirs[c])
-                                    posting_lists_new[c].append((global_idx, sim, proj))
+                        for j in range(arr.shape[0]):
+                            global_idx = span_offset + j
+                            for (c, sim) in span_to_centers.get(global_idx, []):
+                                proj = float(arr[j] @ center_pca_dirs[c])
+                                posting_lists_new[c].append((global_idx, sim, proj))
                         span_offset += arr.shape[0]
                     posting_lists = posting_lists_new
                 else:
                     posting_lists = [[(s, sim, 0.0) for s, sim in pl] for pl in posting_lists]
             
-            # Align metadata if index size differs from metadata count
-            if total_loaded != total_spans_in_metadata:
-                print(f"   ⚠️  Warning: Embeddings count ({total_loaded:,}) != metadata count ({total_spans_in_metadata:,})")
-                min_count = min(total_loaded, total_spans_in_metadata)
-                span_to_doc = {k: v for k, v in span_to_doc.items() if k < min_count}
-                print(f"   Truncated span_to_doc to {min_count:,} spans")
+            # Alignment sanity check
+            if total_loaded != len(span_to_doc):
+                raise ValueError(
+                    f"Embeddings count ({total_loaded:,}) != span_to_doc count ({len(span_to_doc):,}). "
+                    "Posting lists require exact 1:1 alignment."
+                )
             
             # Span-level posting list length (before doc aggregation)
             span_pl_lens = np.array([len(pl) for pl in posting_lists], dtype=np.float64)
@@ -2200,14 +2572,16 @@ def main():
             if idf_exponent != 1.0:
                 print(f"   IDF exponent: {idf_exponent} (score term uses idf^{idf_exponent})")
 
-            # Encode + assign queries
+            # Encode + assign queries (format must match utils.collect_doc_texts for doc side)
             if mode == "abstract2abstract":
                 print(f"\n📝 Evaluating: Abstract -> Abstract")
+                _fmt_scheme = get_encoder_format_scheme(args.dense_model)
+                _sep = get_encoder_sep_for_model(args.dense_model, tokenizer)
                 query_texts = []
                 for idx in queries_df.index:
                     title = queries_df.loc[idx, "title"] if "title" in queries_df.columns else ""
                     abstract = queries_df.loc[idx, "abstract"] if "abstract" in queries_df.columns else ""
-                    query_texts.append(f"{title} [SEP] [abstract] {abstract}".strip())
+                    query_texts.append(format_abstract_for_encoder(_fmt_scheme, title, abstract, sep=_sep))
             else:
                 print(f"\n📝 Evaluating: Claim -> All")
                 # Must match format used when building embeddings (utils.collect_doc_texts): "[claim] {claim}"

@@ -373,11 +373,16 @@ def create_contextual_span_embeddings(
     sep: Optional[str] = None,
     keep_doc_mean: bool = False,
     max_section_chars: Optional[int] = None,
+    max_spans: Optional[int] = None,
+    span_cache: Optional[dict] = None,
 ) -> Tuple[dict, List[dict]]:
     """
     Create contextual span embeddings for all documents using batch processing.
     format_scheme and sep keep format coherent with retrieval. keep_doc_mean: one span per section = mean of tokens.
     max_section_chars: if set, truncate each section text to this many chars before encoding (bounds spaCy/tokenizer input).
+    max_spans: if set, stop after collecting this many spans (early-stop to avoid encoding more than needed).
+    span_cache: if provided, use pre-computed spaCy spans (from 0cache_spacy_spans.py) instead of
+                running spaCy at runtime. Keys: (doc_id, section, sub_part) → list of (start, end, text).
     """
     if format_scheme is None:
         format_scheme = ENCODER_FORMAT_SECTION_TOKENS
@@ -424,6 +429,15 @@ def create_contextual_span_embeddings(
                 temp_embeddings_by_section[section] = []
                 import gc
                 gc.collect()
+
+    def _current_total_spans():
+        """Total span count so far (temp + chunked), for early-stop."""
+        n = 0
+        for section in ['abstract', 'claim', 'invention']:
+            n += len(temp_embeddings_by_section[section])
+            for chunk in all_embeddings_by_section[section]:
+                n += chunk.shape[0]
+        return n
     
     # Per-section embedding row index (i) for metadata; matches row index in embeddings_by_section[section]
     section_idx = {'abstract': 0, 'claim': 0, 'invention': 0}
@@ -439,20 +453,39 @@ def create_contextual_span_embeddings(
             doc_texts = [item[2] for item in batch_data]
 
             # Process doc batch - returns (doc_id, section, doc_text, span_text_raw, span_text_canonical, span_emb)
-            batch_results = process_doc_batch(
-                doc_texts=doc_texts,
-                doc_ids=doc_ids,
-                sections=sections,
-                unit=unit,
-                model=model,
-                tokenizer=tokenizer,
-                device=DEVICE,
-                max_length=max_length,
-                keep_cls=keep_cls,
-                layer=layer,
-                span_pooling=span_pooling,
-                keep_doc_mean=keep_doc_mean,
-            )
+            if span_cache is not None:
+                batch_results = process_doc_batch_cached(
+                    doc_texts=doc_texts,
+                    doc_ids=doc_ids,
+                    sections=sections,
+                    unit=unit,
+                    span_cache=span_cache,
+                    format_scheme=format_scheme,
+                    sep=sep,
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=DEVICE,
+                    max_length=max_length,
+                    keep_cls=keep_cls,
+                    layer=layer,
+                    span_pooling=span_pooling,
+                    keep_doc_mean=keep_doc_mean,
+                )
+            else:
+                batch_results = process_doc_batch(
+                    doc_texts=doc_texts,
+                    doc_ids=doc_ids,
+                    sections=sections,
+                    unit=unit,
+                    model=model,
+                    tokenizer=tokenizer,
+                    device=DEVICE,
+                    max_length=max_length,
+                    keep_cls=keep_cls,
+                    layer=layer,
+                    span_pooling=span_pooling,
+                    keep_doc_mean=keep_doc_mean,
+                )
             
             # Store results with proper metadata tracking, separated by section
             for doc_id, section, doc_text, span_text_raw, span_text_canonical, span_emb in batch_results:
@@ -460,10 +493,18 @@ def create_contextual_span_embeddings(
                     temp_embeddings_by_section[section].append(span_emb)
                 i = section_idx[section]  # 0-based row index within this section (embedding row index)
                 section_idx[section] += 1
+                # span_kind: retrievable in metadata for filtering (content / cls / doc_mean)
+                if span_text_raw == "[DOC_MEAN]":
+                    span_kind = "doc_mean"
+                elif span_text_raw == "[CLS]" or (isinstance(span_text_raw, str) and span_text_raw.startswith("[") and "CLS" in span_text_raw):
+                    span_kind = "cls"
+                else:
+                    span_kind = "content"
                 all_metadata.append({
                     'doc_id': doc_id,
                     'section': section,
                     'i': i,
+                    'span_kind': span_kind,
                     'sentence': doc_text[:100],  # Keep key name for backwards compatibility (first 100 chars)
                     'unit': unit,
                     'span_text_raw': span_text_raw,  # Original span text
@@ -483,6 +524,12 @@ def create_contextual_span_embeddings(
         # Periodically chunk embeddings to reduce peak memory usage
         if (batch_idx + 1) % chunk_frequency == 0:
             _chunk_embeddings()
+        
+        # Early-stop: stop once we have enough spans (avoids encoding then sampling down)
+        if max_spans is not None and _current_total_spans() >= max_spans:
+            print(f"\n[Early-stop] Reached max_spans={max_spans:,}; stopping after batch {batch_idx + 1}.")
+            _chunk_embeddings()
+            break
         
         # Clear GPU cache more frequently for memory-intensive units
         cache_frequency = 5 if unit == "encoder_token" else 10
@@ -545,6 +592,421 @@ def create_contextual_span_embeddings(
     
     return embeddings_by_section, all_metadata
 
+
+# ---------------------------------------------------------------------------
+# Text normalization (model-independent, used by both cache and runtime)
+# ---------------------------------------------------------------------------
+
+def _normalize_semicolon(text: str) -> str:
+    """Add spaces around semicolons glued to words: word1;word2 → word1 ; word2."""
+    return re.sub(r"(?<=[^\s]);(?=[^\s])", " ; ", text)
+
+
+def _normalize_ref_numerals(text: str) -> str:
+    """Remove patent reference numerals like (1), (2), (48, 82), (210; 320; 410)."""
+    t = re.sub(r"\(\d+(?:\s*[,;]\s*\d+)*\)", " ", text)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def normalize_text_for_pipeline(text: str) -> str:
+    """Apply all model-independent text normalization (semicolons + ref numerals)."""
+    return _normalize_ref_numerals(_normalize_semicolon(text))
+
+
+# ---------------------------------------------------------------------------
+# Span extraction from spaCy doc (shared by cache builder and runtime)
+# ---------------------------------------------------------------------------
+
+def extract_char_spans_from_spacy(
+    doc_spacy,
+    section: str,
+    unit: str,
+    *,
+    is_abstract_title: bool = False,
+    is_abstract_body: bool = False,
+) -> List[Tuple[int, int, str]]:
+    """
+    Extract semantic-unit char spans from a spaCy Doc.
+
+    This contains the same logic as the span extraction in process_doc_batch
+    but is decoupled from the encoder so it can be used by the span cache builder.
+
+    Args:
+        doc_spacy: spaCy Doc object
+        section: "abstract", "claim", or "invention"
+        unit: "spacy_token", "spacy_sentence", or "noun_chunk"
+        is_abstract_title: True when processing the title portion of an abstract
+        is_abstract_body: True when processing the body portion of an abstract
+
+    Returns:
+        List of (start_char, end_char, span_text) tuples.
+    """
+    char_spans: List[Tuple[int, int, str]] = []
+
+    if unit == "spacy_token":
+        # Noun chunks merged, standalone tokens kept if they pass quality filter
+        noun_chunk_spans = []
+        for chunk in doc_spacy.noun_chunks:
+            chunk_start = chunk.start_char
+            chunk_end = chunk.end_char
+            chunk_text = _strip_claim_number_prefix(chunk.text.strip(), section).strip()
+            if section == "invention" and chunk_text:
+                chunk_text, skip_in_t = _strip_leading_uppercase_run(chunk_text)
+                if skip_in_t > 0:
+                    leading_ws = len(chunk.text) - len(chunk.text.lstrip())
+                    chunk_start = chunk_start + leading_ws + skip_in_t
+            if not chunk_text or len(chunk_text) < 2 or _is_likely_formula_variable(chunk_text):
+                continue
+            noun_chunk_spans.append((chunk_start, chunk_end, chunk_text))
+
+        char_spans.extend(noun_chunk_spans)
+
+        for tok in doc_spacy:
+            if tok.is_space:
+                continue
+            tok_start = tok.idx
+            tok_end = tok.idx + len(tok.text)
+            token_in_chunk = any(
+                cs <= tok_start and tok_end <= ce for cs, ce, _ in noun_chunk_spans
+            )
+            if not token_in_chunk and filter_span_quality(tok.text, standalone_token=True):
+                char_spans.append((tok_start, tok_end, tok.text))
+
+    elif unit == "spacy_sentence":
+        if is_abstract_title:
+            # Title part: simple sentence extraction
+            for sent in doc_spacy.sents:
+                t = sent.text.strip()
+                if not t or len(t) < 3:
+                    continue
+                if re.match(r"^\[.*\]\s*$", t) or re.match(r"^\[.*\]\s*\[.*\]\s*$", t):
+                    continue
+                char_spans.append((sent.start_char, sent.end_char, t))
+        elif is_abstract_body:
+            # Abstract body: simple sentences + trailing drop
+            sents_list = []
+            for sent in doc_spacy.sents:
+                t = sent.text.strip()
+                if not t or len(t) < 3:
+                    continue
+                if re.match(r"^\[.*\]\s*$", t) or re.match(r"^\[.*\]\s*\[.*\]\s*$", t):
+                    continue
+                sents_list.append((sent.start_char, sent.end_char, t))
+            if len(sents_list) > 1 and _should_drop_trailing_sentence(sents_list[-1][2]):
+                sents_list = sents_list[:-1]
+            char_spans.extend(sents_list)
+        elif section == "claim":
+            sents_list = list(doc_spacy.sents)
+            merged = []
+            j = 0
+            while j < len(sents_list):
+                t = sents_list[j].text.strip()
+                if re.match(r"^\d+\.\s*$", t) and j + 1 < len(sents_list):
+                    merged.append((
+                        sents_list[j].start_char,
+                        sents_list[j + 1].end_char,
+                        sents_list[j].text + " " + sents_list[j + 1].text.strip(),
+                    ))
+                    j += 2
+                else:
+                    if t and len(t) >= 3 and not re.match(r"^\[.*\]\s*$", t) and not re.match(r"^\[.*\]\s*\[.*\]\s*$", t):
+                        merged.append((sents_list[j].start_char, sents_list[j].end_char, t))
+                    j += 1
+            if len(merged) > 1 and _should_drop_trailing_sentence(merged[-1][2]):
+                merged = merged[:-1]
+            for start, end, t in merged:
+                if t:
+                    char_spans.append((start, end, t))
+        else:
+            # invention / other: strip leading all-caps headers, trailing drop
+            sents_list = []
+            for s in doc_spacy.sents:
+                t = s.text.strip()
+                if not t or len(t) < 3:
+                    continue
+                if re.match(r"^\[.*\]\s*$", t) or re.match(r"^\[.*\]\s*\[.*\]\s*$", t):
+                    continue
+                stripped, skip_in_t = _strip_leading_uppercase_run(t)
+                if not stripped or len(stripped) < 3:
+                    continue
+                leading_ws = len(s.text) - len(s.text.lstrip())
+                new_start = s.start_char + leading_ws + skip_in_t
+                sents_list.append((new_start, s.end_char, stripped))
+            if len(sents_list) > 1 and _should_drop_trailing_sentence(sents_list[-1][2]):
+                sents_list = sents_list[:-1]
+            for start, end, t in sents_list:
+                if t:
+                    char_spans.append((start, end, t))
+
+    elif unit == "noun_chunk":
+        for chunk in doc_spacy.noun_chunks:
+            t = _strip_claim_number_prefix(chunk.text.strip(), section).strip()
+            start_c, end_c = chunk.start_char, chunk.end_char
+            if section == "invention" and t:
+                t, skip_in_t = _strip_leading_uppercase_run(t)
+                if skip_in_t > 0:
+                    leading_ws = len(chunk.text) - len(chunk.text.lstrip())
+                    start_c = chunk.start_char + leading_ws + skip_in_t
+            if not t or _is_likely_formula_variable(t):
+                continue
+            char_spans.append((start_c, end_c, t))
+    else:
+        raise ValueError(f"Unknown unit: {unit}")
+
+    return char_spans
+
+
+# ---------------------------------------------------------------------------
+# Span cache I/O
+# ---------------------------------------------------------------------------
+
+def save_span_cache(cache_dir: str, unit: str, cache_entries: List[dict]):
+    """
+    Save span cache for one unit type.
+
+    Each entry: {"d": doc_id, "s": section, "p": "title"|"body", "sp": [[s, e, text], ...]}
+    Saved as gzipped JSONL: {cache_dir}/{unit}_spans.jsonl.gz
+    """
+    import gzip
+    os.makedirs(cache_dir, exist_ok=True)
+    out_path = os.path.join(cache_dir, f"{unit}_spans.jsonl.gz")
+    with gzip.open(out_path, "wt", encoding="utf-8") as f:
+        for entry in cache_entries:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    print(f"Saved {len(cache_entries):,} span-cache entries to {out_path}")
+    return out_path
+
+
+def load_span_cache(cache_dir: str, unit: str) -> dict:
+    """
+    Load span cache for one unit type.
+
+    Returns: dict  (doc_id, section, sub_part) → list of (start_char, end_char, span_text)
+    """
+    import gzip
+    cache_path = os.path.join(cache_dir, f"{unit}_spans.jsonl.gz")
+    if not os.path.isfile(cache_path):
+        raise FileNotFoundError(f"Span cache not found: {cache_path}")
+    cache = {}
+    with gzip.open(cache_path, "rt", encoding="utf-8") as f:
+        for line in f:
+            entry = json.loads(line)
+            key = (entry["d"], entry["s"], entry["p"])
+            cache[key] = [(s, e, t) for s, e, t in entry["sp"]]
+    print(f"Loaded span cache: {len(cache):,} entries from {cache_path}")
+    return cache
+
+
+def _compute_content_offsets(
+    normalized_formatted: str,
+    section: str,
+    format_scheme: str,
+    sep: str,
+) -> dict:
+    """
+    Compute where raw section content starts within the normalized formatted text.
+
+    Returns {"body": int} for claim/invention,
+            {"title": 0, "body": int} for abstract.
+    """
+    if section in ("claim", "invention"):
+        if format_scheme == ENCODER_FORMAT_SECTION_TOKENS:
+            marker = f"[{section}] "
+            if normalized_formatted.startswith(marker):
+                return {"body": len(marker)}
+        return {"body": 0}
+
+    # abstract
+    sep_pos = normalized_formatted.find(sep.strip())
+    if sep_pos < 0:
+        return {"title": 0, "body": 0}
+
+    # title starts at 0
+    if format_scheme == ENCODER_FORMAT_SECTION_TOKENS:
+        abs_marker = "[abstract] "
+        marker_pos = normalized_formatted.find(abs_marker, sep_pos)
+        if marker_pos >= 0:
+            body_offset = marker_pos + len(abs_marker)
+        else:
+            body_offset = sep_pos + len(sep)
+    else:
+        # title_sep_only: title{sep}body  — find end of sep region
+        sep_end = sep_pos + len(sep.strip())
+        # advance past any whitespace after the stripped sep
+        while sep_end < len(normalized_formatted) and normalized_formatted[sep_end] == " ":
+            sep_end += 1
+        body_offset = sep_end
+
+    return {"title": 0, "body": body_offset}
+
+
+# ---------------------------------------------------------------------------
+# process_doc_batch_cached: Phase 2 — encode with cached spans (no spaCy)
+# ---------------------------------------------------------------------------
+
+def process_doc_batch_cached(
+    doc_texts: List[str],
+    doc_ids: List[str],
+    sections: List[str],
+    unit: str,
+    span_cache: dict,
+    format_scheme: str,
+    sep: str,
+    model,
+    tokenizer,
+    device,
+    max_length: int = 512,
+    keep_cls: bool = True,
+    layer: str = "last",
+    span_pooling: str = "mean",
+    keep_doc_mean: bool = False,
+) -> List[Tuple[str, str, str, str, str, np.ndarray]]:
+    """
+    Phase 2: Encode doc-section texts using pre-cached spaCy spans (no spaCy needed).
+
+    Same interface as process_doc_batch but uses span_cache instead of running spaCy.
+    For each doc-section, cached char spans (relative to normalized raw section text) are
+    adjusted by the model-specific prefix offset, then filtered to those within the encoder's
+    visible window (char_end), then mapped to token indices and pooled.
+    """
+    # Normalize (same normalization as Phase 1 used on raw section text)
+    doc_texts = [normalize_text_for_pipeline(t) for t in doc_texts]
+
+    # Tokenize in batch
+    encoding = tokenizer(
+        doc_texts, truncation=True, max_length=max_length, padding=True,
+        add_special_tokens=True, return_tensors="pt", return_offsets_mapping=True,
+    )
+    input_ids = encoding["input_ids"].to(device)
+    attention_mask = encoding["attention_mask"].to(device)
+    offset_mapping = encoding["offset_mapping"]
+
+    special_token_ids = set(tokenizer.all_special_ids)
+    cls_token_id = getattr(tokenizer, "cls_token_id", None)
+    filtered_special_token_ids = special_token_ids.copy()
+    if keep_cls and cls_token_id is not None:
+        filtered_special_token_ids.discard(cls_token_id)
+
+    # Truncation diagnostics
+    truncated_count = 0
+    if hasattr(encoding, "encodings") and encoding.encodings is not None:
+        for enc in encoding.encodings:
+            if hasattr(enc, "overflowing") and len(enc.overflowing) > 0:
+                truncated_count += 1
+    if truncated_count > 0:
+        print(f"\n⚠️  {truncated_count}/{len(doc_texts)} docs truncated at {max_length} tokens")
+
+    # Encode
+    with torch.no_grad():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        if layer == "last":
+            batch_embeddings = outputs.last_hidden_state
+        elif layer == "second_last":
+            batch_embeddings = outputs.hidden_states[-2]
+        else:
+            raise ValueError(f"Invalid layer: {layer}")
+
+    # Visible char end per doc
+    char_ends = []
+    for i in range(len(doc_texts)):
+        ce = _visible_char_end_from_offset_mapping(offset_mapping[i], input_ids[i], special_token_ids)
+        char_ends.append(ce)
+
+    all_span_embeddings = []
+
+    for i, (doc_id, section, doc_text) in enumerate(zip(doc_ids, sections, doc_texts)):
+        char_end = char_ends[i]
+        if char_end == 0:
+            continue
+
+        token_embeddings = batch_embeddings[i]
+        offset_map = offset_mapping[i]
+        seq_input_ids = input_ids[i]
+
+        # Compute content offsets for this section
+        offsets = _compute_content_offsets(doc_text, section, format_scheme, sep)
+
+        # Collect cached spans for this doc-section
+        adjusted_char_spans = []
+        if section == "abstract":
+            title_off = offsets.get("title", 0)
+            body_off = offsets.get("body", 0)
+            for sub, off in [("title", title_off), ("body", body_off)]:
+                for s, e, t in span_cache.get((doc_id, section, sub), []):
+                    adj_s, adj_e = s + off, e + off
+                    if adj_e <= char_end:
+                        adjusted_char_spans.append((adj_s, adj_e, t))
+        else:
+            body_off = offsets.get("body", 0)
+            for s, e, t in span_cache.get((doc_id, section, "body"), []):
+                adj_s, adj_e = s + body_off, e + body_off
+                if adj_e <= char_end:
+                    adjusted_char_spans.append((adj_s, adj_e, t))
+
+        # Map char spans → token spans
+        spans = extract_char_spans_to_token_spans(
+            char_spans=adjusted_char_spans,
+            prefix_len=0,
+            offset_mapping=offset_map,
+            input_ids=seq_input_ids,
+            special_token_ids=filtered_special_token_ids,
+            dedup=False,
+        )
+
+        # Add [CLS] token embedding
+        if keep_cls and cls_token_id is not None:
+            for tok_idx, tok_id in enumerate(seq_input_ids):
+                if int(tok_id.item()) == cls_token_id:
+                    cls_emb = token_embeddings[tok_idx].cpu().numpy()
+                    cls_emb = cls_emb / (np.linalg.norm(cls_emb) + 1e-12)
+                    cls_text = tokenizer.convert_ids_to_tokens([cls_token_id])[0]
+                    cls_canonical = canonicalize_span_text(cls_text)
+                    all_span_embeddings.append((doc_id, section, doc_text, cls_text, cls_canonical, cls_emb))
+                    break
+
+        # Pool token embeddings per span
+        for span_text, token_start, token_end in spans:
+            if token_start >= token_end or token_end > len(token_embeddings):
+                continue
+            if unit == "spacy_sentence":
+                if len(span_text.strip()) < 3:
+                    continue
+            else:
+                if not filter_span_quality(span_text):
+                    continue
+
+            if span_pooling == "max":
+                span_emb = token_embeddings[token_start:token_end].max(dim=0)[0]
+            else:
+                span_emb = token_embeddings[token_start:token_end].mean(dim=0)
+            span_emb = span_emb.cpu().numpy()
+            span_emb = span_emb / (np.linalg.norm(span_emb) + 1e-12)
+            span_text_canonical = canonicalize_span_text(span_text)
+            if not span_text_canonical:
+                continue
+            all_span_embeddings.append((doc_id, section, doc_text, span_text, span_text_canonical, span_emb))
+
+    # Doc mean
+    if keep_doc_mean:
+        for i in range(len(doc_ids)):
+            doc_id, section, doc_text = doc_ids[i], sections[i], doc_texts[i]
+            token_embeddings = batch_embeddings[i]
+            seq_input_ids = input_ids[i]
+            seq_attention = attention_mask[i]
+            embs = []
+            for tok_idx in range(seq_attention.shape[0]):
+                if int(seq_attention[tok_idx].item()) == 0:
+                    continue
+                if int(seq_input_ids[tok_idx].item()) in filtered_special_token_ids:
+                    continue
+                embs.append(token_embeddings[tok_idx].cpu().numpy())
+            if embs:
+                mean_emb = np.mean(embs, axis=0).astype(np.float32)
+                mean_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
+                all_span_embeddings.append((doc_id, section, doc_text, "[DOC_MEAN]", "[DOC_MEAN]", mean_emb))
+
+    del batch_embeddings, input_ids, attention_mask, offset_mapping, encoding
+    return all_span_embeddings
 
 
 def extract_char_spans_to_token_spans(char_spans: List[Tuple[int, int, str]],
@@ -638,48 +1100,136 @@ def canonicalize_span_text(span_text: str) -> str:
     return " ".join(toks)
 
 
-def filter_span_quality(span_text: str) -> bool:
+def _strip_claim_number_prefix(text: str, section: str) -> str:
+    """Strip leading claim number (e.g. '1. ', '2. ') from span text when section is 'claim'."""
+    if section != "claim":
+        return text
+    return re.sub(r"^\d+\.\s*", "", text.strip()).strip()
+
+
+def _should_drop_trailing_sentence(text: str) -> bool:
+    """True if the last sentence should be dropped: too short or likely truncated (no sentence-ending punctuation)."""
+    if not text or not text.strip():
+        return True
+    t = text.strip()
+    # Too short
+    if len(t) < 20 or len(t.split()) <= 2:
+        return True
+    # Likely truncated: does not end with sentence-ending punctuation
+    if t[-1] not in ".?!":
+        return True
+    return False
+
+
+def _strip_leading_uppercase_run(text: str) -> tuple:
+    """
+    Remove leading run of all-caps words (e.g. BACKGROUND OF THE INVENTION) from invention section text.
+    Returns (stripped_text, skip_count) where skip_count is the number of chars to skip from the start
+    of the trimmed input (for adjusting span start_char). If no leading all-caps run, returns (text, 0).
+    """
+    if not text or not text.strip():
+        return (text, 0)
+    t = text.strip()
+    # Require each "word" to have at least 2 chars so we don't strip sentence-initial capital (e.g. "T" from "This")
+    m = re.match(r"^(?:[A-Z][A-Z0-9]{1,}\s*)+", t)
+    if not m:
+        return (t, 0)
+    rest = t[m.end():]
+    stripped = rest.lstrip(".,;: \t\n").strip()
+    skip_in_t = m.end() + (len(rest) - len(rest.lstrip(".,;: \t\n")))
+    return (stripped, skip_in_t)
+
+
+def _is_section_marker_or_header(span_text: str) -> bool:
+    """True if span is a section token, '[claim] 1.', a standalone section-header word, or starts with a section token."""
+    s = span_text.strip()
+    if not s:
+        return True
+    # Section tokens only (exact or with trailing space)
+    if re.match(r"^\[(?:abstract|claim|invention)\]\s*$", s, re.IGNORECASE):
+        return True
+    # "[claim] 1." or "[abstract] ..." style
+    if re.match(r"^\[(?:abstract|claim|invention)\]\s+[\d.]+\s*$", s, re.IGNORECASE):
+        return True
+    # Spans starting with a section token followed by header words (e.g., "[invention] FIELD")
+    if re.match(r"^\[(?:abstract|claim|invention)\]\s+", s, re.IGNORECASE):
+        remainder = re.sub(r"^\[(?:abstract|claim|invention)\]\s+", "", s, flags=re.IGNORECASE).strip()
+        if not remainder or len(remainder.split()) <= 2:
+            return True
+    # Single-word section header fragments from "FIELD OF THE INVENTION AND RELATED ART"
+    header_words = {"field", "related", "art", "invention", "description", "background", "prior", "technical"}
+    if len(s.split()) == 1 and s.lower() in header_words:
+        return True
+    return False
+
+
+def _is_likely_formula_variable(text: str) -> bool:
+    """True if span looks like a chemical formula variable (R, X, ") X") to filter from noun_chunks/tokens."""
+    s = text.strip()
+    if not s:
+        return False
+    if len(s) <= 2 and s.isalpha():
+        return True
+    if re.match(r"^\)\s*[A-Za-z]\s*$", s):
+        return True
+    return False
+
+
+def filter_span_quality(span_text: str, *, standalone_token: bool = False) -> bool:
     """
     Filter out low-quality spans (patent templates, stopwords, etc.).
     Returns True if span should be kept, False if should be filtered out.
+
+    When standalone_token=True (used for spacy_token unit: tokens not in any noun_chunk),
+    single-word spans are allowed if they pass basic checks (length, not formula/hard_stop);
+    generic_heads and the strict "acronym/digit/hyphen only" rule are skipped so more
+    content words (e.g. "method", "material") are retained.
     """
     s = span_text.strip()
     # 0) strip weird whitespace
     if not s:
         return False
+    # 0b) reject section markers and header-only spans ([abstract], [claim] 1., FIELD, RELATED, ART, etc.)
+    if _is_section_marker_or_header(s):
+        return False
 
     span_lower = span_text.lower().strip()
-    # 1) Too short or too long
+    # 1) Too short or too long (standalone: allow 2+ chars so "no", "or" still filtered by hard_stop if needed)
     if len(span_text) < 3 or len(span_text) > 100:
         return False
-    
-    # 2) reject pure function/connector words (patent discourse)
+
+    # 2) reject formula variables (single letters R, X, ") X" etc. from chemical noun_chunks)
+    if _is_likely_formula_variable(s):
+        return False
+
+    # 3) reject pure function/connector words and abbreviations (patent discourse)
     hard_stop = {
-        "which","wherein","thereof","therein","thereby","herein","hereby",
-        "said","such","other","another","any","each","may","can","would","could",
-        "including","include","includes","according","respectively"
+        "which", "wherein", "thereof", "therein", "thereby", "herein", "hereby",
+        "said", "such", "other", "another", "any", "each", "may", "can", "would", "could",
+        "including", "include", "includes", "according", "respectively",
+        "e.g.", "i.e.", "etc.", "cf.", "viz."
     }
     if span_lower in hard_stop:
         return False
 
-    # 3) reject 1-word spans unless they look like technical anchors
+    # 3b) For multi-word spans, or single-word when not standalone_token: apply strict single-word rule
     words = re.findall(r"[A-Za-z0-9]+(?:[-/][A-Za-z0-9]+)*", s)
-    if len(words) == 1:
+    if len(words) == 1 and not standalone_token:
         w = words[0]
-        # allow acronyms / chemical-like / alnum anchors
+        # allow acronyms / chemical-like / alnum anchors only
         if not (re.match(r"^[A-Z]{2,}$", w) or re.search(r"\d", w) or "-" in w or "/" in w):
             return False
 
-    # 4) reject generic template heads (very common in patents)
-    generic_heads = {
-        "method","methods","system","systems","apparatus","device","devices",
-        "technique","techniques","approach","approaches","solution","solutions",
-        "embodiment","embodiments","invention","disclosure"
-    }
-    # if span is short and ends with generic head -> drop (e.g., "a method", "the technique")
-    toks = [t for t in span_lower.split() if t]
-    if len(toks) <= 4 and toks[-1] in generic_heads:
-        return False
+    # 4) reject generic template heads (very common in patents); skip for standalone_token to keep more content words
+    if not standalone_token:
+        generic_heads = {
+            "method", "methods", "system", "systems", "apparatus", "device", "devices",
+            "technique", "techniques", "approach", "approaches", "solution", "solutions",
+            "embodiment", "embodiments", "invention", "disclosure"
+        }
+        toks = [t for t in span_lower.split() if t]
+        if len(toks) <= 4 and toks[-1] in generic_heads:
+            return False
 
     # 5) Only digits, punctuation, or units
     if re.match(r'^[\d\s\-.,;:()%°/]+$', span_text):
@@ -844,6 +1394,8 @@ def process_doc_batch(doc_texts: List[str],
 
     Returns: List of (doc_id, section, doc_text, span_text_raw, span_text_canonical, span_embedding)
     """
+    doc_texts = [normalize_text_for_pipeline(t) for t in doc_texts]
+
     # Encode doc texts
     encoding = tokenizer(
         doc_texts,
@@ -972,35 +1524,36 @@ def process_doc_batch(doc_texts: List[str],
         if unit == "spacy_token":
             # Strategy: noun_chunks are merged (one embedding per chunk),
             # other tokens remain individual (one embedding per token).
-            # Step 1: Collect all noun_chunks (spaCy yields non-overlapping spans)
+            # Step 1: Collect all noun_chunks; skip formula vars; strip claim number (claim); strip leading all-caps (invention)
             noun_chunk_spans = []
             for chunk in doc_spacy.noun_chunks:
                 chunk_start = chunk.start_char
                 chunk_end = chunk.end_char
-                chunk_text = chunk.text.strip()
-                if chunk_text:
-                    noun_chunk_spans.append((chunk_start, chunk_end, chunk_text))
+                chunk_text = _strip_claim_number_prefix(chunk.text.strip(), section).strip()
+                if section == "invention" and chunk_text:
+                    chunk_text, skip_in_t = _strip_leading_uppercase_run(chunk_text)
+                    if skip_in_t > 0:
+                        leading_ws = len(chunk.text) - len(chunk.text.lstrip())
+                        chunk_start = chunk_start + leading_ws + skip_in_t
+                if not chunk_text or len(chunk_text) < 2 or _is_likely_formula_variable(chunk_text):
+                    continue
+                noun_chunk_spans.append((chunk_start, chunk_end, chunk_text))
             
             # Step 2: Add noun_chunks first (they will be merged into one embedding each)
             char_spans.extend(noun_chunk_spans)
             
-            # Step 3: Add individual tokens that are NOT completely inside any noun_chunk
-            # A token is "inside" a chunk if its char range is fully contained within the chunk's range
+            # Step 3: Add individual tokens that are NOT completely inside any noun_chunk,
+            # only if they pass quality filter (avoids punctuation, stopwords, formula vars, etc.).
             for tok in doc_spacy:
                 if tok.is_space:
                     continue
                 tok_start = tok.idx
                 tok_end = tok.idx + len(tok.text)
-                
-                # Check if this token is completely contained within any noun_chunk
-                token_in_chunk = False
-                for chunk_start, chunk_end, _ in noun_chunk_spans:
-                    if chunk_start <= tok_start and tok_end <= chunk_end:
-                        token_in_chunk = True
-                        break
-                
-                # Only add tokens that are NOT part of any noun_chunk
-                if not token_in_chunk:
+                token_in_chunk = any(
+                    chunk_start <= tok_start and tok_end <= chunk_end
+                    for chunk_start, chunk_end, _ in noun_chunk_spans
+                )
+                if not token_in_chunk and filter_span_quality(tok.text, standalone_token=True):
                     char_spans.append((tok_start, tok_end, tok.text))
         elif unit == "spacy_sentence":
             # For abstract section, split by model's separator first (e.g. [SEP], </s>), then process title and abstract separately
@@ -1041,55 +1594,92 @@ def process_doc_batch(doc_texts: List[str],
                             char_spans.append((sent_start, sent_end, t))
                             sentences_found = True
                     
-                    # Process abstract part (includes [abstract] token if present)
+                    # Process abstract part (includes [abstract] token if present); drop short trailing sentence if truncated
                     if abstract_part:
                         abstract_doc = NLP(abstract_part)
-                        
+                        abs_sents = []
                         for sent in abstract_doc.sents:
                             t = sent.text.strip()
                             if not t:
                                 continue
-                            # For [abstract] token itself, keep it if it's a standalone sentence
-                            # Otherwise, skip very short sentences (but allow [abstract] token)
                             if len(t) < 3 and t != "[abstract]":
                                 continue
-                            # Skip other special token patterns (but keep [abstract])
                             if t != "[abstract]" and (re.match(r'^\[.*\]\s*$', t) or re.match(r'^\[.*\]\s*\[.*\]\s*$', t)):
                                 continue
-                            # Adjust offset: sent.start_char is relative to abstract_part, add abstract_content_start
-                            sent_start = abstract_content_start + sent.start_char
-                            sent_end = abstract_content_start + sent.end_char
+                            abs_sents.append((abstract_content_start + sent.start_char, abstract_content_start + sent.end_char, t))
+                        if len(abs_sents) > 1 and abs_sents[-1][2]:
+                            if _should_drop_trailing_sentence(abs_sents[-1][2]):
+                                abs_sents = abs_sents[:-1]
+                        for sent_start, sent_end, t in abs_sents:
                             char_spans.append((sent_start, sent_end, t))
                             sentences_found = True
                 else:
-                    # Fallback: if separator not found, process whole doc as one
+                    # Fallback: if separator not found, collect sents and drop short trailing
                     sentences_found = False
-                    for sent in doc_spacy.sents:
-                        t = sent.text.strip()
-                        if not t:
-                            continue
-                        if len(t) < 3:
-                            continue
-                        if re.match(r'^\[.*\]\s*$', t) or re.match(r'^\[.*\]\s*\[.*\]\s*$', t):
-                            continue
-                        char_spans.append((sent.start_char, sent.end_char, t))
+                    sents_list = [
+                        (s.start_char, s.end_char, s.text.strip())
+                        for s in doc_spacy.sents
+                        if s.text.strip() and len(s.text.strip()) >= 3
+                        and not re.match(r"^\[.*\]\s*$", s.text.strip())
+                        and not re.match(r"^\[.*\]\s*\[.*\]\s*$", s.text.strip())
+                    ]
+                    if len(sents_list) > 1 and sents_list[-1][2]:
+                        if _should_drop_trailing_sentence(sents_list[-1][2]):
+                            sents_list = sents_list[:-1]
+                    for start, end, t in sents_list:
+                        char_spans.append((start, end, t))
                         sentences_found = True
             else:
-                # For non-abstract sections or abstract without separator, process normally
+                # For non-abstract: claim gets number-merge + trailing drop; invention just normal sents + optional trailing drop
                 sentences_found = False
-                for sent in doc_spacy.sents:
-                    t = sent.text.strip()
-                    if not t:
-                        continue
-                    # Filter out sentences that are only special tokens or very short
-                    if len(t) < 3:
-                        continue
-                    # Additional check: skip sentences that are only special token patterns
-                    # (e.g., "[abstract]", "[claim]", "[invention]", "[SEP]")
-                    if re.match(r'^\[.*\]\s*$', t) or re.match(r'^\[.*\]\s*\[.*\]\s*$', t):
-                        continue
-                    char_spans.append((sent.start_char, sent.end_char, t))
-                    sentences_found = True
+                if section == "claim":
+                    # Claim only: collect sents, merge "1.", "2." with next sentence, drop short trailing
+                    sents_list = list(doc_spacy.sents)
+                    merged = []
+                    j = 0
+                    while j < len(sents_list):
+                        t = sents_list[j].text.strip()
+                        if re.match(r"^\d+\.\s*$", t) and j + 1 < len(sents_list):
+                            merged.append((
+                                sents_list[j].start_char,
+                                sents_list[j + 1].end_char,
+                                sents_list[j].text + " " + sents_list[j + 1].text.strip()
+                            ))
+                            j += 2
+                        else:
+                            if t and len(t) >= 3 and not re.match(r"^\[.*\]\s*$", t) and not re.match(r"^\[.*\]\s*\[.*\]\s*$", t):
+                                merged.append((sents_list[j].start_char, sents_list[j].end_char, t))
+                            j += 1
+                    if len(merged) > 1 and merged[-1][2]:
+                        if _should_drop_trailing_sentence(merged[-1][2]):
+                            merged = merged[:-1]
+                    for start, end, t in merged:
+                        if t:
+                            char_spans.append((start, end, t))
+                            sentences_found = True
+                else:
+                    # Invention (and any other non-abstract): sentence iteration, strip leading all-caps header, drop short trailing
+                    sents_list = []
+                    for s in doc_spacy.sents:
+                        t = s.text.strip()
+                        if not t or len(t) < 3:
+                            continue
+                        if re.match(r"^\[.*\]\s*$", t) or re.match(r"^\[.*\]\s*\[.*\]\s*$", t):
+                            continue
+                        # Strip leading all-caps run (e.g. "BACKGROUND OF THE INVENTION ") so only content remains
+                        stripped, skip_in_t = _strip_leading_uppercase_run(t)
+                        if not stripped or len(stripped) < 3:
+                            continue
+                        leading_ws = len(s.text) - len(s.text.lstrip())
+                        new_start = s.start_char + leading_ws + skip_in_t
+                        sents_list.append((new_start, s.end_char, stripped))
+                    if len(sents_list) > 1 and sents_list[-1][2]:
+                        if _should_drop_trailing_sentence(sents_list[-1][2]):
+                            sents_list = sents_list[:-1]
+                    for start, end, t in sents_list:
+                        if t:
+                            char_spans.append((start, end, t))
+                            sentences_found = True
             
             # Debug: if no sentences found but vis_text exists, it might be too short or only special tokens
             # This is expected for some documents where truncation leaves only special tokens
@@ -1099,10 +1689,16 @@ def process_doc_batch(doc_texts: List[str],
 
         elif unit == "noun_chunk":
             for chunk in doc_spacy.noun_chunks:
-                t = chunk.text.strip()
-                if not t:
+                t = _strip_claim_number_prefix(chunk.text.strip(), section).strip()
+                start_c, end_c = chunk.start_char, chunk.end_char
+                if section == "invention" and t:
+                    t, skip_in_t = _strip_leading_uppercase_run(t)
+                    if skip_in_t > 0:
+                        leading_ws = len(chunk.text) - len(chunk.text.lstrip())
+                        start_c = chunk.start_char + leading_ws + skip_in_t
+                if not t or _is_likely_formula_variable(t):
                     continue
-                char_spans.append((chunk.start_char, chunk.end_char, t))
+                char_spans.append((start_c, end_c, t))
         else:
             raise ValueError(f"Unknown unit: {unit}")
 
@@ -1133,17 +1729,14 @@ def process_doc_batch(doc_texts: List[str],
             if token_start >= token_end or token_end > len(token_embeddings):
                 continue
 
-            # Quality filtering for non-encoder_token modes (encoder_token outputs all tokens as-is)
-            # For spacy_sentence, we're more lenient - only filter if span is clearly invalid
-            # because sentences should generally be kept even if they're short or contain common words
+            # Quality filtering: applied before appending → filtered spans never get embeddings (not just display).
+            # For spacy_sentence, we're more lenient - only filter if span is clearly invalid.
             if unit != "encoder_token":
                 if unit == "spacy_sentence":
-                    # For sentences, only filter if they're extremely short or clearly invalid
-                    # Don't apply the full filter_span_quality which is designed for tokens/noun_chunks
                     if len(span_text.strip()) < 3:
                         continue
                 else:
-                    # For other units (spacy_token, noun_chunk), use full quality filter
+                    # spacy_token / noun_chunk: filter_span_quality drops section markers, header words, etc.
                     if not filter_span_quality(span_text):
                         continue
 
