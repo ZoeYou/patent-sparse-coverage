@@ -2047,10 +2047,10 @@ def find_centers(dense_model: str, tokenization_unit: str, include_cls: bool, se
         matching_dirs.sort(key=lambda x: os.path.getmtime(x), reverse=True)
         centers_dir = matching_dirs[0]
         print(f"⚠️  Found {len(matching_dirs)} matching directories, using: {centers_dir}")
-    centers_pattern = os.path.join(centers_dir, "centers_greedy_r*.npy")
+    centers_pattern = os.path.join(centers_dir, "centers_greedy_*.npy")
     centers_files = glob.glob(centers_pattern)
     if not centers_files:
-        raise FileNotFoundError(f"Could not find centers file in: {centers_dir}\nExpected pattern: centers_greedy_r*.npy")
+        raise FileNotFoundError(f"Could not find centers file in: {centers_dir}\nExpected pattern: centers_greedy_*.npy")
     centers_path = centers_files[0]
     if len(centers_files) > 1:
         centers_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)

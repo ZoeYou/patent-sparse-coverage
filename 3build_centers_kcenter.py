@@ -132,9 +132,12 @@ def _compute_df_diagnostic(assignments, assign_dists, span_doc_ids, r_per_center
     O(N log N) via sort-based unique counting instead of O(V*N) per-center masking.
     Returns (df_per_center, quantiles, top_df_centers).
     """
-    unique_docs = sorted(set(span_doc_ids))
-    doc_to_int = {d: i for i, d in enumerate(unique_docs)}
-    doc_ints = np.array([doc_to_int[d] for d in span_doc_ids], dtype=np.int32)
+    doc_to_int: dict[str, int] = {}
+    doc_ints = np.empty(len(span_doc_ids), dtype=np.int32)
+    for i, d in enumerate(span_doc_ids):
+        if d not in doc_to_int:
+            doc_to_int[d] = len(doc_to_int)
+        doc_ints[i] = doc_to_int[d]
 
     # Sort-based df: unique (center, doc) pairs, then bincount on center
     pairs = np.stack([assignments, doc_ints], axis=1)  # (N, 2)
@@ -889,10 +892,11 @@ def main():
         df_per_center, df_quantiles, top10_df = _compute_df_diagnostic(
             assignments, assign_dists, span_doc_ids, r_per_center, V_actual, top_k=10
         )
-        # Stop-center rule: df >= p99 -> disabled at retrieval (avoids long posting lists + noise)
-        df_p99 = df_quantiles["p99"]
-        stop_centers = [int(c) for c in range(V_actual) if df_per_center[c] >= df_p99]
-        stop_center_threshold = df_p99
+        # Stop-center rule: top 1% of centers by df
+        n_stop = max(1, int(math.ceil(V_actual * 0.01)))
+        ranked = np.argsort(-df_per_center)
+        stop_centers = [int(ranked[i]) for i in range(n_stop)]
+        stop_center_threshold = int(df_per_center[ranked[n_stop - 1]])
 
         df_diagnostic = {
             "df_p50": df_quantiles["p50"],
@@ -903,7 +907,7 @@ def main():
         }
         print(f"\n[kcenter] ── DF diagnostic (doc frequency per center = posting list length) ──")
         print(f"[kcenter] df quantiles: p50={df_quantiles['p50']:,}, p90={df_quantiles['p90']:,}, p99={df_quantiles['p99']:,}, max={df_quantiles['max']:,}")
-        print(f"[kcenter] stop_centers (df >= p99): {len(stop_centers):,} disabled for retrieval (threshold={stop_center_threshold:,})")
+        print(f"[kcenter] stop_centers (top {n_stop} by df, min_df={stop_center_threshold:,}): {len(stop_centers):,} disabled for retrieval")
         print(f"[kcenter] Top-10 df centers (r_c + representative span):")
         for row in top10_df:
             print(f"  center {row['center_id']}: df={row['df']:,}, r_c={row['r_c']:.4f}, rep_span_idx={row['rep_span_idx']}, rep_span_dist={row['rep_span_dist']:.4f}")
@@ -920,7 +924,7 @@ def main():
     args.out_dir = build_output_dir(args.out_dir, args.embeddings_dir, args.mode, suffix=suffix)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    out_name = f"centers_greedy_r{nominal_r:.3f}.npy"
+    out_name = f"centers_greedy_V{V_actual}_r{nominal_r:.3f}.npy"
     out_path = os.path.join(args.out_dir, out_name)
     np.save(out_path, centers)
 

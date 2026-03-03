@@ -141,7 +141,10 @@ def prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_e
     assert len(doc_ids) == len(document_embeddings), f"doc_ids and document_embeddings length mismatch: {len(doc_ids)} vs {len(document_embeddings)}"
     assert len(query_types) == len(query_ids), f"query_types and query_ids length mismatch: {len(query_types)} vs {len(query_ids)}"
     assert len(doc_types) == len(doc_ids), f"doc_types and doc_ids length mismatch: {len(doc_types)} vs {len(doc_ids)}"
-    assert len(citation_mapping) == len(query_ids), f"citation_mapping and query_ids length mismatch: {len(citation_mapping)} vs {len(query_ids)}"
+    unique_query_ids = set(query_ids)
+    missing = unique_query_ids - set(citation_mapping)
+    if missing:
+        print(f"⚠️  {len(missing)} query IDs have no gold citations (first 5: {sorted(missing)[:5]})")
 
     results = {}
 
@@ -151,12 +154,16 @@ def prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_e
     # Convert to numpy array to ensure compatibility
     query_types = np.array(query_types)
     doc_types = np.array(doc_types)
+    query_ids_arr = np.array(query_ids)
+    doc_ids_arr = np.array(doc_ids)
 
     query_type_masks = (query_types == texttype_q)
     doc_type_masks = (doc_types == texttype_d)
 
     Q_emb = query_embeddings[query_type_masks].astype(np.float32)  # shape: [n_queries, emb_dim]
     D_emb = document_embeddings[doc_type_masks].astype(np.float32)    # shape: [n_docs, emb_dim]
+    qids_abs = query_ids_arr[query_type_masks]
+    dids_abs = doc_ids_arr[doc_type_masks]
 
     # Validate shape consistency
     assert Q_emb.shape[1] == D_emb.shape[1], f"Embedding dimension mismatch: Q_emb {Q_emb.shape} vs D_emb {D_emb.shape}"
@@ -173,27 +180,19 @@ def prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_e
     # Evaluate retrieval: we build lists of true labels & predicted labels
     true_labels_list, predicted_labels_list = [], []
 
-    # We'll iterate over each query index
     for q_idx, retrieved_docs_indices in enumerate(top_k_indices):
-        # 1) The query ID string, e.g. 'Q1'
-        q_id_str = query_ids[q_idx]
-        # 2) The set of true doc IDs for that query, e.g. ['D3', 'D27']
-        #    Make sure your citation_mapping stores them as a set/list
+        q_id_str = qids_abs[q_idx]
         true_labels = citation_mapping.get(q_id_str, [])
-
-        # 3) Convert doc indices to doc ID strings
-        predicted_labels = [doc_ids[d_idx] for d_idx in retrieved_docs_indices]
+        predicted_labels = [dids_abs[d_idx] for d_idx in retrieved_docs_indices]
 
         true_labels_list.append(true_labels)
         predicted_labels_list.append(predicted_labels)
 
-    # Optionally save abstract->abstract rankings for hybrid fusion (query_ids here are full list; first n are abstract)
     if save_rankings_path:
-        n_abstract = len(predicted_labels_list)
-        ranking_dict = {query_ids[q_idx]: predicted_labels_list[q_idx] for q_idx in range(n_abstract)}
+        ranking_dict = {qids_abs[i]: predicted_labels_list[i] for i in range(len(predicted_labels_list))}
         with open(save_rankings_path, "w") as f:
             json.dump(ranking_dict, f, indent=0)
-        print(f"   Saved abstract->abstract rankings to {save_rankings_path} ({n_abstract} queries)")
+        print(f"   Saved abstract->abstract rankings to {save_rankings_path} ({len(predicted_labels_list)} queries)")
 
     # Compute metrics
     results_key = "abstract->abstract"
@@ -203,14 +202,12 @@ def prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_e
     ######## Task2: Claim-to-All evaluation ########
     retrieved_sections = []   # for noting which section is retrieved at top_k
     
-    # Original counts before tripling (abstract, claim, invention)
     original_doc_count = len(doc_ids) // 3
-    original_query_count = len(query_ids) // 3
 
-    query_type_masks = (query_types == "claim")
-    Q_emb = query_embeddings[query_type_masks].astype(np.float32)
+    query_type_masks_claim = (query_types == "claim")
+    qids_claim = query_ids_arr[query_type_masks_claim]
+    Q_emb = query_embeddings[query_type_masks_claim].astype(np.float32)
     D_emb = document_embeddings.astype(np.float32)
-    D_ids = doc_ids
     faiss.normalize_L2(Q_emb)
     faiss.normalize_L2(D_emb)
     _report_dense_flops(Q_emb, D_emb, "claim->all", model_label=model_label)
@@ -218,19 +215,22 @@ def prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_e
 
     top_k_indices = np.argsort(-distances, axis=1)[:, :300]  # top_k * 3 to ensure we have enough candidates
     true_labels_list, predicted_labels_list = [], []
+    section_names = ["abstract", "claim", "invention"]
     for q_idx, retrieved_docs_indices in enumerate(top_k_indices):
-        q_id_str = query_ids[original_query_count + q_idx]  # qid for claim queries
+        q_id_str = qids_claim[q_idx]
         true_labels = citation_mapping.get(q_id_str, [])
-        # Map indices to doc IDs (same doc can appear as abstract/claim/invention → dedupe by first occurrence)
-        raw_predicted = [D_ids[d_idx] for d_idx in retrieved_docs_indices]
-        _, unique_indices = np.unique(raw_predicted, return_index=True)
-        unique_indices_sorted = sorted(unique_indices)[:100]
-        predicted_labels = [raw_predicted[i] for i in unique_indices_sorted]
-        # Section for each of top-100 (after dedupe): 0=abstract, 1=claim, 2=invention
-        section_names = ["abstract", "claim", "invention"]
-        retrieved_sections.append([
-            section_names[retrieved_docs_indices[i] // original_doc_count] for i in unique_indices_sorted
-        ])
+        seen = set()
+        predicted_labels = []
+        q_sections = []
+        for d_idx in retrieved_docs_indices:
+            docid = doc_ids_arr[d_idx]
+            if docid not in seen:
+                seen.add(docid)
+                predicted_labels.append(docid)
+                q_sections.append(section_names[d_idx // original_doc_count])
+            if len(predicted_labels) == 100:
+                break
+        retrieved_sections.append(q_sections)
         true_labels_list.append(true_labels)
         predicted_labels_list.append(predicted_labels)
 
@@ -241,14 +241,11 @@ def prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_e
         retrieved_sections=f"[{len(retrieved_sections)} queries with retrieved sections]",
     )
 
-    # Optionally save claim->all rankings for hybrid fusion
     if save_rankings_claim2all_path:
-        n_claim = len(predicted_labels_list)
-        claim_query_ids = [query_ids[original_query_count + q_idx] for q_idx in range(n_claim)]
-        ranking_dict = {str(qid): predicted_labels_list[q_idx] for q_idx, qid in enumerate(claim_query_ids)}
+        ranking_dict = {str(qids_claim[i]): predicted_labels_list[i] for i in range(len(predicted_labels_list))}
         with open(save_rankings_claim2all_path, "w") as f:
             json.dump(ranking_dict, f, indent=0)
-        print(f"   Saved claim->all rankings to {save_rankings_claim2all_path} ({n_claim} queries)")
+        print(f"   Saved claim->all rankings to {save_rankings_claim2all_path} ({len(predicted_labels_list)} queries)")
 
     # Format and display results
     print_subsection_header("Prior Art Search Results")
@@ -945,18 +942,20 @@ def main():
 
     # Document side:
     parser.add_argument("--document_assignment", type=str, default="soft", choices=["hard", "soft"],
-                       help="Document side: hard = each span -> nearest center only (Voronoi); soft = each span in all spheres (range_search). Default: soft.")
+                       help="Document side: hard = each span -> nearest center only (Voronoi); soft = search(K) + per-center r_c filter + topK cap. Default: soft.")
     parser.add_argument("--weight_aggregation", type=str, default="max", choices=["max", "sum"],
                        help="Per (query, center) and (doc, center): max = use max similarity (default); sum = use sum of similarities (TF-style). Default: max.")
     
     # Query side:
-    parser.add_argument("--use_soft_assignment", action="store_true", default=False,
-                       help="Use soft assignment for query spans: all centers with sim >= threshold (same as document side, range_search). "
-                            "Default: False (hard assignment: only nearest center per span). If True, query assignment is consistent with posting lists.")
-    parser.add_argument("--soft_assignment_max_centers_per_span", type=int, default=None,
-                       help="When use_soft_assignment: cap each span to at most this many centers (by similarity). "
-                            "Cap-only: if span falls in >K centers, keep top-K; if <=K, keep all (no fill). "
-                            "Default: None (no cap). Try 5 or 10 to reduce noise while keeping multi-center recall.")
+    _soft_grp = parser.add_mutually_exclusive_group()
+    _soft_grp.add_argument("--use_soft_assignment", action="store_true", default=True,
+                       help="Use soft assignment for query spans: search(K) + per-center r_c filter + topK cap (symmetric with doc side). Default.")
+    _soft_grp.add_argument("--no_soft_assignment", action="store_true", default=False,
+                       help="Force hard assignment for query spans (nearest center only).")
+    parser.add_argument("--soft_assignment_max_centers_per_span", type=int, default=10,
+                       help="Cap each query span to at most this many centers (by similarity). "
+                            "If span falls in >K centers, keep top-K; if <=K, keep all. "
+                            "Default: 10. Main efficiency knob for query-side soft assignment.")
     parser.add_argument("--query_first_span_weight", type=float, default=1.0,
                        help="Multiply weight of first span per query by this factor (e.g. 1.5 for claim2all). Default: 1.0.")
     parser.add_argument("--query_full_chunks", action="store_true", default=False,
@@ -972,12 +971,13 @@ def main():
                             "Default: 1.0. Try 0.5 (flatter), 1.5 or 2.0 (more discriminative).")
 
     parser.add_argument("--length_norm", type=str, default="none",
-                       choices=["none", "sqrt_centers"],
+                       choices=["none", "sqrt_spans", "sqrt_centers"],
                        help="Document length normalization for sparse_coverage. "
-                            "none: no normalization. sqrt_centers: divide by num_centers_hit^length_norm_exponent. "
-                            "Default: none.")
+                            "none: no normalization. sqrt_spans: divide by doc_span_count^exponent "
+                            "(BM25-like, stable across stop-center changes). "
+                            "sqrt_centers: legacy alias for sqrt_spans. Default: none.")
     parser.add_argument("--length_norm_exponent", type=float, default=0.5,
-                       help="Exponent for length norm when length_norm=sqrt_centers: divide by n_centers^exponent. "
+                       help="Exponent for length norm: divide by doc_span_count^exponent. "
                             "0.5 => sqrt (default). 0.8 => stronger penalization of long docs.")
     parser.add_argument("--centers_suffix", type=str, default="",
                        help="Suffix appended to centers directory name for discovery. Required when centers were "
@@ -1179,11 +1179,11 @@ def main():
                     for i in trange(0, len(query_encodings['input_ids']), batch_size, desc=f"Computing {texttype} query embeddings"):
                         batch = {key: torch.tensor(val[i:i+batch_size]).to(device) for key, val in query_encodings.items()}
                         outputs = model(**batch)
-                        query_embs[i:i+batch_size] = mean_pooling(outputs.last_hidden_state, query_encodings['attention_mask'][i:i+batch_size]).detach().cpu().numpy()
+                        query_embs[i:i+batch_size] = mean_pooling(outputs.last_hidden_state, batch['attention_mask']).detach().cpu().numpy()
                     for i in trange(0, len(doc_encodings['input_ids']), batch_size, desc=f"Computing {texttype} document embeddings"):
                         batch = {key: torch.tensor(val[i:i+batch_size]).to(device) for key, val in doc_encodings.items()}
                         outputs = model(**batch)
-                        doc_embs[i:i+batch_size] = mean_pooling(outputs.last_hidden_state, doc_encodings['attention_mask'][i:i+batch_size]).detach().cpu().numpy()
+                        doc_embs[i:i+batch_size] = mean_pooling(outputs.last_hidden_state, batch['attention_mask']).detach().cpu().numpy()
                 query_embeddings_dict[texttype] = query_embs
                 doc_embeddings_dict[texttype] = doc_embs
             q = np.concatenate([query_embeddings_dict["abstract"], query_embeddings_dict["claim"], query_embeddings_dict["invention"]], axis=0)
@@ -2113,7 +2113,7 @@ def main():
                     span_pooling="mean",
                 )
                 all_batch_results.extend(br)
-            # Group spans by (doc_id) to get (qidx, chunk_idx) and local span order
+            # Group spans by doc_id (= "query_{qidx}_{cidx}")
             from collections import defaultdict
             doc_id_to_spans: dict[str, list[np.ndarray]] = defaultdict(list)
             for doc_id, _sec, _dt, _raw, _canon, span_emb in all_batch_results:
@@ -2121,43 +2121,63 @@ def main():
                     if (_canon or "").strip().lower() == "cls" or (_raw or "").strip() == "[CLS]":
                         continue
                 doc_id_to_spans[doc_id].append(span_emb)
-            # Build per-query: (global_index, span_emb, from_first_chunk)
+
+            # For encoder_token unit, each output span = one non-special token.
+            # Each chunk's encoder input is: [CLS] prefix_tokens... abstract_chunk_tokens... [SEP]
+            # After filtering specials (and optionally CLS), the first n_prefix output
+            # spans are prefix (title+section marker), the rest are abstract tokens.
+            # offset_base for chunk 0 = len(prefix_ids), giving us n_prefix.
+            # We keep prefix spans only from chunk 0, and dedup abstract spans by their
+            # position in the original (pre-chunked) abstract sequence.
             num_queries = len(texts)
-            per_query: dict[int, list[tuple[int, np.ndarray, bool]]] = defaultdict(list)
+            per_query_prefix: dict[int, list[tuple[int, np.ndarray]]] = defaultdict(list)
+            per_query_abstract: dict[int, list[tuple[int, np.ndarray, bool]]] = defaultdict(list)
+
             for doc_id, span_list in doc_id_to_spans.items():
                 parts = doc_id.split("_")
                 if len(parts) != 3 or parts[0] != "query":
                     continue
                 qidx = int(parts[1])
                 cidx = int(parts[2])
-                offset_base = chunk_meta.get((qidx, cidx), 0)
+                n_prefix = chunk_meta.get((qidx, 0), 0)
+                abstract_start = chunk_meta.get((qidx, cidx), 0) - n_prefix
                 for local_idx, span_emb in enumerate(span_list):
-                    global_index = offset_base + local_idx
-                    per_query[qidx].append((global_index, span_emb, cidx == 0))
-            # Dedup: keep first occurrence per (qidx, global_index); then sort by global_index
+                    if local_idx < n_prefix:
+                        if cidx == 0:
+                            per_query_prefix[qidx].append((local_idx, span_emb))
+                    else:
+                        abs_pos = abstract_start + (local_idx - n_prefix)
+                        per_query_abstract[qidx].append((abs_pos, span_emb, cidx == 0))
+
             all_query_spans = []
             all_query_weights: Optional[list[np.ndarray]] = None if chunk_weight_mode == "uniform" else []
             for qidx in range(num_queries):
+                prefix_spans = sorted(per_query_prefix.get(qidx, []), key=lambda x: x[0])
+                abs_entries = per_query_abstract.get(qidx, [])
+                abs_entries.sort(key=lambda x: (x[0], -x[2]))
                 seen: set[int] = set()
-                kept: list[tuple[int, np.ndarray, bool]] = []
-                for global_index, span_emb, from_first in sorted(per_query.get(qidx, []), key=lambda x: (x[0], -x[2])):  # same global: prefer first chunk (from_first True first)
-                    if global_index in seen:
+                deduped_abs: list[tuple[int, np.ndarray, bool]] = []
+                for abs_pos, span_emb, from_first in abs_entries:
+                    if abs_pos in seen:
                         continue
-                    seen.add(global_index)
-                    kept.append((global_index, span_emb, from_first))
-                kept.sort(key=lambda x: x[0])
-                if not kept:
+                    seen.add(abs_pos)
+                    deduped_abs.append((abs_pos, span_emb, from_first))
+                deduped_abs.sort(key=lambda x: x[0])
+
+                kept_embs = [e for _, e in prefix_spans] + [e for _, e, _ in deduped_abs]
+                if not kept_embs:
                     all_query_spans.append(np.zeros((0, d), dtype=np.float32))
                     if all_query_weights is not None:
                         all_query_weights.append(np.array([], dtype=np.float32))
                 else:
-                    spans_arr = np.stack([x[1] for x in kept], axis=0).astype(np.float32)
-                    all_query_spans.append(spans_arr)
+                    all_query_spans.append(np.stack(kept_embs, axis=0).astype(np.float32))
                     if chunk_weight_mode == "first" and all_query_weights is not None:
-                        w = np.ones(len(kept), dtype=np.float32)
-                        for i, (_, _, from_first) in enumerate(kept):
+                        w = np.ones(len(kept_embs), dtype=np.float32)
+                        for i in range(len(prefix_spans)):
+                            w[i] = first_chunk_weight
+                        for i, (_, _, from_first) in enumerate(deduped_abs):
                             if from_first:
-                                w[i] = first_chunk_weight
+                                w[len(prefix_spans) + i] = first_chunk_weight
                         all_query_weights.append(w)
             return all_query_spans, all_query_weights
         
@@ -2165,13 +2185,14 @@ def main():
             query_spans: list[np.ndarray],
             center_index: faiss.Index,
             V: int,
-            sim_threshold: float,
+            sim_thr_per_center: np.ndarray,
             idf: Optional[np.ndarray] = None,
             center_pca_dirs: Optional[np.ndarray] = None,
             query_span_weights: Optional[list[np.ndarray]] = None,
             stop_centers: Optional[set] = None,
         ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-            use_soft_assignment = args.use_soft_assignment if hasattr(args, "use_soft_assignment") else False
+            use_soft_assignment = (args.use_soft_assignment if hasattr(args, "use_soft_assignment") else True) \
+                and not getattr(args, "no_soft_assignment", False)
             weight_agg = getattr(args, "weight_aggregation", "max")
             query_first_span_weight = float(getattr(args, "query_first_span_weight", 1.0))
             _stop = stop_centers if stop_centers is not None else set()
@@ -2220,23 +2241,33 @@ def main():
                         return 1.0
                     return float(w[si])
 
-                if use_soft_assignment and sim_threshold is not None:
-                    max_centers_per_span = getattr(args, "soft_assignment_max_centers_per_span", None)
-                    lims, D, I = center_index.range_search(spans_norm, sim_threshold)
+                if use_soft_assignment:
+                    max_centers_per_span = int(getattr(args, "soft_assignment_max_centers_per_span", 10) or 0)
+                    K_search = min(max(max_centers_per_span * 4, 64), V)
+                    _min_thr = float(sim_thr_per_center.min())
+                    D_q, I_q = center_index.search(spans_norm, K_search)
                     center_weights = {}
                     center_projs: dict[int, float] = {}
                     center_max_sim: dict[int, float] = {} if weight_agg == "sum" else None
                     for span_idx in range(spans_norm.shape[0]):
-                        start, end = int(lims[span_idx]), int(lims[span_idx + 1])
-                        pairs = [(int(I[j]), float(D[j])) for j in range(start, end) if float(D[j]) > 0]
-                        if max_centers_per_span is not None and max_centers_per_span > 0 and len(pairs) > max_centers_per_span:
-                            pairs = sorted(pairs, key=lambda x: -x[1])[:max_centers_per_span]
                         extra = _span_extra(q_idx, span_idx)
-                        for center_id, sim in pairs:
-                            if center_id in _stop:
+                        kept = 0
+                        for k in range(K_search):
+                            c = int(I_q[span_idx, k])
+                            if c < 0:
+                                break
+                            sim = float(D_q[span_idx, k])
+                            if sim < _min_thr:
+                                break
+                            if c in _stop or sim <= 0:
                                 continue
-                            proj = float(spans_norm[span_idx] @ center_pca_dirs[center_id]) if center_pca_dirs is not None else 0.0
-                            _update_weight(center_weights, center_id, sim, span_idx, span_downweight=1.0, span_extra_weight=extra, center_projs=center_projs, center_max_sim=center_max_sim, proj=proj)
+                            if sim < sim_thr_per_center[c]:
+                                continue
+                            proj = float(spans_norm[span_idx] @ center_pca_dirs[c]) if center_pca_dirs is not None else 0.0
+                            _update_weight(center_weights, c, sim, span_idx, span_downweight=1.0, span_extra_weight=extra, center_projs=center_projs, center_max_sim=center_max_sim, proj=proj)
+                            kept += 1
+                            if max_centers_per_span > 0 and kept >= max_centers_per_span:
+                                break
                     if not center_weights:
                         similarities, assigned = center_index.search(spans_norm, k=1)
                         for span_idx in range(similarities.shape[0]):
@@ -2320,6 +2351,15 @@ def main():
                 center_pca_dirs = None
             
             r, sim_threshold = _get_r_and_sim_threshold(centers_info)
+            
+            # Per-center similarity thresholds (from k-center Voronoi radii)
+            _rpc = centers_info.get("r_per_center", None)
+            if _rpc is not None and len(_rpc) >= V:
+                sim_thr_per_center = 1.0 - np.array(_rpc[:V], dtype=np.float32)
+                print(f"   Per-center r_c loaded: sim thresholds in [{sim_thr_per_center.min():.4f}, {sim_thr_per_center.max():.4f}]")
+            else:
+                sim_thr_per_center = np.full(V, float(sim_threshold), dtype=np.float32)
+                print(f"   No per-center r_c found; using global sim_threshold={sim_threshold:.4f} for all centers")
             
             if model.config.hidden_size != d:
                 raise ValueError(f"Dimension mismatch: model hidden_size={model.config.hidden_size} but centers dimension={d}")
@@ -2413,12 +2453,19 @@ def main():
                 print(f"   Excluding {len(exclude_cls_span_indices):,} CLS spans")
             print(f"   Total: {len(span_to_doc):,} span-to-doc mappings, {total_loaded:,} embedding rows")
 
-            # Build doc_span_count for length normalization
+            # Build per-doc span count for length normalization (stable, pre-filtering)
+            doc_id_to_idx = {doc_id: idx for idx, doc_id in enumerate(documents_df.index)}
             doc_span_count: dict[str, int] = {}
             for span_idx, doc_id in span_to_doc.items():
                 if exclude_cls_spans and span_idx in exclude_cls_span_indices:
                     continue
                 doc_span_count[doc_id] = doc_span_count.get(doc_id, 0) + 1
+            N_docs = len(documents_df)
+            doc_nspans = np.ones(N_docs, dtype=np.float32)
+            for doc_id, cnt in doc_span_count.items():
+                didx = doc_id_to_idx.get(doc_id)
+                if didx is not None:
+                    doc_nspans[didx] = float(cnt)
             
             # ---- Build posting lists ----
             document_assignment = getattr(args, "document_assignment", "soft")
@@ -2457,78 +2504,53 @@ def main():
                     print(f"     {section_name}: {sec_emb.shape[0]:,} spans assigned")
                 print(f"   Total spans: {total_loaded:,}")
             else:
-                # Doc soft: sphere (range_search) per center
-                print(f"   Using radius r={r:.6f} for range search")
-                idx_size = 0
-                embeddings_index = faiss.IndexFlatIP(d)
+                # Doc soft: search(K) + per-center threshold filter + topK cap
+                max_centers_per_span = int(getattr(args, "soft_assignment_max_centers_per_span", 10) or 0)
+                K_search = min(max(max_centers_per_span * 4, 64), V)
+                min_sim_thr = float(sim_thr_per_center.min())
+                print(f"   Soft assignment: search(K={K_search}) + per-center r_c filter + topK={max_centers_per_span}")
+                posting_lists = [[] for _ in range(V)]
+                span_offset = 0
                 for section_name in doc_sections:
                     sec_emb = embeddings_by_section[section_name]
                     if sec_emb.shape[0] == 0:
+                        span_offset += 0
                         continue
                     if sec_emb.shape[1] != d:
                         raise ValueError(f"Embedding dimension mismatch for {section_name}: {sec_emb.shape[1]} != {d}")
                     sec_emb_n = sec_emb.astype(np.float32).copy()
                     faiss.normalize_L2(sec_emb_n)
-                    embeddings_index.add(sec_emb_n)
-                    idx_size += sec_emb_n.shape[0]
-                    print(f"     {section_name}: {sec_emb_n.shape[0]:,} (index size: {idx_size:,})")
+                    batch_size = max(1, int(getattr(args, "posting_list_batch_size", 4096)))
+                    for b_start in tqdm(range(0, sec_emb_n.shape[0], batch_size),
+                                        desc=f"  {section_name} spans->centers", leave=False):
+                        b_end = min(b_start + batch_size, sec_emb_n.shape[0])
+                        batch = sec_emb_n[b_start:b_end]
+                        D_batch, I_batch = center_index.search(batch, K_search)
+                        for j in range(batch.shape[0]):
+                            global_idx = span_offset + b_start + j
+                            if exclude_cls_spans and global_idx in exclude_cls_span_indices:
+                                continue
+                            kept = 0
+                            for k in range(K_search):
+                                c = int(I_batch[j, k])
+                                if c < 0:
+                                    break
+                                sim_val = float(D_batch[j, k])
+                                if sim_val < min_sim_thr:
+                                    break
+                                if c in stop_centers or sim_val <= 0:
+                                    continue
+                                if sim_val < sim_thr_per_center[c]:
+                                    continue
+                                proj = float(batch[j] @ center_pca_dirs[c]) if center_pca_dirs is not None else 0.0
+                                posting_lists[c].append((global_idx, sim_val, proj))
+                                kept += 1
+                                if max_centers_per_span > 0 and kept >= max_centers_per_span:
+                                    break
+                    span_offset += sec_emb_n.shape[0]
+                    print(f"     {section_name}: {sec_emb_n.shape[0]:,} spans assigned")
                     del sec_emb_n
-                print(f"   Total in index: {idx_size:,}")
-                r_per_center = centers_info.get("r_per_center", None)
-                if r_per_center is not None:
-                    if len(r_per_center) < V:
-                        r_per_center = None
-                    else:
-                        if len(r_per_center) > V:
-                            r_per_center = r_per_center[:V]
-                        print(f"   Using per-center radius (r_per_center from centers JSON)")
-                sim_thresh_default = 1.0 - r
-                batch_size = max(1, int(getattr(args, "posting_list_batch_size", 256)))
-                print(f"   Batch size for range_search: {batch_size}")
-                for batch_start in tqdm(range(0, V, batch_size), desc="Computing posting lists"):
-                    batch_end = min(batch_start + batch_size, V)
-                    centers_batch = centers_norm_for_pl[batch_start:batch_end].astype(np.float32)
-                    if r_per_center is not None:
-                        sim_thresh_batch = float(np.min([1.0 - r_per_center[i] for i in range(batch_start, batch_end)]))
-                    else:
-                        sim_thresh_batch = sim_thresh_default
-                    lims, D, I = embeddings_index.range_search(centers_batch, sim_thresh_batch)
-                    n_batch = centers_batch.shape[0]
-                    if lims is None or len(lims) != n_batch + 1:
-                        for _ in range(n_batch):
-                            posting_lists.append([])
-                        continue
-                    for i in range(n_batch):
-                        start, end = int(lims[i]), int(lims[i + 1])
-                        cidx = batch_start + i
-                        sim_thresh_c = (1.0 - float(r_per_center[cidx])) if r_per_center else sim_thresh_default
-                        entries = [(int(I[j]), float(D[j])) for j in range(start, end) if float(D[j]) >= sim_thresh_c]
-                        if exclude_cls_spans:
-                            entries = [(idx, s) for idx, s in entries if idx not in exclude_cls_span_indices]
-                        if cidx in stop_centers:
-                            entries = []
-                        posting_lists.append(entries)
-                
-                # PCA projections: second pass over in-memory embeddings
-                if center_pca_dirs is not None:
-                    span_to_centers: dict[int, list[tuple[int, float]]] = {}
-                    for c in range(V):
-                        for (span_idx, sim) in posting_lists[c]:
-                            span_to_centers.setdefault(span_idx, []).append((c, sim))
-                    posting_lists_new: list[list[tuple[int, float, float]]] = [[] for _ in range(V)]
-                    span_offset = 0
-                    for section_name in doc_sections:
-                        arr = embeddings_by_section[section_name].astype(np.float32).copy()
-                        faiss.normalize_L2(arr)
-                        for j in range(arr.shape[0]):
-                            global_idx = span_offset + j
-                            for (c, sim) in span_to_centers.get(global_idx, []):
-                                proj = float(arr[j] @ center_pca_dirs[c])
-                                posting_lists_new[c].append((global_idx, sim, proj))
-                        span_offset += arr.shape[0]
-                    posting_lists = posting_lists_new
-                else:
-                    posting_lists = [[(s, sim, 0.0) for s, sim in pl] for pl in posting_lists]
+                print(f"   Total spans: {total_loaded:,}")
             
             # Alignment sanity check
             if total_loaded != len(span_to_doc):
@@ -2537,55 +2559,61 @@ def main():
                     "Posting lists require exact 1:1 alignment."
                 )
             
-            # Span-level posting list length (before doc aggregation)
+            # Span-level posting list stats (index build cost / memory)
             span_pl_lens = np.array([len(pl) for pl in posting_lists], dtype=np.float64)
             span_non_empty = span_pl_lens[span_pl_lens > 0]
             if len(span_non_empty) > 0:
-                print(f"\n📊 Posting list (span-level) length: total entries={int(span_pl_lens.sum()):,}, "
-                      f"mean per non-empty center={float(span_non_empty.mean()):.1f}, max={int(span_pl_lens.max()):,}")
+                print(f"\n📊 Span-level posting lists (build cost/memory): "
+                      f"total entries={int(span_pl_lens.sum()):,}, "
+                      f"mean/non-empty center={float(span_non_empty.mean()):.1f}, "
+                      f"max={int(span_pl_lens.max()):,}")
             
-            # Build document-level inverted index (doc_id, weight, proj)
+            # Build document-level inverted index (doc_idx, weight, proj)
             print(f"\n🔨 Building document-level inverted index from posting lists...")
-            doc_postings: list[list[tuple[str, float, float]]] = [[] for _ in range(V)]
-            doc_id_to_idx = {doc_id: idx for idx, doc_id in enumerate(documents_df.index)}
-            doc_centers_hit: dict[str, int] = {}
+            doc_postings: list[list[tuple[int, float, float]]] = [[] for _ in range(V)]
             
             weight_agg = getattr(args, "weight_aggregation", "max")
             for center_idx in tqdm(range(V), desc="Building inverted index"):
                 span_sims = posting_lists[center_idx]
                 if not span_sims:
                     continue
-                doc_weights: dict[str, tuple[float, float, float]] = {}  # (weight, max_sim_seen, proj_of_max)
+                agg: dict[int, tuple[float, float, float]] = {}  # doc_idx -> (weight, max_sim_seen, proj_of_max)
                 for entry in span_sims:
                     if len(entry) == 3:
                         span_idx, similarity, proj = entry
                     else:
                         span_idx, similarity, proj = entry[0], entry[1], 0.0
                     doc_id = span_to_doc.get(span_idx, None)
-                    if doc_id is None or doc_id not in doc_id_to_idx:
+                    if doc_id is None:
+                        continue
+                    didx = doc_id_to_idx.get(doc_id)
+                    if didx is None:
                         continue
                     sim = float(similarity)
                     p = float(proj)
                     if weight_agg == "sum":
-                        if doc_id in doc_weights:
-                            ow, max_s, op = doc_weights[doc_id]
+                        if didx in agg:
+                            ow, max_s, op = agg[didx]
                             new_w = ow + max(0.0, sim)
-                            doc_weights[doc_id] = (new_w, max(max_s, sim), op if max_s >= sim else p)
+                            agg[didx] = (new_w, max(max_s, sim), op if max_s >= sim else p)
                         else:
-                            doc_weights[doc_id] = (max(0.0, sim), sim, p)
+                            agg[didx] = (max(0.0, sim), sim, p)
                     else:
-                        if doc_id not in doc_weights or max(0.0, sim) > doc_weights[doc_id][0]:
-                            doc_weights[doc_id] = (max(0.0, sim), sim, p)
-                for doc_id, wproj in doc_weights.items():
-                    weight = wproj[0]
-                    proj = wproj[2]
-                    doc_postings[center_idx].append((doc_id, float(weight), float(proj)))
-                    doc_centers_hit[doc_id] = doc_centers_hit.get(doc_id, 0) + 1
+                        if didx not in agg or max(0.0, sim) > agg[didx][0]:
+                            agg[didx] = (max(0.0, sim), sim, p)
+                for didx, wproj in agg.items():
+                    doc_postings[center_idx].append((didx, float(wproj[0]), float(wproj[2])))
             
-            # For efficiency report: total postings and non-empty count (FLOPs computed after query_sparse)
+            # Doc-level posting list stats (retrieval cost / FLOPs)
             pl_lens = np.array([len(pl) for pl in doc_postings], dtype=np.float64)
+            doc_non_empty = pl_lens[pl_lens > 0]
             n_empty = int(np.sum(pl_lens == 0))
             total_entries = int(np.sum(pl_lens))
+            if len(doc_non_empty) > 0:
+                print(f"📊 Doc-level posting lists (retrieval cost/FLOPs): "
+                      f"total entries={total_entries:,}, "
+                      f"mean/non-empty center={float(doc_non_empty.mean()):.1f}, "
+                      f"max={int(pl_lens.max()):,}")
 
             N_docs = len(documents_df)
             df = np.array([len(set(e[0] for e in pl)) if pl else 0 for pl in doc_postings], dtype=np.float32)
@@ -2618,21 +2646,40 @@ def main():
                     print(f"   Query full_chunks requested but tokenization_unit != encoder_token; using single-chunk (truncated) encoding.")
                 query_spans = _encode_query_spans(query_texts, section=query_section, d=d)
                 query_span_weights = None
-            query_sparse = _assign_query_spans_to_centers(query_spans, center_index=center_index, V=V, sim_threshold=sim_threshold, idf=idf, center_pca_dirs=center_pca_dirs, query_span_weights=query_span_weights, stop_centers=stop_centers)
-            # FLOPs = 2 * sum over queries of (sum of |L_t| for t in query terms)
-            total_flops = sum(2 * sum(len(doc_postings[t]) for t in qpack[0]) for qpack in query_sparse)
+            query_sparse = _assign_query_spans_to_centers(query_spans, center_index=center_index, V=V, sim_thr_per_center=sim_thr_per_center, idf=idf, center_pca_dirs=center_pca_dirs, query_span_weights=query_span_weights, stop_centers=stop_centers)
+            # Per-query retrieval cost diagnostics
+            postings_per_query = np.array(
+                [sum(len(doc_postings[t]) for t in qpack[0]) for qpack in query_sparse],
+                dtype=np.float64,
+            )
+            centers_per_query = np.array(
+                [len(qpack[0]) for qpack in query_sparse], dtype=np.float64,
+            )
+            total_flops = int(2 * postings_per_query.sum())
             n_queries_flops = len(query_sparse)
             _report_flops_and_postings_one_line(
                 int(total_entries), V - n_empty, V, mode,
                 total_flops=total_flops, n_queries=n_queries_flops, model_label="sparse_coverage"
             )
+            if n_queries_flops > 0:
+                pq = postings_per_query
+                cq = centers_per_query
+                print(f"   Postings scanned per query  — "
+                      f"mean={pq.mean():.0f}, p50={np.percentile(pq,50):.0f}, "
+                      f"p90={np.percentile(pq,90):.0f}, p99={np.percentile(pq,99):.0f}, "
+                      f"max={pq.max():.0f}")
+                print(f"   Active centers per query    — "
+                      f"mean={cq.mean():.1f}, p50={np.percentile(cq,50):.0f}, "
+                      f"p90={np.percentile(cq,90):.0f}, p99={np.percentile(cq,99):.0f}, "
+                      f"max={cq.max():.0f}")
 
             # Length normalization setup
             length_norm = getattr(args, "length_norm", "none")
-            length_norm_exp = getattr(args, "length_norm_exponent", 0.5)
-            avg_span_count = 1.0
             if length_norm == "sqrt_centers":
-                print(f"   Length norm: sqrt_centers (exponent={length_norm_exp})")
+                length_norm = "sqrt_spans"
+            length_norm_exp = getattr(args, "length_norm_exponent", 0.5)
+            if length_norm == "sqrt_spans":
+                print(f"   Length norm: sqrt_spans (exponent={length_norm_exp})")
             q_opts = []
             if getattr(args, "query_full_chunks", False):
                 q_opts.append(f"full_chunks stride={getattr(args, 'query_chunk_stride_ratio', 1.0)} weight={getattr(args, 'query_chunk_weight', 'uniform')}")
@@ -2661,10 +2708,7 @@ def main():
                     q_sim = float(weights[i])
                     q_proj = float(projs[i]) if i < len(projs) else 0.0
                     idf_t = float(idf[term]) ** idf_exponent
-                    for doc_id, d_weight, d_proj in doc_postings[term]:
-                        doc_idx = doc_id_to_idx.get(doc_id, None)
-                        if doc_idx is None:
-                            continue
+                    for doc_idx, d_weight, d_proj in doc_postings[term]:
                         d_sim = float(d_weight)
                         sim_approx = q_sim * d_sim
                         if pca_proj_alpha != 0.0:
@@ -2679,14 +2723,9 @@ def main():
                             contrib += residual_alpha * (q_res_proj * d_res_proj) * idf_t
                         doc_scores[doc_idx] = doc_scores.get(doc_idx, 0.0) + contrib
                 # Apply document length normalization
-                if length_norm != "none" and doc_scores:
+                if length_norm == "sqrt_spans" and doc_scores:
                     for doc_idx in list(doc_scores.keys()):
-                        doc_id = documents_df.index[doc_idx]
-                        if length_norm == "sqrt_centers":
-                            nch = doc_centers_hit.get(doc_id, 1)
-                            norm_factor = max(float(nch) ** length_norm_exp, 1e-6)
-                        else:
-                            norm_factor = 1.0
+                        norm_factor = max(doc_nspans[doc_idx] ** length_norm_exp, 1e-6)
                         doc_scores[doc_idx] /= norm_factor
                 if doc_scores:
                     sorted_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
