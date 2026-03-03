@@ -633,6 +633,9 @@ def _run_clefip_sparse_coverage(args, query_ids, query_texts, passage_ids, passa
             centers_info = json.load(f)
     r = float(centers_info.get("r", 0.1))
     sim_threshold = 1.0 - r
+    stop_centers = set(centers_info.get("stop_centers", []))
+    if stop_centers:
+        print(f"CLEF-IP sparse_coverage: {len(stop_centers)} stop-centers disabled (df >= threshold)")
 
     centers_norm = centers.copy()
     faiss.normalize_L2(centers_norm)
@@ -701,6 +704,8 @@ def _run_clefip_sparse_coverage(args, query_ids, query_texts, passage_ids, passa
             start, end = int(lims[span_i]), int(lims[span_i + 1])
             for j in range(start, end):
                 c = int(I[j])
+                if c in stop_centers:
+                    continue
                 sim = float(D[j])
                 if sim <= 0:
                     continue
@@ -758,6 +763,8 @@ def _run_clefip_sparse_coverage(args, query_ids, query_texts, passage_ids, passa
             start, end = int(lims[si]), int(lims[si + 1])
             for j in range(start, end):
                 c = int(I[j])
+                if c in stop_centers:
+                    continue
                 sim = float(D[j])
                 if sim > q_center_weights.get(c, 0.0):
                     q_center_weights[c] = sim
@@ -2162,10 +2169,12 @@ def main():
             idf: Optional[np.ndarray] = None,
             center_pca_dirs: Optional[np.ndarray] = None,
             query_span_weights: Optional[list[np.ndarray]] = None,
+            stop_centers: Optional[set] = None,
         ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
             use_soft_assignment = args.use_soft_assignment if hasattr(args, "use_soft_assignment") else False
             weight_agg = getattr(args, "weight_aggregation", "max")
             query_first_span_weight = float(getattr(args, "query_first_span_weight", 1.0))
+            _stop = stop_centers if stop_centers is not None else set()
 
             def _to_weight(sim: float, span_idx: int, span_downweight: float = 1.0, span_extra_weight: float = 1.0) -> float:
                 w = sim
@@ -2224,12 +2233,16 @@ def main():
                             pairs = sorted(pairs, key=lambda x: -x[1])[:max_centers_per_span]
                         extra = _span_extra(q_idx, span_idx)
                         for center_id, sim in pairs:
+                            if center_id in _stop:
+                                continue
                             proj = float(spans_norm[span_idx] @ center_pca_dirs[center_id]) if center_pca_dirs is not None else 0.0
                             _update_weight(center_weights, center_id, sim, span_idx, span_downweight=1.0, span_extra_weight=extra, center_projs=center_projs, center_max_sim=center_max_sim, proj=proj)
                     if not center_weights:
                         similarities, assigned = center_index.search(spans_norm, k=1)
                         for span_idx in range(similarities.shape[0]):
                             center_id = int(assigned[span_idx, 0])
+                            if center_id in _stop:
+                                continue
                             sim = float(similarities[span_idx, 0])
                             proj = float(spans_norm[span_idx] @ center_pca_dirs[center_id]) if center_pca_dirs is not None else 0.0
                             extra = _span_extra(q_idx, span_idx)
@@ -2249,6 +2262,8 @@ def main():
                     center_max_sim = {} if weight_agg == "sum" else None
                     for span_idx in range(similarities.shape[0]):
                         center_id = int(assigned[span_idx, 0])
+                        if center_id in _stop:
+                            continue
                         sim = float(similarities[span_idx, 0])
                         proj = float(spans_norm[span_idx] @ center_pca_dirs[center_id]) if center_pca_dirs is not None else 0.0
                         extra = _span_extra(q_idx, span_idx)
@@ -2275,6 +2290,9 @@ def main():
             
             centers_info = _load_centers_info_json(centers_path)
             V = int(centers.shape[0])
+            stop_centers = set(centers_info.get("stop_centers", []))
+            if stop_centers:
+                print(f"   stop_centers: {len(stop_centers)} disabled for activation (df >= threshold)")
             print(f"   Final vocabulary size: {V:,} centers")
             
             pca_proj_alpha = float(getattr(args, "pca_proj_alpha", 0.0))
@@ -2429,6 +2447,8 @@ def main():
                         if exclude_cls_spans and global_idx in exclude_cls_span_indices:
                             continue
                         c = int(assigned[j, 0])
+                        if c in stop_centers:
+                            continue
                         sim = float(sims[j, 0])
                         if sim > 0:
                             proj = float(sec_emb[j] @ center_pca_dirs[c]) if center_pca_dirs is not None else 0.0
@@ -2485,6 +2505,8 @@ def main():
                         entries = [(int(I[j]), float(D[j])) for j in range(start, end) if float(D[j]) >= sim_thresh_c]
                         if exclude_cls_spans:
                             entries = [(idx, s) for idx, s in entries if idx not in exclude_cls_span_indices]
+                        if cidx in stop_centers:
+                            entries = []
                         posting_lists.append(entries)
                 
                 # PCA projections: second pass over in-memory embeddings
@@ -2596,7 +2618,7 @@ def main():
                     print(f"   Query full_chunks requested but tokenization_unit != encoder_token; using single-chunk (truncated) encoding.")
                 query_spans = _encode_query_spans(query_texts, section=query_section, d=d)
                 query_span_weights = None
-            query_sparse = _assign_query_spans_to_centers(query_spans, center_index=center_index, V=V, sim_threshold=sim_threshold, idf=idf, center_pca_dirs=center_pca_dirs, query_span_weights=query_span_weights)
+            query_sparse = _assign_query_spans_to_centers(query_spans, center_index=center_index, V=V, sim_threshold=sim_threshold, idf=idf, center_pca_dirs=center_pca_dirs, query_span_weights=query_span_weights, stop_centers=stop_centers)
             # FLOPs = 2 * sum over queries of (sum of |L_t| for t in query terms)
             total_flops = sum(2 * sum(len(doc_postings[t]) for t in qpack[0]) for qpack in query_sparse)
             n_queries_flops = len(query_sparse)

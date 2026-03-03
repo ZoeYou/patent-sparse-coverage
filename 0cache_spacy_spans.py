@@ -31,6 +31,7 @@ from typing import Literal
 import os
 import argparse
 import time
+import json
 import spacy
 from tqdm import tqdm
 
@@ -62,11 +63,15 @@ def main():
     ap.add_argument("--epo_sample_seed", type=int, default=42)
     ap.add_argument("--spacy_model", type=str, default="sci_lg",
                     choices=["sm", "md", "lg", "sci_sm", "sci_md", "sci_lg"])
-    ap.add_argument("--spacy_batch_size", type=int, default=256,
-                    help="Batch size for nlp.pipe(). Default: 256.")
+    ap.add_argument("--spacy_batch_size", type=int, default=512,
+                    help="Batch size for nlp.pipe(). Larger is faster if memory allows. Default: 512.")
+    ap.add_argument("--spacy_n_process", type=int, default=1,
+                    help="Number of processes for nlp.pipe() (multi-CPU). Default: 1. Try 4 or 8 on a many-core node.")
     ap.add_argument("--units", type=str, nargs="+", default=list[Literal['spacy_token', 'spacy_sentence', 'noun_chunk']](UNITS),
                     choices=list[Literal['spacy_token', 'spacy_sentence', 'noun_chunk']](UNITS),
                     help="Which unit types to cache. Default: all three.")
+    ap.add_argument("--save_corpus_to", type=str, default=None,
+                    help="When loading from EPO, save the loaded corpus to DIR/content/documents.json so future runs can use DATA_DIR=DIR for fast load. Ignored when using cached corpus.")
     args = ap.parse_args()
 
     # Load spaCy
@@ -83,6 +88,7 @@ def main():
 
     # Load corpus
     print("\nLoading corpus...")
+    t_load_start = time.time()
     documents_path = os.path.join(args.data_dir, "content/documents.json")
     if os.path.isfile(documents_path):
         documents = load_corpus(documents_path)
@@ -98,6 +104,26 @@ def main():
         if not documents:
             raise FileNotFoundError(f"No corpus found at {args.data_dir}")
         print(f"Loaded {len(documents):,} documents from EPO dir {args.data_dir}")
+        # Optional: save corpus for future fast load
+        if args.save_corpus_to:
+            out_dir = os.path.join(args.save_corpus_to, "content")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, "documents.json")
+            with open(out_path, "w") as f:
+                for doc_id, doc in documents.items():
+                    line = json.dumps({
+                        "dnum": doc_id,
+                        "Content": {
+                            "title": doc.get("title", ""),
+                            "pa01": doc.get("abstract", ""),
+                            "c-en-001": doc.get("claim", ""),
+                            "p001": doc.get("invention", ""),
+                        },
+                    }, ensure_ascii=False) + "\n"
+                    f.write(line)
+            print(f"Saved corpus to {out_path} for future fast load (use --data_dir {args.save_corpus_to})")
+    t_load_elapsed = time.time() - t_load_start
+    print(f"  Load time: {t_load_elapsed:.1f}s")
 
     if args.max_docs and len(documents) > args.max_docs:
         doc_items = list(documents.items())[:args.max_docs]
@@ -106,6 +132,7 @@ def main():
 
     # Build list of (doc_id, section, sub_part, normalized_truncated_text)
     print("\nPreparing texts for spaCy...")
+    t_prep_start = time.time()
     text_items = []
     max_c = args.max_visible_chars
     for doc_id, doc in documents.items():
@@ -125,43 +152,50 @@ def main():
             text_items.append((doc_id, "invention", "body", invention[:max_c]))
 
     print(f"Total text items: {len(text_items):,}")
+    t_prep_elapsed = time.time() - t_prep_start
+    print(f"  Prepare time: {t_prep_elapsed:.1f}s")
 
     # Run spaCy on all texts (once)
-    print(f"\nRunning spaCy (batch_size={args.spacy_batch_size})...")
+    n_process = max(1, int(getattr(args, "spacy_n_process", 1)))
+    print(f"\nRunning spaCy (batch_size={args.spacy_batch_size}, n_process={n_process})...")
     texts_only = [item[3] for item in text_items]
     t0 = time.time()
-    spacy_docs = list(nlp.pipe(texts_only, batch_size=args.spacy_batch_size))
+    pipe_kw = {"batch_size": args.spacy_batch_size}
+    if n_process > 1:
+        pipe_kw["n_process"] = n_process
+    spacy_docs = list(nlp.pipe(texts_only, **pipe_kw))
     t_spacy = time.time() - t0
     print(f"✓ spaCy done in {t_spacy:.1f}s ({len(texts_only) / max(t_spacy, 0.01):.0f} texts/s)")
     del texts_only
 
-    # Extract spans per unit
-    for unit in args.units:
-        print(f"\n{'='*60}")
-        print(f"Extracting spans for unit: {unit}")
-        t0 = time.time()
-        cache_entries = []
-        total_spans = 0
-        for idx, (doc_id, section, sub_part, text) in enumerate(tqdm(text_items, desc=f"  {unit}")):
-            doc_spacy = spacy_docs[idx]
-            is_title = (sub_part == "title")
-            is_body = (sub_part == "body" and section == "abstract")
+    # Extract spans for all units in a single pass (one loop over 1M items instead of three)
+    print(f"\n{'='*60}")
+    print("Extracting spans for all units (single pass)...")
+    t0 = time.time()
+    entries_by_unit = {u: [] for u in args.units}
+    for idx, (doc_id, section, sub_part, text) in enumerate(tqdm(text_items, desc="  extract")):
+        doc_spacy = spacy_docs[idx]
+        is_title = (sub_part == "title")
+        is_body = (sub_part == "body" and section == "abstract")
+        for unit in args.units:
             char_spans = extract_char_spans_from_spacy(
                 doc_spacy, section, unit,
                 is_abstract_title=is_title,
                 is_abstract_body=is_body,
             )
-            cache_entries.append({
+            entries_by_unit[unit].append({
                 "d": doc_id,
                 "s": section,
                 "p": sub_part,
                 "sp": char_spans,
             })
-            total_spans += len(char_spans)
-        t_extract = time.time() - t0
-        print(f"  Total spans: {total_spans:,} ({t_extract:.1f}s)")
-        save_span_cache(args.cache_dir, unit, cache_entries)
-        del cache_entries
+    t_extract = time.time() - t0
+    print(f"  Extract time: {t_extract:.1f}s")
+    for unit in args.units:
+        total_spans = sum(len(e["sp"]) for e in entries_by_unit[unit])
+        print(f"  {unit}: {total_spans:,} spans")
+        save_span_cache(args.cache_dir, unit, entries_by_unit[unit])
+        del entries_by_unit[unit]
 
     print(f"\n{'='*60}")
     print(f"✓ Span cache saved to: {os.path.abspath(args.cache_dir)}")
