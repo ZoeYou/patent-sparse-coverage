@@ -30,7 +30,11 @@ Section sampling (--section_sampling):
   - proportional + ref_size: stratified by section size (n_j/N); keeps center distribution
     aligned with corpus.
   - To use only retrieval-candidate side (e.g. avoid query vs doc imbalance), pass
-    only the candidate-side embedding files in --embeddings_dir / mode.
+    only the candidate-side embedding files in --embeddings_dir.
+
+Centers are task-agnostic: all available sections (abstract, claim, invention)
+are loaded and used for center construction. The same vocabulary is shared
+across abstract2abstract and claim2all evaluation tasks.
 
 Usage with evaluate.py: --centers_suffix "_kcenter_V{V}"
 """
@@ -71,16 +75,22 @@ def _load_span_doc_ids(embedding_files, N):
         meta_path = os.path.splitext(fp)[0] + "_metadata.jsonl"
         if not os.path.isfile(meta_path):
             return None
-        with open(meta_path, "r") as f:
-            for line in f:
+        try:
+            # Batch read entire file at once
+            with open(meta_path, "r") as f:
+                content = f.read()
+            lines = content.split("\n")
+            del content  # free memory early
+            file_ids = []
+            for line in lines:
                 line = line.strip()
                 if not line:
                     continue
-                try:
-                    obj = json.loads(line)
-                    doc_ids.append(obj.get("d", obj.get("doc_id", "")))
-                except Exception:
-                    return None
+                obj = json.loads(line)
+                file_ids.append(obj.get("d", obj.get("doc_id", "")))
+            doc_ids.extend(file_ids)
+        except Exception:
+            return None
     if len(doc_ids) != N:
         return None
     return doc_ids
@@ -149,17 +159,12 @@ def _compute_df_diagnostic(assignments, assign_dists, span_doc_ids, r_per_center
 
     # Top-k by df: only need per-center argmin(assign_dists) for the top-k centers
     top_indices = np.argsort(-df_per_center)[:top_k]
-    # Pre-compute per-span argmin via argsort(assign_dists) grouped by assignment
+    # Vectorized: sort by distance, then np.unique on assignments finds first (=closest) per center
     order = np.argsort(assign_dists)
+    sorted_assignments = assignments[order]
+    unique_centers, first_idx = np.unique(sorted_assignments, return_index=True)
     rep_span_for_center = np.full(V_actual, -1, dtype=np.int64)
-    seen = np.zeros(V_actual, dtype=np.bool_)
-    for i in order:
-        c = int(assignments[i])
-        if not seen[c]:
-            rep_span_for_center[c] = i
-            seen[c] = True
-        if seen.all():
-            break
+    rep_span_for_center[unique_centers] = order[first_idx]
 
     top_df_centers = []
     for c in top_indices:
@@ -177,23 +182,175 @@ def _compute_df_diagnostic(assignments, assign_dists, span_doc_ids, r_per_center
     return df_per_center, quantiles, top_df_centers
 
 
+def _compute_df_diagnostic_activation(
+    store, center_index, N, d, use_gpu,
+    span_doc_ids, r_per_center, V_actual,
+    max_centers_per_span=10, top_k_report=10,
+):
+    """
+    Activation-based DF diagnostic: matches evaluate.py's soft assignment.
+
+    For each span, search(K) nearest centers, filter by per-center r_c,
+    cap at max_centers_per_span.  df_c = |{doc : exists span in doc activating c}|.
+    This reflects the actual posting-list lengths in retrieval and is typically
+    much larger than the Voronoi df (nearest-1 only).
+
+    Returns (df_per_center, quantiles, top_report_centers, activation_stats).
+    """
+    import time as _time
+    t0 = _time.time()
+
+    # Map doc_ids to ints
+    doc_to_int: dict[str, int] = {}
+    doc_ints = np.empty(N, dtype=np.int32)
+    for i, did in enumerate(span_doc_ids):
+        if did not in doc_to_int:
+            doc_to_int[did] = len(doc_to_int)
+        doc_ints[i] = doc_to_int[did]
+
+    # Precompute per-center similarity threshold: sim >= 1 - r_c[c]
+    sim_thr_per_center = (1.0 - r_per_center).astype(np.float32)
+    min_sim_thr = float(sim_thr_per_center.min())
+
+    # K_search: match evaluate.py logic — search more than max_centers_per_span
+    # to allow filtering by r_c before capping
+    K_search = min(max(max_centers_per_span * 4, 64), V_actual)
+
+    assign_batch = _adaptive_batch_size(d, use_gpu)
+
+    # Collect (center_id, doc_int) pairs in streaming batches
+    all_centers_list = []
+    all_docs_list = []
+    total_activations = 0
+
+    for start in range(0, N, assign_batch):
+        end = min(start + assign_batch, N)
+        batch = store.get_chunk(start, end)
+        l2_normalize_inplace(batch)
+        sims, idxs = center_index.search(batch, K_search)  # (batch_size, K_search)
+
+        batch_size = end - start
+        batch_doc = doc_ints[start:end]  # (batch_size,)
+
+        # Vectorized filtering: flatten (batch, K) -> (batch*K,)
+        center_ids_flat = idxs.ravel().astype(np.int64)   # (batch*K,)
+        sims_flat = sims.ravel()                           # (batch*K,)
+        docs_flat = np.repeat(batch_doc, K_search)         # (batch*K,)
+        span_indices = np.repeat(np.arange(batch_size), K_search)  # for topK cap
+
+        # Filter 1: valid center id and positive similarity
+        valid = (center_ids_flat >= 0) & (sims_flat > 0)
+        # Filter 2: global min threshold (early exit equivalent)
+        valid &= sims_flat >= min_sim_thr
+        # Filter 3: per-center r_c threshold
+        valid &= sims_flat >= sim_thr_per_center[center_ids_flat]
+
+        # Apply validity filter
+        v_centers = center_ids_flat[valid]
+        v_sims = sims_flat[valid]
+        v_docs = docs_flat[valid]
+        v_spans = span_indices[valid]
+
+        # Filter 4: top-K cap per span (keep at most max_centers_per_span per span)
+        # FAISS returns results sorted by descending sim per span; after boolean
+        # masking the relative order within each span is preserved.
+        # Fully vectorized group-wise cumcount via sort + maximum.accumulate.
+        if max_centers_per_span > 0 and len(v_centers) > 0:
+            order = np.argsort(v_spans, kind='stable')
+            sorted_spans = v_spans[order]
+            positions = np.arange(len(sorted_spans), dtype=np.int64)
+            # Detect group boundaries (new span id)
+            changes = np.empty(len(sorted_spans), dtype=np.bool_)
+            changes[0] = True
+            np.not_equal(sorted_spans[1:], sorted_spans[:-1], out=changes[1:])
+            # Propagate each group's start position forward
+            group_start = np.maximum.accumulate(np.where(changes, positions, 0))
+            cumcount_sorted = positions - group_start   # 0, 1, 2, ... within each group
+            # Unsort back to original order
+            cumcount = np.empty_like(cumcount_sorted)
+            cumcount[order] = cumcount_sorted
+            keep_mask = cumcount < max_centers_per_span
+            v_centers = v_centers[keep_mask]
+            v_docs = v_docs[keep_mask]
+
+        all_centers_list.append(v_centers)
+        all_docs_list.append(v_docs)
+        total_activations += len(v_centers)
+
+    # Concatenate all batches
+    all_centers = np.concatenate(all_centers_list) if all_centers_list else np.array([], dtype=np.int64)
+    all_docs = np.concatenate(all_docs_list) if all_docs_list else np.array([], dtype=np.int32)
+
+    # Unique (center, doc) pairs -> df per center
+    if len(all_centers) > 0:
+        pairs = np.stack([all_centers, all_docs.astype(np.int64)], axis=1)
+        unique_pairs = np.unique(pairs, axis=0)
+        df_per_center = np.bincount(unique_pairs[:, 0].astype(np.int64), minlength=V_actual).astype(np.int64)
+    else:
+        df_per_center = np.zeros(V_actual, dtype=np.int64)
+
+    q = np.percentile(df_per_center, [50, 90, 99])
+    quantiles = {"p50": int(q[0]), "p90": int(q[1]), "p99": int(q[2]), "max": int(np.max(df_per_center))}
+
+    # Top centers by activation df
+    top_indices = np.argsort(-df_per_center)[:top_k_report]
+    top_df_centers = []
+    for c in top_indices:
+        top_df_centers.append({
+            "center_id": int(c),
+            "df": int(df_per_center[c]),
+            "r_c": float(r_per_center[c]),
+        })
+
+    mean_activations_per_span = total_activations / N if N > 0 else 0.0
+    activation_stats = {
+        "total_activations": int(total_activations),
+        "mean_activations_per_span": float(mean_activations_per_span),
+        "K_search": int(K_search),
+        "max_centers_per_span": int(max_centers_per_span),
+    }
+
+    elapsed = _time.time() - t0
+    print(f"[kcenter] Activation DF diagnostic done in {elapsed:.1f}s "
+          f"({total_activations:,} activations, {mean_activations_per_span:.1f} per span)")
+
+    return df_per_center, quantiles, top_df_centers, activation_stats
+
+
 def _compute_r_c_and_coverage(assignments, assign_dists, V_actual, r_c_percentile, hist_bins):
     """
     Single entry point for r_c and coverage: max (percentile>=100) or histogram percentile.
+
+    Small-cell fallback: for percentile p, a cell needs at least
+    ceil(100 / (100-p)) points for the p-th percentile to trim ≥ 1 outlier.
+    Below that, percentile ≈ max anyway and histogram interpolation just adds
+    bin-quantisation noise.  We replace those with exact max (conservative:
+    wider r_c → no lost recall, zero extra cost).
+
+      p=99 → threshold 100    p=95 → 20    p=90 → 10
+
     Returns (r_per_center, points_per_center, coverage).
     """
     N = len(assignments)
     r_per_center = np.zeros(V_actual, dtype=np.float64)
     points_per_center = np.bincount(assignments, minlength=V_actual).astype(np.int64)
     if r_c_percentile >= 100.0:
-        for c in range(V_actual):
-            mask = assignments == c
-            if np.any(mask):
-                r_per_center[c] = float(np.max(assign_dists[mask]))
+        np.maximum.at(r_per_center, assignments, assign_dists.astype(np.float64))
         return r_per_center, points_per_center, 1.0
     r_per_center, points_per_center, n_covered = _r_c_from_histogram(
         assignments, assign_dists, V_actual, r_c_percentile, hist_bins
     )
+    # Small-cell fallback: threshold derived from percentile.
+    # n_c * (1 - p/100) >= 1  ⟺  n_c >= ceil(100 / (100-p))
+    small_cell_thr = int(math.ceil(100.0 / (100.0 - r_c_percentile)))
+    small_mask = (points_per_center > 0) & (points_per_center < small_cell_thr)
+    if np.any(small_mask):
+        r_max = np.zeros(V_actual, dtype=np.float64)
+        np.maximum.at(r_max, assignments, assign_dists.astype(np.float64))
+        r_per_center = np.where(small_mask, r_max, r_per_center)
+        n_small = int(small_mask.sum())
+        print(f"[kcenter] Small-cell fallback (p={r_c_percentile}, n<{small_cell_thr}): "
+              f"{n_small}/{V_actual} centers -> r_c = max")
     coverage = n_covered / N if N > 0 else 0.0
     return r_per_center, points_per_center, coverage
 
@@ -211,26 +368,34 @@ def _r_c_from_histogram(assignments, assign_dists, V_actual, percentile, B):
     np.add.at(hist, (assignments, bin_idx), 1)
     points_per_center = np.bincount(assignments, minlength=V_actual).astype(np.int64)
 
-    r_per_center = np.zeros(V_actual, dtype=np.float64)
-    n_covered = 0
-    for c in range(V_actual):
-        total = hist[c].sum()
-        if total == 0:
-            r_per_center[c] = 0.0
-            continue
-        target_count = total * percentile / 100.0
-        cum = np.cumsum(hist[c])
-        bin_idx = np.searchsorted(cum, target_count, side="left")
-        if bin_idx >= B:
-            bin_idx = B - 1
-        left_edge = (bin_idx / B) * 2.0
-        right_edge = ((bin_idx + 1) / B) * 2.0
-        c_lo = cum[bin_idx - 1] if bin_idx > 0 else 0
-        c_hi = cum[bin_idx]
-        frac = (target_count - c_lo) / (c_hi - c_lo) if c_hi > c_lo else 0.0
-        r_per_center[c] = left_edge + frac * (right_edge - left_edge)
-        bin_r = min(int(r_per_center[c] * B / 2.0), B - 1)
-        n_covered += hist[c, : bin_r + 1].sum()
+    # Fully vectorized percentile computation over all centers
+    cumhist = np.cumsum(hist, axis=1)                           # (V, B)
+    totals = cumhist[:, -1].astype(np.float64)                  # (V,)
+    target_counts = totals * (percentile / 100.0)               # (V,)
+
+    # For each center, find the bin where cumhist crosses target_count
+    # (cumhist < target_counts[:, None]) is True for bins before the target
+    below = cumhist < target_counts[:, None]                    # (V, B) bool
+    bin_indices = below.sum(axis=1).astype(np.int64)            # (V,)
+    np.clip(bin_indices, 0, B - 1, out=bin_indices)
+
+    # Vectorized linear interpolation within the target bin
+    left_edges = (bin_indices / B) * 2.0
+    right_edges = ((bin_indices + 1) / B) * 2.0
+    c_hi = cumhist[np.arange(V_actual), bin_indices].astype(np.float64)
+    c_lo = np.where(bin_indices > 0,
+                    cumhist[np.arange(V_actual), bin_indices - 1].astype(np.float64),
+                    0.0)
+    denom = c_hi - c_lo
+    frac = np.where(denom > 0, (target_counts - c_lo) / denom, 0.0)
+    r_per_center = left_edges + frac * (right_edges - left_edges)
+    r_per_center = np.where(totals > 0, r_per_center, 0.0)
+
+    # Vectorized coverage: count points within each center's r_c bin
+    bin_r = np.minimum((r_per_center * (B / 2.0)).astype(np.int64), B - 1)
+    # cumhist already has cumulative sums; coverage per center = cumhist[c, bin_r[c]]
+    n_covered = int(cumhist[np.arange(V_actual), bin_r].sum())
+
     return r_per_center, points_per_center, n_covered
 
 
@@ -310,11 +475,15 @@ class ChunkedEmbeddingStore:
         return out
 
     def get_rows(self, indices):
-        """Return rows at indices as (len(indices), d) float32."""
+        """Return rows at indices as (len(indices), d) float32. Batch by section."""
         indices = np.asarray(indices, dtype=np.int64).ravel()
         out = np.empty((len(indices), self.d), dtype=np.float32)
-        for i, idx in enumerate(indices):
-            out[i] = self.get_row(int(idx))
+        # Map each index to its section, then batch-read per section
+        sections = np.searchsorted(self.cumsum, indices, side="right") - 1
+        for j in np.unique(sections):
+            mask = sections == j
+            local_idx = indices[mask] - self.cumsum[j]
+            out[mask] = self.section_embeddings[j][local_idx]
         return out
 
 
@@ -406,7 +575,7 @@ def farthest_first_traversal_gpu(X_ref_np, V, batch_size_ff=1, seed=0, log_every
     return np.array(center_indices, dtype=np.int64)
 
 
-def build_output_dir(base_out_dir: str, embeddings_dir: str, mode: str, suffix: str = "_kcenter") -> str:
+def build_output_dir(base_out_dir: str, embeddings_dir: str, suffix: str = "_kcenter") -> str:
     """Build output directory, appending suffix (e.g. _kcenter)."""
     if base_out_dir not in ("./centers", "centers"):
         return base_out_dir
@@ -419,7 +588,7 @@ def build_output_dir(base_out_dir: str, embeddings_dir: str, mode: str, suffix: 
         tokenization_unit = dir_info["unit"]
         cls_suffix = dir_info["cls_suffix"]
         layer = dir_info.get("layer", "last")
-        return f"centers_greedy_{mode}_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}{suffix}"
+        return f"centers_greedy_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}{suffix}"
 
     basename = os.path.basename(normalized_dir)
     if basename.startswith("embeddings_"):
@@ -432,9 +601,9 @@ def build_output_dir(base_out_dir: str, embeddings_dir: str, mode: str, suffix: 
                 tokenization_unit = "_".join(parts[cls_pos + 1 : layer_pos])
                 cls_suffix = parts[cls_pos]
                 layer = parts[layer_pos]
-                return f"centers_greedy_{mode}_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}{suffix}"
+                return f"centers_greedy_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}{suffix}"
 
-    return f"centers_greedy_{basename}_{mode}{suffix}"
+    return f"centers_greedy_{basename}{suffix}"
 
 
 def farthest_first_traversal(X_ref, V, batch_size_ff=1, seed=0, log_every=500):
@@ -530,6 +699,7 @@ def farthest_first_traversal_streaming(store, N, d, V, chunk_size=100_000, batch
     first = int(rng.integers(N))
     center_indices.append(first)
     center_row = store.get_row(first)
+    center_row /= max(np.linalg.norm(center_row), 1e-12)
     for start in range(0, N, chunk_size):
         end = min(start + chunk_size, N)
         batch = store.get_chunk(start, end)
@@ -548,6 +718,7 @@ def farthest_first_traversal_streaming(store, N, d, V, chunk_size=100_000, batch
             new_center = int(np.argmax(min_dist))
             center_indices.append(new_center)
             center_row = store.get_row(new_center)
+            center_row /= max(np.linalg.norm(center_row), 1e-12)
             for start in range(0, N, chunk_size):
                 end = min(start + chunk_size, N)
                 batch = store.get_chunk(start, end)
@@ -597,6 +768,7 @@ def farthest_first_traversal_streaming_gpu(store, N, d, V, chunk_size=100_000, b
     first = int(rng.integers(N))
     center_indices.append(first)
     center_row = store.get_row(first)
+    center_row /= max(np.linalg.norm(center_row), 1e-12)
     center_t = torch.from_numpy(center_row).to(device)
     for start in range(0, N, chunk_size):
         end = min(start + chunk_size, N)
@@ -617,6 +789,7 @@ def farthest_first_traversal_streaming_gpu(store, N, d, V, chunk_size=100_000, b
             new_center = int(np.argmax(min_dist))
             center_indices.append(new_center)
             center_row = store.get_row(new_center)
+            center_row /= max(np.linalg.norm(center_row), 1e-12)
             center_t = torch.from_numpy(center_row).to(device)
             for start in range(0, N, chunk_size):
                 end = min(start + chunk_size, N)
@@ -664,7 +837,6 @@ def main():
     )
     ap.add_argument("--embeddings_dir", type=str, required=True)
     ap.add_argument("--out_dir", type=str, default="./centers")
-    ap.add_argument("--mode", type=str, required=True, choices=["abstract2abstract", "claim2all"])
     ap.add_argument("--V", type=int, required=True,
                     help="Number of centers (= semantic unit granularity). The only required hyperparameter.")
     ap.add_argument("--r_c_percentile", type=float, default=99.0,
@@ -694,6 +866,9 @@ def main():
     ap.add_argument("--r_c_hist_bins", type=int, default=512,
                     help="Number of histogram bins for percentile r_c (cosine distance in [0, 2]). "
                          "Streaming histogram avoids storing all N distances; 512–1024 is typically enough.")
+    ap.add_argument("--df_top_k", type=int, default=10,
+                    help="max_centers_per_span for activation DF diagnostic (matches evaluate.py soft assignment). "
+                         "0 = skip activation DF and use Voronoi DF for stop-centers. Default: 10.")
 
     args = ap.parse_args()
     rng = np.random.default_rng(args.seed)
@@ -713,19 +888,20 @@ def main():
 
     # Auto-detect CUDA for farthest-first and FAISS
     use_gpu = _check_gpu()
+    vram_bytes = 0
     if use_gpu:
         import torch
         props = torch.cuda.get_device_properties(0)
-        vram = getattr(props, 'total_memory', None) or getattr(props, 'total_mem', 0)
+        vram_bytes = getattr(props, 'total_memory', None) or getattr(props, 'total_mem', 0)
         print(f"[kcenter] GPU mode (auto): {torch.cuda.get_device_name(0)}, "
-              f"VRAM={vram / 1e9:.1f}GB")
+              f"VRAM={vram_bytes / 1e9:.1f}GB")
 
     dir_info = parse_embeddings_dir(args.embeddings_dir)
-    embedding_files = find_embedding_files(args.embeddings_dir, args.mode, dir_info["unit"] if dir_info else None)
+    embedding_files = find_embedding_files(args.embeddings_dir, dir_info["unit"] if dir_info else None)
     if not embedding_files:
-        raise ValueError(f"No embedding files for mode '{args.mode}' in {args.embeddings_dir}")
+        raise ValueError(f"No embedding files in {args.embeddings_dir}")
 
-    print(f"[kcenter] Mode: {args.mode}, V={args.V}, r_c_percentile={args.r_c_percentile}, "
+    print(f"[kcenter] V={args.V}, r_c_percentile={args.r_c_percentile}, "
           f"batch_size_ff={args.batch_size_ff}")
     print(f"[kcenter] Embeddings: {[os.path.basename(f) for f in embedding_files]}")
 
@@ -770,7 +946,38 @@ def main():
         eligible_indices = np.concatenate(per_section)
         print(f"[kcenter] Section sampling=equal, max_per_section={args.max_per_section:,} -> eligible pool {len(eligible_indices):,}")
 
+    # ── Fit heuristic: load all into memory if RAM (or GPU VRAM) allows ──
+    data_bytes = N * d * 4  # float32
+    # GPU: need X (N×d) + min_dist (N) + scratch; use 50% VRAM threshold
+    gpu_can_fit_all = use_gpu and vram_bytes > 0 and data_bytes < vram_bytes * 0.50
+    # CPU: need X (N×d) + min_dist (N) + scratch; use 50% system RAM threshold
+    try:
+        import psutil
+        total_ram = psutil.virtual_memory().total
+    except ImportError:
+        # Fallback: read /proc/meminfo on Linux
+        total_ram = 0
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal"):
+                        total_ram = int(line.split()[1]) * 1024  # kB → bytes
+                        break
+        except Exception:
+            pass
+    ram_can_fit_all = (not use_gpu) and total_ram > 0 and data_bytes < total_ram * 0.50
+
+    # Adaptive chunk size for streaming fallback
     ff_chunk_size = 100_000
+    if use_gpu and vram_bytes > 0:
+        # Use up to 20% VRAM per chunk
+        max_chunk_rows = int(vram_bytes * 0.20 / (d * 4))
+        ff_chunk_size = max(100_000, min(max_chunk_rows, N))
+    elif total_ram > 0:
+        # CPU: use up to 10% RAM per chunk (leave room for min_dist, scratch, etc.)
+        max_chunk_rows = int(total_ram * 0.10 / (d * 4))
+        ff_chunk_size = max(100_000, min(max_chunk_rows, N))
+
     if eligible_indices is not None:
         X_ff = store.get_rows(eligible_indices)
         l2_normalize_inplace(X_ff)
@@ -784,13 +991,51 @@ def main():
         ff_to_global = ref_idx
         use_streaming_ff = False
         print(f"[kcenter] Farthest-first on ref subset: {args.ref_size:,}")
+    elif gpu_can_fit_all or ram_can_fit_all:
+        # Data fits in GPU VRAM or system RAM → load all at once for in-memory FFT
+        # (orders of magnitude faster than streaming: 1 matmul/round vs N/chunk_size transfers/round)
+        if gpu_can_fit_all:
+            print(f"[kcenter] Data fits in GPU VRAM ({data_bytes / 1e9:.1f}GB < {vram_bytes * 0.50 / 1e9:.1f}GB threshold)")
+        else:
+            print(f"[kcenter] Data fits in RAM ({data_bytes / 1e9:.1f}GB < {total_ram * 0.50 / 1e9:.1f}GB threshold)")
+        print(f"[kcenter] Loading all {N:,} points into RAM (bulk read, no mmap)...")
+        t_load = time.time()
+        # Re-read files WITHOUT mmap for fast sequential bulk IO.
+        # mmap on network FS (Lustre/GPFS) triggers per-page faults (4KB each)
+        # = ~5M faults for 20GB → extremely slow.  A single fread() is 100x+ faster.
+        parts = []
+        for fp in embedding_files:
+            print(f"  Reading {os.path.basename(fp)}...", end=" ", flush=True)
+            arr = np.load(fp).astype(np.float32)
+            parts.append(arr)
+            print(f"{arr.shape[0]:,} x {arr.shape[1]}")
+        X_ff = np.concatenate(parts, axis=0)
+        del parts
+        print(f"  Concatenated: {X_ff.shape}, normalizing...", flush=True)
+        l2_normalize_inplace(X_ff)
+        ff_to_global = np.arange(N, dtype=np.int64)
+        use_streaming_ff = False
+        print(f"[kcenter] Loaded + normalized in {time.time() - t_load:.1f}s")
     else:
         ff_to_global = None
         use_streaming_ff = True
-        print(f"[kcenter] Farthest-first on full data (streaming): {N:,}")
+        if use_gpu:
+            print(f"[kcenter] Data too large for GPU VRAM ({data_bytes / 1e9:.1f}GB); using streaming")
+        else:
+            print(f"[kcenter] Data too large for RAM ({data_bytes / 1e9:.1f}GB); using streaming")
+        print(f"[kcenter] Farthest-first on full data (streaming): {N:,} (chunk={ff_chunk_size:,})")
 
     ff_pool_size = (len(eligible_indices) if eligible_indices is not None else
                     (args.ref_size if (args.ref_size and args.ref_size < N) else N))
+
+    # Auto-tune batch_size_ff for streaming: with default (1), each round requires a full
+    # data pass.  For V=30K streaming that's 30K passes — painfully slow.  Batch=64 cuts
+    # passes by 64× with minimal quality loss (k-center is approximate anyway).
+    if use_streaming_ff and args.batch_size_ff == 1 and args.V > 1000:
+        auto_batch = min(128, max(16, args.V // 500))
+        print(f"[kcenter] Auto batch_size_ff: 1 → {auto_batch} (streaming + V={args.V:,}; "
+              f"override with --batch_size_ff 1 to force exact)")
+        args.batch_size_ff = auto_batch
 
     if use_streaming_ff:
         ff_label = "GPU" if use_gpu else "CPU"
@@ -854,15 +1099,35 @@ def main():
         for start in range(0, N, assign_batch):
             end = min(start + assign_batch, N)
             batch = store.get_chunk(start, end)
+            l2_normalize_inplace(batch)
             c_batch = assignments[start:end]
-            np.add.at(sum_c, c_batch, batch)
-            np.add.at(count_c, c_batch, 1)
+            # Sort-based grouped sum: contiguous memory access, much faster than np.add.at
+            order = np.argsort(c_batch, kind="mergesort")
+            sorted_c = c_batch[order]
+            sorted_batch = batch[order].astype(np.float64)
+            # Find boundaries between groups
+            change = np.empty(len(sorted_c), dtype=np.bool_)
+            change[0] = True
+            np.not_equal(sorted_c[1:], sorted_c[:-1], out=change[1:])
+            group_starts = np.nonzero(change)[0]
+            group_ids = sorted_c[group_starts]
+            group_ends = np.empty_like(group_starts)
+            group_ends[:-1] = group_starts[1:]
+            group_ends[-1] = len(sorted_c)
+            group_counts = group_ends - group_starts
+            # Cumsum trick: compute prefix sums, then diff at boundaries
+            cumsum_batch = np.cumsum(sorted_batch, axis=0)
+            for gi in range(len(group_starts)):
+                s, e = int(group_starts[gi]), int(group_ends[gi])
+                gid = int(group_ids[gi])
+                group_sum = cumsum_batch[e - 1] - (cumsum_batch[s - 1] if s > 0 else 0)
+                sum_c[gid] += group_sum
+                count_c[gid] += group_counts[gi]
         centers_new = np.zeros_like(centers, dtype=np.float32)
-        for c in range(V_actual):
-            if count_c[c] > 0:
-                centers_new[c] = (sum_c[c] / count_c[c]).astype(np.float32)
-            else:
-                centers_new[c] = centers[c]
+        # Vectorized division with safe handling of empty cells (count_c=0)
+        active = count_c > 0
+        centers_new[active] = (sum_c[active] / count_c[active, None]).astype(np.float32)
+        centers_new[~active] = centers[~active]
         l2_normalize_inplace(centers_new)
         centers = centers_new
         center_index = _build_faiss_center_index(centers, use_gpu)
@@ -889,28 +1154,72 @@ def main():
     # ── DF diagnostic (document frequency per center = posting list length; critical for retrieval) ──
     df_diagnostic = None
     if span_doc_ids is not None:
-        df_per_center, df_quantiles, top10_df = _compute_df_diagnostic(
+        # --- Voronoi DF (nearest-1 only; lower bound) ---
+        df_per_center_voronoi, df_quantiles_voronoi, top10_df_voronoi = _compute_df_diagnostic(
             assignments, assign_dists, span_doc_ids, r_per_center, V_actual, top_k=10
         )
-        # Stop-center rule: top 1% of centers by df
-        n_stop = max(1, int(math.ceil(V_actual * 0.01)))
-        ranked = np.argsort(-df_per_center)
-        stop_centers = [int(ranked[i]) for i in range(n_stop)]
-        stop_center_threshold = int(df_per_center[ranked[n_stop - 1]])
+        print(f"\n[kcenter] ── Voronoi DF (nearest-1 assignment, lower bound) ──")
+        print(f"[kcenter] df quantiles: p50={df_quantiles_voronoi['p50']:,}, p90={df_quantiles_voronoi['p90']:,}, "
+              f"p99={df_quantiles_voronoi['p99']:,}, max={df_quantiles_voronoi['max']:,}")
 
+        # --- Activation DF (top-K + r_c filter; matches evaluate.py soft assignment) ---
+        df_top_k = args.df_top_k
+        if df_top_k > 0:
+            print(f"\n[kcenter] ── Activation DF (top-{df_top_k} + per-center r_c, matches evaluate.py) ──")
+            df_per_center_act, df_quantiles_act, top10_df_act, act_stats = _compute_df_diagnostic_activation(
+                store, center_index, N, d, use_gpu,
+                span_doc_ids, r_per_center, V_actual,
+                max_centers_per_span=df_top_k, top_k_report=10,
+            )
+            print(f"[kcenter] activation df quantiles: p50={df_quantiles_act['p50']:,}, p90={df_quantiles_act['p90']:,}, "
+                  f"p99={df_quantiles_act['p99']:,}, max={df_quantiles_act['max']:,}")
+            ratio_p50 = df_quantiles_act['p50'] / max(df_quantiles_voronoi['p50'], 1)
+            ratio_max = df_quantiles_act['max'] / max(df_quantiles_voronoi['max'], 1)
+            print(f"[kcenter] activation/voronoi ratio: p50={ratio_p50:.1f}x, max={ratio_max:.1f}x")
+            print(f"[kcenter] mean activations per span: {act_stats['mean_activations_per_span']:.1f} "
+                  f"(K_search={act_stats['K_search']}, cap={act_stats['max_centers_per_span']})")
+
+            # Use activation DF for stop-centers (more representative of actual retrieval)
+            df_for_stop = df_per_center_act
+            df_label = "activation"
+        else:
+            df_for_stop = df_per_center_voronoi
+            df_label = "voronoi"
+            df_quantiles_act = None
+            top10_df_act = None
+            act_stats = None
+
+        # Stop-center rule: top 1% of centers by df (using activation df when available)
+        n_stop = max(1, int(math.ceil(V_actual * 0.01)))
+        ranked = np.argsort(-df_for_stop)
+        stop_centers = [int(ranked[i]) for i in range(n_stop)]
+        stop_center_threshold = int(df_for_stop[ranked[n_stop - 1]])
+        print(f"[kcenter] stop_centers (top {n_stop} by {df_label} df, min_df={stop_center_threshold:,}): "
+              f"{len(stop_centers):,} disabled for retrieval")
+
+        # Build diagnostic dict
         df_diagnostic = {
-            "df_p50": df_quantiles["p50"],
-            "df_p90": df_quantiles["p90"],
-            "df_p99": df_quantiles["p99"],
-            "df_max": df_quantiles["max"],
-            "top10_df_centers": top10_df,
+            "voronoi_df_p50": df_quantiles_voronoi["p50"],
+            "voronoi_df_p90": df_quantiles_voronoi["p90"],
+            "voronoi_df_p99": df_quantiles_voronoi["p99"],
+            "voronoi_df_max": df_quantiles_voronoi["max"],
+            "voronoi_top10_df_centers": top10_df_voronoi,
         }
-        print(f"\n[kcenter] ── DF diagnostic (doc frequency per center = posting list length) ──")
-        print(f"[kcenter] df quantiles: p50={df_quantiles['p50']:,}, p90={df_quantiles['p90']:,}, p99={df_quantiles['p99']:,}, max={df_quantiles['max']:,}")
-        print(f"[kcenter] stop_centers (top {n_stop} by df, min_df={stop_center_threshold:,}): {len(stop_centers):,} disabled for retrieval")
-        print(f"[kcenter] Top-10 df centers (r_c + representative span):")
-        for row in top10_df:
-            print(f"  center {row['center_id']}: df={row['df']:,}, r_c={row['r_c']:.4f}, rep_span_idx={row['rep_span_idx']}, rep_span_dist={row['rep_span_dist']:.4f}")
+        if df_quantiles_act is not None:
+            df_diagnostic["activation_df_p50"] = df_quantiles_act["p50"]
+            df_diagnostic["activation_df_p90"] = df_quantiles_act["p90"]
+            df_diagnostic["activation_df_p99"] = df_quantiles_act["p99"]
+            df_diagnostic["activation_df_max"] = df_quantiles_act["max"]
+            df_diagnostic["activation_top10_df_centers"] = top10_df_act
+            df_diagnostic["activation_stats"] = act_stats
+            df_diagnostic["stop_centers_source"] = "activation"
+        else:
+            df_diagnostic["stop_centers_source"] = "voronoi"
+
+        print(f"\n[kcenter] Top-10 df centers ({df_label}):")
+        top10_for_print = top10_df_act if top10_df_act is not None else top10_df_voronoi
+        for row in top10_for_print:
+            print(f"  center {row['center_id']}: df={row['df']:,}, r_c={row['r_c']:.4f}")
 
     # Final coverage only (k-center does not track per-step coverage; no fake curve)
     coverage_history = [float(coverage)]
@@ -921,18 +1230,29 @@ def main():
         suffix += f"_r{args.r_c_percentile:g}"
     if refine_iters > 0:
         suffix += f"_refine{refine_iters}"
-    args.out_dir = build_output_dir(args.out_dir, args.embeddings_dir, args.mode, suffix=suffix)
+    args.out_dir = build_output_dir(args.out_dir, args.embeddings_dir, suffix=suffix)
     os.makedirs(args.out_dir, exist_ok=True)
 
     out_name = f"centers_greedy_V{V_actual}_r{nominal_r:.3f}.npy"
     out_path = os.path.join(args.out_dir, out_name)
     np.save(out_path, centers)
 
+    # ── Save stop_centers as standalone files (fast loading, no JSON parse) ──
+    if df_diagnostic is not None and stop_centers:
+        sc_arr = np.array(stop_centers, dtype=np.int64)
+        sc_npy_path = os.path.join(args.out_dir, "stop_centers.npy")
+        np.save(sc_npy_path, sc_arr)
+        sc_txt_path = os.path.join(args.out_dir, "stop_centers.txt")
+        with open(sc_txt_path, "w") as f:
+            for c in sorted(stop_centers):
+                f.write(f"{c}\n")
+        print(f"[kcenter] Saved: {sc_npy_path} ({len(sc_arr)} centers)")
+        print(f"[kcenter] Saved: {sc_txt_path}")
+
     stats = {
         "method": "kcenter",
         "algorithm": "farthest_first_traversal",
         "embeddings_dir": args.embeddings_dir,
-        "task_mode": args.mode,
         "N": int(N),
         "d": int(d),
         "V": int(V_actual),

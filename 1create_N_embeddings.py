@@ -58,6 +58,48 @@ from utils import (
 SECTIONS = ("abstract", "claim", "invention")
 
 
+def auto_batch_size(model_path: str, max_length: int = 512) -> int:
+    """Estimate a reasonable encoding batch size based on available GPU memory.
+
+    Heuristic (for BERT-class encoders with max_length tokens):
+        usable_gb = total_vram * 0.70          # leave headroom for model weights + OS
+        per_sample_mb ≈ max_length / 512 * 3   # ~3 MB per sample at 512 tokens (empirical)
+        batch_size = usable_gb * 1024 / per_sample_mb, clamped to [8, 2048]
+
+    Falls back to 64 on CPU or when detection fails.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        print("[auto_batch_size] No GPU detected → default batch_size=64")
+        return 64
+
+    try:
+        dev = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(dev)
+        total_mb = props.total_mem / (1024 ** 2)
+        total_gb = total_mb / 1024
+        gpu_name = props.name
+
+        # Rough per-sample cost scales linearly with sequence length
+        per_sample_mb = (max_length / 512) * 3.0
+        usable_mb = total_mb * 0.70  # 70 % usable after model weights + overhead
+        estimated = int(usable_mb / per_sample_mb)
+
+        # Clamp to a sane range
+        estimated = max(8, min(estimated, 2048))
+
+        # Round down to nearest power-of-two-friendly number (multiple of 8)
+        estimated = (estimated // 8) * 8
+
+        print(f"[auto_batch_size] GPU: {gpu_name}, VRAM: {total_gb:.1f} GB → batch_size={estimated}")
+        return estimated
+
+    except Exception as e:
+        print(f"[auto_batch_size] Detection failed ({e}) → default batch_size=64")
+        return 64
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="./downstream/perf200/",
@@ -65,8 +107,8 @@ def main():
 
     parser.add_argument("--model_path", type=str, default="ZoeYou/PatentMap-V0-SecPair-Claim",
                        help="Path to pretrained model or HuggingFace model ID")
-    parser.add_argument("--batch_size", type=int, default=512,
-                       help="Batch size for encoding documents")
+    parser.add_argument("--batch_size", type=int, default=None,
+                       help="Batch size for encoding documents. If not set, automatically estimated from GPU memory.")
     parser.add_argument("--max_length", type=int, default=512,
                        help="Maximum sequence length for tokenizer (max_length parameter)")
     parser.add_argument("--max_section_chars", type=int, default=32768,
@@ -83,6 +125,17 @@ def main():
                        help="[EPO only] Random seed when sampling to max_docs (proportional per year). For reproducibility.")
     parser.add_argument("--max_spans", type=int, default=5000000,
                        help="Maximum number of spans (embeddings) to extract")
+    parser.add_argument("--shuffle_doc_sections", type=int, default=1, choices=[0, 1],
+                       help="Shuffle doc-sections before batch processing (1=yes, 0=no). Default: 1. "
+                            "Ensures early-stop covers documents from all years/sources uniformly, "
+                            "instead of only the first N documents in insertion order.")
+    parser.add_argument("--max_spans_per_doc_section", type=int, default=None,
+                       help="Max content spans (excl. CLS/DOC_MEAN) to keep per (doc, section) pair. "
+                            "None = no cap (default). Post-truncation actual content spans: "
+                            "abstract ~6, claim ~48, invention ~42. "
+                            "Recommended: 25 for spacy_token (27%% doc coverage vs 16%% uncapped), "
+                            "15 for noun_chunk, not needed for spacy_sentence. "
+                            "Evenly-spaced sub-sampling is used when capping (deterministic).")
 
     parser.add_argument("--embed_dtype", type=str, default="float32", choices=["float32", "float16"],
                        help="Storage dtype for embeddings: float32 (default, full precision), float16 (half size, minimal quality loss for retrieval).")
@@ -116,6 +169,12 @@ def main():
     parser.add_argument("--spacy_disable_extra", type=int, default=1, choices=[0, 1],
                        help="If 1 (default), disable lemmatizer for speed (attribute_ruler is kept for POS tags / noun_chunks). Set 0 to keep full pipeline.")
     args = parser.parse_args()
+
+    # ── Resolve batch_size (auto-detect when not explicitly provided) ──
+    if args.batch_size is None:
+        args.batch_size = auto_batch_size(args.model_path, args.max_length)
+    else:
+        print(f"[batch_size] Using user-specified batch_size={args.batch_size}")
 
     # Load span cache if provided (Phase 2: skip spaCy entirely)
     span_cache = None
@@ -193,6 +252,8 @@ def main():
     print(f"Batch size: {args.batch_size}, Max length: {args.max_length}, Max section chars: {args.max_section_chars}")
     print(f"Keep [CLS]: {keep_cls}")
     print(f"Keep doc mean: {keep_doc_mean}")
+    print(f"Shuffle doc-sections: {bool(args.shuffle_doc_sections)}")
+    print(f"Max spans/doc-section: {args.max_spans_per_doc_section or 'unlimited'}")
     print(f"Span cache: {args.span_cache_dir or 'none (spaCy at runtime)'}")
     print(f"Output directory: {output_dir}")
     print(f"=" * 80)
@@ -243,7 +304,14 @@ def main():
         max_section_chars=args.max_section_chars,
         max_spans=args.max_spans,
         span_cache=span_cache,
+        shuffle_doc_sections=bool(args.shuffle_doc_sections),
+        max_spans_per_doc_section=args.max_spans_per_doc_section,
     )
+    
+    # Free corpus and span cache — no longer needed, reclaim potentially 20+ GB
+    del documents
+    del span_cache
+    import gc; gc.collect()
     
     # Separate metadata by section for sampling and saving.
     # Order within each section must match embeddings_by_section row order (asserted in utils.create_contextual_span_embeddings).

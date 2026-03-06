@@ -375,6 +375,8 @@ def create_contextual_span_embeddings(
     max_section_chars: Optional[int] = None,
     max_spans: Optional[int] = None,
     span_cache: Optional[dict] = None,
+    shuffle_doc_sections: bool = True,
+    max_spans_per_doc_section: Optional[int] = None,
 ) -> Tuple[dict, List[dict]]:
     """
     Create contextual span embeddings for all documents using batch processing.
@@ -383,6 +385,12 @@ def create_contextual_span_embeddings(
     max_spans: if set, stop after collecting this many spans (early-stop to avoid encoding more than needed).
     span_cache: if provided, use pre-computed spaCy spans (from 0cache_spacy_spans.py) instead of
                 running spaCy at runtime. Keys: (doc_id, section, sub_part) → list of (start, end, text).
+    shuffle_doc_sections: if True, shuffle doc_data after collect_doc_texts (seed=42) so that
+                          early-stop covers documents from all years/sources uniformly.
+    max_spans_per_doc_section: if set, cap content spans (excl. CLS/DOC_MEAN) per (doc, section)
+                               pair. Uses evenly-spaced sub-sampling (deterministic). This limits
+                               the contribution of long sections so more unique documents are
+                               covered before reaching max_spans.
     """
     if format_scheme is None:
         format_scheme = ENCODER_FORMAT_SECTION_TOKENS
@@ -399,9 +407,52 @@ def create_contextual_span_embeddings(
         'claim': [],
         'invention': []
     }
-    all_metadata = []
+    all_metadata = []  # will be flushed to disk periodically
+    _metadata_flush_frequency = 10  # flush metadata to disk every N batches
+    import tempfile as _tmpmod
+    _metadata_tmpdir = _tmpmod.mkdtemp(prefix="emb_meta_")
+    _metadata_tmpfiles = {s: os.path.join(_metadata_tmpdir, f"{s}_meta.jsonl") for s in ['abstract', 'claim', 'invention']}
+    _metadata_counts = {'abstract': 0, 'claim': 0, 'invention': 0}
+
+    def _flush_metadata():
+        """Write accumulated metadata to temp files and clear the in-memory list."""
+        nonlocal all_metadata
+        if not all_metadata:
+            return
+        # Group by section and append to temp files
+        section_buf = {'abstract': [], 'claim': [], 'invention': []}
+        for meta in all_metadata:
+            s = meta.get('section')
+            if s in section_buf:
+                section_buf[s].append(json.dumps(meta, ensure_ascii=False))
+        for s in ['abstract', 'claim', 'invention']:
+            if section_buf[s]:
+                with open(_metadata_tmpfiles[s], 'a', encoding='utf-8') as f:
+                    f.write('\n'.join(section_buf[s]) + '\n')
+                _metadata_counts[s] += len(section_buf[s])
+        all_metadata = []
+
+    def _load_flushed_metadata() -> list:
+        """Load all flushed metadata back from temp files (in section order)."""
+        result = []
+        for s in ['abstract', 'claim', 'invention']:
+            if os.path.isfile(_metadata_tmpfiles[s]):
+                with open(_metadata_tmpfiles[s], 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            result.append(json.loads(line))
+        # Cleanup temp files
+        import shutil
+        shutil.rmtree(_metadata_tmpdir, ignore_errors=True)
+        return result
 
     doc_data = collect_doc_texts(documents, max_docs=max_docs, format_scheme=format_scheme, sep=sep, max_section_chars=max_section_chars)
+    # Free the documents dict early — it can be 10-15 GB for 300K EPO patents
+    # The caller still has a reference but we clear our local view
+    documents.clear()
+    import gc as _gc_early
+    _gc_early.collect()
     from collections import Counter
     section_counts = Counter(item[1] for item in doc_data)
     n_abs = section_counts.get("abstract", 0)
@@ -411,6 +462,41 @@ def create_contextual_span_embeddings(
     if n_abs == 0 and max_docs is not None:
         print("⚠️  No abstract sections: the first max_docs documents have no 'pa01' (abstract). "
               "Use a larger --max_docs or run without --max_docs to include abstract embeddings.")
+
+    # Shuffle doc-sections so early-stop covers all years/sources uniformly
+    if shuffle_doc_sections:
+        _shuffle_rng = np.random.RandomState(42)
+        _shuffle_rng.shuffle(doc_data)
+        n_unique_docs = len(set(item[0] for item in doc_data))
+        print(f"✓ Shuffled {len(doc_data):,} doc-sections (seed=42, {n_unique_docs:,} unique docs)")
+
+    # Helper: cap content spans per (doc, section) pair (evenly-spaced sub-sampling)
+    def _cap_spans_per_doc_section(batch_results, max_content):
+        """Cap content spans per (doc_id, section); CLS/DOC_MEAN always kept."""
+        from collections import OrderedDict
+        groups = OrderedDict()
+        for item in batch_results:
+            _raw = item[3]  # span_text_raw
+            key = (item[0], item[1])  # (doc_id, section)
+            if key not in groups:
+                groups[key] = {'special': [], 'content': []}
+            is_special = (_raw == "[DOC_MEAN]" or _raw == "[CLS]"
+                          or (isinstance(_raw, str) and _raw.startswith("[") and "CLS" in _raw))
+            if is_special:
+                groups[key]['special'].append(item)
+            else:
+                groups[key]['content'].append(item)
+        capped = []
+        for key, g in groups.items():
+            capped.extend(g['special'])
+            content = g['content']
+            if len(content) <= max_content:
+                capped.extend(content)
+            else:
+                # Evenly-spaced sub-sampling: deterministic, good coverage across the section
+                indices = np.linspace(0, len(content) - 1, max_content, dtype=int)
+                capped.extend(content[idx] for idx in indices)
+        return capped
     
     # Process in batches
     print(f"\nExtracting contextual span embeddings (batch size={batch_size})...")
@@ -418,7 +504,8 @@ def create_contextual_span_embeddings(
     
     # Chunk size: convert to numpy arrays every N batches to reduce peak memory
     # For memory-intensive units, chunk more frequently
-    chunk_frequency = 20 if unit == "encoder_token" else 50
+    # Keep chunk_frequency LOW to avoid accumulating millions of individual numpy arrays
+    chunk_frequency = 3 if unit == "encoder_token" else 5
     
     def _chunk_embeddings():
         """Convert accumulated embeddings to numpy arrays and clear temp lists."""
@@ -487,6 +574,10 @@ def create_contextual_span_embeddings(
                     keep_doc_mean=keep_doc_mean,
                 )
             
+            # Cap content spans per (doc, section) if configured
+            if max_spans_per_doc_section is not None:
+                batch_results = _cap_spans_per_doc_section(batch_results, max_spans_per_doc_section)
+
             # Store results with proper metadata tracking, separated by section
             for doc_id, section, doc_text, span_text_raw, span_text_canonical, span_emb in batch_results:
                 if section in temp_embeddings_by_section:
@@ -525,6 +616,10 @@ def create_contextual_span_embeddings(
         if (batch_idx + 1) % chunk_frequency == 0:
             _chunk_embeddings()
         
+        # Periodically flush metadata to disk to avoid unbounded RAM growth
+        if (batch_idx + 1) % _metadata_flush_frequency == 0:
+            _flush_metadata()
+        
         # Early-stop: stop once we have enough spans (avoids encoding then sampling down)
         if max_spans is not None and _current_total_spans() >= max_spans:
             print(f"\n[Early-stop] Reached max_spans={max_spans:,}; stopping after batch {batch_idx + 1}.")
@@ -540,6 +635,8 @@ def create_contextual_span_embeddings(
     
     # Final chunking for any remaining embeddings
     _chunk_embeddings()
+    # Final flush for any remaining metadata
+    _flush_metadata()
     
     # Convert embeddings per section to numpy arrays (concatenate chunks)
     embeddings_by_section = {}
@@ -558,6 +655,11 @@ def create_contextual_span_embeddings(
     
     if total_embeddings == 0:
         raise ValueError("No embeddings were created. Check your input data and processing pipeline.")
+    
+    # Reload metadata from disk (was flushed incrementally to save RAM)
+    print("Loading flushed metadata from disk...")
+    all_metadata = _load_flushed_metadata()
+    print(f"Loaded {len(all_metadata):,} metadata entries")
     
     # Ensure metadata and embeddings are aligned: same order and length per section
     # (metadata_by_section order must match embeddings_by_section row order for downstream doc-soft / evaluate)
@@ -1864,12 +1966,12 @@ def parse_embeddings_dir(dirname: str) -> dict:
     return None
 
 
-def find_embedding_files(embeddings_dir: str, mode: str, unit: str = None) -> list:
+def find_embedding_files(embeddings_dir: str, unit: str = None) -> list:
     """
-    Find embedding files in directory from 1create_N_embeddings.py output based on task mode.
+    Find embedding files in directory from 1create_N_embeddings.py output.
     
-    For abstract2abstract: returns [abstract_{unit}.npy/npz]
-    For claim2all: returns [abstract_{unit}.npy/npz, claim_{unit}.npy/npz, invention_{unit}.npy/npz]
+    Returns ALL available section embedding files (abstract, claim, invention)
+    in canonical order, skipping any that don't exist on disk.
     
     If unit is not provided, tries to infer from directory name or scans for available files.
     
@@ -1879,13 +1981,7 @@ def find_embedding_files(embeddings_dir: str, mode: str, unit: str = None) -> li
     if not os.path.isdir(embeddings_dir):
         return []
     
-    # Determine which sections are needed based on mode
-    if mode == "abstract2abstract":
-        required_sections = ['abstract']
-    elif mode == "claim2all":
-        required_sections = ['abstract', 'claim', 'invention']
-    else:
-        raise ValueError(f"Unknown mode: {mode}. Supported modes: abstract2abstract, claim2all")
+    ALL_SECTIONS = ['abstract', 'claim', 'invention']
     
     # If unit not provided, try to infer from directory name
     if unit is None:
@@ -1895,9 +1991,8 @@ def find_embedding_files(embeddings_dir: str, mode: str, unit: str = None) -> li
         else:
             # Scan for available files to infer unit
             for f in os.listdir(embeddings_dir):
-                for section in required_sections:
+                for section in ALL_SECTIONS:
                     if f.startswith(f"{section}_") and (f.endswith('.npy') or f.endswith('.npz')):
-                        # Extract unit from filename: {section}_{unit}.{ext}
                         unit = f.replace(f"{section}_", "").replace('.npy', '').replace('.npz', '')
                         break
                 if unit:
@@ -1906,41 +2001,21 @@ def find_embedding_files(embeddings_dir: str, mode: str, unit: str = None) -> li
     if unit is None:
         return []
     
-    # Find files for each required section
+    # Find files for each section
     found_files = []
-    for section in required_sections:
-        # Try .npy first, then .npz
+    for section in ALL_SECTIONS:
         for ext in ['.npy', '.npz']:
             filepath = os.path.join(embeddings_dir, f"{section}_{unit}{ext}")
             if os.path.exists(filepath):
                 found_files.append(filepath)
                 break
     
-    # Return only if all required sections are found
-    if len(found_files) == len(required_sections):
-        return found_files
-    else:
-        return []
+    return found_files
 
 
 # ============================================================================
 # Vector normalization utilities
 # ============================================================================
-
-def l2_normalize(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    """
-    L2-normalize vectors (returns new array, non-destructive).
-    
-    Args:
-        X: Array of shape [N, d] to normalize
-        eps: Small epsilon to prevent division by zero
-    
-    Returns:
-        Normalized array of same shape
-    """
-    norms = np.linalg.norm(X, axis=1, keepdims=True)
-    return X / np.clip(norms, eps, None)
-
 
 def l2_normalize_inplace(X: np.ndarray, eps: float = 1e-12):
     """
@@ -1955,14 +2030,6 @@ def l2_normalize_inplace(X: np.ndarray, eps: float = 1e-12):
 
 
 # ================== Evaluation / formatting helpers (used by evaluate.py) ==================
-
-def log_embeddings_shape(embeddings_dict, context=""):
-    """Log embedding shapes consistently."""
-    if context:
-        print(f"{context}:")
-    for name, embeddings in embeddings_dict.items():
-        print(f"  {name}: {embeddings.shape}")
-
 
 def print_subsection_header(title, width=60):
     """Print a formatted subsection header."""
@@ -2013,34 +2080,39 @@ def cls_pooling(model_output, attention_mask):
     return model_output.last_hidden_state[:, 0]
 
 
-def compute_rankings(top_indices):
-    """Convert top_k indices to rank matrix (1-based)."""
-    rankings = np.empty_like(top_indices)
-    for query_idx, doc_order in enumerate(top_indices):
-        rankings[query_idx, doc_order] = np.arange(1, len(doc_order) + 1)
-    return rankings
 
 
 def find_centers(dense_model: str, tokenization_unit: str, include_cls: bool, search_dir: str = ".",
-                 mode: str = "abstract2abstract", layer: str = "last", centers_suffix: str = "") -> tuple:
+                 layer: str = "last", centers_suffix: str = "") -> tuple:
     """
     Find centers directory and .npy file for sparse_coverage eval.
+    Centers are task-agnostic (shared across abstract2abstract and claim2all).
     Returns (centers_path, centers_dir).
     """
     import glob
     model_name = dense_model.strip("/").split("/")[-1].replace("/", "_").replace("\\", "_")
     cls_suffix = "cls" if include_cls else "nocls"
-    expected_dir_pattern = f"centers_greedy_{mode}_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}{centers_suffix}"
+    expected_dir_pattern = f"centers_greedy_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}{centers_suffix}"
     search_pattern = os.path.join(search_dir, expected_dir_pattern)
     matching_dirs = glob.glob(search_pattern)
     if not matching_dirs:
         matching_dirs = glob.glob(os.path.join(search_dir, "**", expected_dir_pattern), recursive=True)
     if not matching_dirs:
+        # Backward compat: try legacy pattern with mode prefix
+        for legacy_mode in ["abstract2abstract", "claim2all"]:
+            legacy_pattern = f"centers_greedy_{legacy_mode}_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}{centers_suffix}"
+            matching_dirs = glob.glob(os.path.join(search_dir, legacy_pattern))
+            if not matching_dirs:
+                matching_dirs = glob.glob(os.path.join(search_dir, "**", legacy_pattern), recursive=True)
+            if matching_dirs:
+                print(f"⚠️  Using legacy mode-specific centers: {matching_dirs[0]}")
+                break
+    if not matching_dirs:
         raise FileNotFoundError(
             f"Could not find centers directory matching: {expected_dir_pattern}\n"
             f"Searched in: {os.path.abspath(search_dir)}\n"
             f"  dense_model={dense_model}\n  tokenization_unit={tokenization_unit}\n"
-            f"  include_cls={include_cls}\n  mode={mode}\n  layer={layer}"
+            f"  include_cls={include_cls}\n  layer={layer}"
         )
     centers_dir = matching_dirs[0]
     if len(matching_dirs) > 1:
