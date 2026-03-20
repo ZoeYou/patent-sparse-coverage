@@ -11,11 +11,7 @@ speed up repeated runs instead of recomputing embeddings.
 Usage example:
     python evaluate.py --model_name <path_or_model_id> --temp_dir ./temp
 """
-
-from __future__ import absolute_import, division, unicode_literals
-
 import os
-import re
 import sys
 import json
 import argparse
@@ -45,9 +41,6 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-# Global constants
-QUALITY_MIN_WORDS = 6  # Minimum number of words required for high-quality text
 
 
 # add patenteval to the path
@@ -96,36 +89,73 @@ from utils import (
 )
 
 
+def _auto_batch_size(device, hidden_size: int = 768, min_bs: int = 4, max_bs: int = 256) -> int:
+    """Return a safe inference batch size scaled to GPU total memory.
+
+    Calibrated for transformer models at seq_len=512:
+      ~11 GB GPU  (e.g. GTX 1080 Ti / RTX 2080 Ti) → 32
+      ~16 GB GPU  (e.g. V100-16 / RTX 3080/4080)    → 64
+      ~24 GB GPU  (e.g. RTX 3090/4090)               → 64
+      ~40 GB GPU  (e.g. A100-40)                      → 128
+      ~80 GB GPU  (e.g. A100-80)                      → 256
+    Hidden-size scaling: larger models get proportionally smaller batches (sqrt scaling).
+    Falls back to 32 on CPU or if GPU info is unavailable.
+    """
+    if not torch.cuda.is_available():
+        return 32
+    try:
+        dev_idx = device.index if (hasattr(device, "index") and device.index is not None) else 0
+        total_gb = torch.cuda.get_device_properties(dev_idx).total_memory / (1024 ** 3)
+        # Reference: hidden=768 works at bs=64 on a 16 GB GPU
+        bs_float = 64.0 * (total_gb / 16.0) * (768.0 / max(hidden_size, 1)) ** 0.5
+        # Round down to nearest power of 2
+        p2 = min_bs
+        while p2 * 2 <= int(bs_float):
+            p2 *= 2
+        result = max(min_bs, min(max_bs, p2))
+        print(f"  [auto batch_size] GPU total={total_gb:.1f} GB, hidden={hidden_size} → batch_size={result}", flush=True)
+        return result
+    except Exception:
+        return 32
+
+
 def _load_or_compute_prior_art_embeddings(cache_query_path, cache_doc_path, compute_fn, pickle_protocol=None):
     """
     Load prior-art query/document embeddings from cache if present, else compute via compute_fn() and save.
     compute_fn() should return (query_embeddings, document_embeddings) as numpy arrays.
-    Returns (query_embeddings, document_embeddings).
+    Returns (query_embeddings, document_embeddings) as float32.
     """
     if os.path.exists(cache_query_path) and os.path.exists(cache_doc_path):
         print("Embeddings already created!")
-        return (
-            torch.load(cache_query_path, weights_only=False),
-            torch.load(cache_doc_path, weights_only=False),
-        )
-    query_embeddings, document_embeddings = compute_fn()
-    save_kw = {} if pickle_protocol is None else {"pickle_protocol": pickle_protocol}
-    torch.save(query_embeddings, cache_query_path, **save_kw)
-    torch.save(document_embeddings, cache_doc_path, **save_kw)
-    return query_embeddings, document_embeddings
+        q = torch.load(cache_query_path, weights_only=False)
+        d = torch.load(cache_doc_path, weights_only=False)
+    else:
+        q, d = compute_fn()
+        save_kw = {} if pickle_protocol is None else {"pickle_protocol": pickle_protocol}
+        torch.save(q, cache_query_path, **save_kw)
+        torch.save(d, cache_doc_path, **save_kw)
+    return np.asarray(q, dtype=np.float32), np.asarray(d, dtype=np.float32)
 
 
 def _save_rankings_paths_from_args(args):
-    """If args.save_rankings (dir) is set, return (path_abstract2abstract, path_claim2all); else (None, None). Creates dir if needed."""
+    """If args.save_rankings (dir) is set, return dict of ranking file paths; else empty dict.
+
+    Keys:
+      - 'priorart_abs2abs': prior-art abstract → abstract
+      - 'priorart_claim2all': prior-art claim → all sections
+      - 'clefip_passage': CLEF-IP passage-level ranking
+    Creates directory if needed.
+    """
     base = getattr(args, "save_rankings", None)
     if not base:
-        return None, None
+        return {}
     base = os.path.abspath(base)
     os.makedirs(base, exist_ok=True)
-    return (
-        os.path.join(base, "rankings_abstract2abstract.json"),
-        os.path.join(base, "rankings_claim2all.json"),
-    )
+    return {
+        "priorart_abs2abs": os.path.join(base, "rankings_abstract2abstract.json"),
+        "priorart_claim2all": os.path.join(base, "rankings_claim2all.json"),
+        "clefip_passage": os.path.join(base, "rankings_clefip_passage.json"),
+    }
 
 
 def prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=None, save_rankings_claim2all_path=None, model_label="Dense"):
@@ -188,11 +218,7 @@ def prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_e
         true_labels_list.append(true_labels)
         predicted_labels_list.append(predicted_labels)
 
-    if save_rankings_path:
-        ranking_dict = {qids_abs[i]: predicted_labels_list[i] for i in range(len(predicted_labels_list))}
-        with open(save_rankings_path, "w") as f:
-            json.dump(ranking_dict, f, indent=0)
-        print(f"   Saved abstract->abstract rankings to {save_rankings_path} ({len(predicted_labels_list)} queries)")
+    _save_rankings(save_rankings_path, qids_abs, predicted_labels_list, "abstract->abstract")
 
     # Compute metrics
     results_key = "abstract->abstract"
@@ -241,39 +267,84 @@ def prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_e
         retrieved_sections=f"[{len(retrieved_sections)} queries with retrieved sections]",
     )
 
-    if save_rankings_claim2all_path:
-        ranking_dict = {str(qids_claim[i]): predicted_labels_list[i] for i in range(len(predicted_labels_list))}
-        with open(save_rankings_claim2all_path, "w") as f:
-            json.dump(ranking_dict, f, indent=0)
-        print(f"   Saved claim->all rankings to {save_rankings_claim2all_path} ({len(predicted_labels_list)} queries)")
+    _save_rankings(save_rankings_claim2all_path, qids_claim, predicted_labels_list, "claim->all")
 
-    # Format and display results
-    print_subsection_header("Prior Art Search Results")
-    
-    for task_key, task_results in results.items():
-        if isinstance(task_results, dict):
-            # Create a clean task name
-            if '->' in task_key:
-                clean_name = f"Query: {task_key.split('->')[0]} → Document: {task_key.split('->')[1]}"
+    _display_prior_art_results(results, results_key, retrieved_sections, query_section="claim")
+
+
+def _clefip_two_stage_rerank(
+    passage_ids: list,
+    predicted_labels_list: list,
+    passage_scores_list: list,
+    topk_docs: int = 100,
+) -> list:
+    """
+    Two-stage CLEF-IP passage retrieval:
+      Stage 1: From initial passage ranking, derive document ranking (first occurrence dedup).
+               Keep only the top-K documents.
+      Stage 2: Among ALL passages in the corpus belonging to those top-K documents,
+               re-rank by the original passage scores.  Passages from documents not in
+               top-K are excluded — this eliminates noise from spurious high-score passages
+               in irrelevant documents.
+
+    Args:
+        passage_ids:            full corpus passage_id list (same order as scoring index).
+        predicted_labels_list:  per-query list of ranked passage_ids from Stage 1 (any length).
+        passage_scores_list:    per-query list of dicts {passage_id: score} covering all scored passages
+                                (or at least those from the top-ranking). If a dict is None or empty,
+                                the corresponding query falls back to Stage 1 ranking.
+        topk_docs:              number of top documents to keep after Stage 1 (default 100).
+
+    Returns:
+        reranked_list:  per-query list of passage_ids (all passages from top-K docs, sorted by score).
+    """
+    # Pre-build passage_id -> doc_id mapping and doc_id -> set(passage_ids)
+    pid_to_doc = {}
+    doc_to_pids: dict[str, set] = {}
+    for pid in passage_ids:
+        doc_id = _clefip_passage_id_to_doc_id(pid)
+        pid_to_doc[pid] = doc_id
+        doc_to_pids.setdefault(doc_id, set()).add(pid)
+
+    reranked_list = []
+    for q_idx in range(len(predicted_labels_list)):
+        pred = predicted_labels_list[q_idx]
+        scores = passage_scores_list[q_idx] if q_idx < len(passage_scores_list) else {}
+        if not scores:
+            # Fallback: no scores available, use Stage 1 ranking as-is
+            reranked_list.append(pred)
+            continue
+
+        # Stage 1: derive document ranking from passage ranking (first-occurrence dedup)
+        seen_docs = set()
+        top_docs = []
+        for pid in pred:
+            doc_id = pid_to_doc.get(pid, pid.split("::", 1)[0] if "::" in pid else pid)
+            if doc_id not in seen_docs:
+                seen_docs.add(doc_id)
+                top_docs.append(doc_id)
+                if len(top_docs) >= topk_docs:
+                    break
+
+        # Collect ALL passage_ids from those top-K documents
+        candidate_pids = set()
+        for doc_id in top_docs:
+            candidate_pids.update(doc_to_pids.get(doc_id, set()))
+
+        # Stage 2: re-rank candidates by their original passage score (desc)
+        scored_candidates = []
+        for pid in candidate_pids:
+            s = scores.get(pid, None)
+            if s is not None:
+                scored_candidates.append((pid, s))
             else:
-                clean_name = task_key
-                
-            print_metric_table(task_results, clean_name)
-        
-    # Store the full retrieved_sections in results for analysis, but don't print it
-    results[results_key]['retrieved_sections_full'] = retrieved_sections
-    
-    # Run retrieved sections analysis if we have the data
-    if retrieved_sections:
-        from patentmap_eval.patenteval.utils import analyze_retrieved_sections_integrated
-        
-        # Analyze retrieved sections distribution
-        section_analysis = analyze_retrieved_sections_integrated(
-            retrieved_sections, 
-            query_section=texttype_q, 
-            print_results=True
-        )
-        results[results_key]['section_analysis'] = section_analysis
+                # Passage from a top-K doc but not scored (e.g. it was beyond the initial
+                # top-N cutoff). Assign a very low score so it still appears after scored ones.
+                scored_candidates.append((pid, -1e9))
+        scored_candidates.sort(key=lambda x: -x[1])
+        reranked_list.append([pid for pid, _ in scored_candidates])
+
+    return reranked_list
 
 
 def clefip_passage_evaluation(
@@ -284,11 +355,18 @@ def clefip_passage_evaluation(
     qrels_passage_ids,
     k=100,
     model_label="Dense",
+    topk_docs=100,
+    save_rankings_path=None,
 ):
     """
     Evaluate CLEF-IP claims-to-passages: rank passages per query and compute metrics.
     qrels_passage_ids: dict topic_id -> list of relevant passage_ids (subset of passage_ids).
-    Uses same metrics as prior_art: recall@k, NDCG@k, MRR, MAP, PRES@100.
+    Official CLEF-IP metrics: document-level PRES@100 (pres_doc@100), passage-level MAgP (magp),
+    plus recall@k, NDCG@k, MRR, MAP, pres@100 (passage-level).
+
+    Two-stage retrieval is always applied:
+      Stage 1: passage rank → document dedup → top-K documents.
+      Stage 2: re-rank ALL passages from those top-K docs by cosine similarity.
     """
     assert len(query_ids) == len(query_embeddings)
     assert len(passage_ids) == len(passage_embeddings)
@@ -299,15 +377,25 @@ def clefip_passage_evaluation(
     faiss.normalize_L2(D)
     _report_dense_flops(Q, D, "CLEF-IP passage", model_label=model_label)
     sim = Q @ D.T
-    top_k_indices = np.argsort(-sim, axis=1)[:, :k]
-    true_labels_list = []
-    predicted_labels_list = []
+    # Full ranking for Stage 1 document derivation (dense has all scores, no need to truncate)
+    full_ranking_indices = np.argsort(-sim, axis=1)
+    predicted_labels_list_s1 = []
+    passage_scores_list = []
     for q_idx, qid in enumerate(query_ids):
-        true_labels_list.append(qrels_passage_ids.get(qid, []))
-        predicted_labels_list.append([passage_ids[j] for j in top_k_indices[q_idx]])
-    results = _make_prior_art_metrics(true_labels_list, predicted_labels_list)
-    print_subsection_header("CLEF-IP 2013 EN claims-to-passages")
-    print_metric_table(results, "Passage retrieval")
+        ranked_pids = [passage_ids[j] for j in full_ranking_indices[q_idx]]
+        predicted_labels_list_s1.append(ranked_pids)
+        scores = {passage_ids[j]: float(sim[q_idx, j]) for j in range(sim.shape[1])}
+        passage_scores_list.append(scores)
+    predicted_labels_list = _clefip_two_stage_rerank(
+        passage_ids, predicted_labels_list_s1, passage_scores_list,
+        topk_docs=topk_docs,
+    )
+    print(f"  🔄 Two-stage retrieval: top-{topk_docs} docs → re-ranked passages per query")
+    results = _evaluate_and_print_clefip(
+        qrels_passage_ids, query_ids, predicted_labels_list,
+        "Passage retrieval", save_path=save_rankings_path,
+        two_stage=True, topk_docs=topk_docs,
+    )
     return results
 
 
@@ -323,10 +411,211 @@ def _clefip_passage_section(passage_id: str) -> str:
     return "description"
 
 
+def _clefip_passage_id_to_doc_id(passage_id: str) -> str:
+    """Extract doc_id from passage_id (format doc_id::xpath)."""
+    return passage_id.split("::", 1)[0] if "::" in passage_id else passage_id
+
+
+def _save_rankings(save_path: str, query_ids, predicted_labels_list: list, label: str = ""):
+    """Save ranked list to JSON if save_path is set. Format: {query_id: [id, ...]}."""
+    if not save_path:
+        return
+    ranking_dict = {str(query_ids[i]): predicted_labels_list[i]
+                    for i in range(len(predicted_labels_list))}
+    with open(save_path, "w") as f:
+        json.dump(ranking_dict, f, indent=0)
+    print(f"   Saved {label} rankings to {save_path} ({len(predicted_labels_list)} queries)")
+
+
+def _clefip_derive_doc_level_rankings(
+    query_ids: list,
+    qrels_passage_ids: dict,
+    predicted_passage_labels_list: list,
+    k: int = 100,
+) -> tuple:
+    """
+    Convert passage-level qrels and predictions to document-level for official metrics.
+    Returns (true_doc_ids_list, predicted_doc_ranking_list).
+    - true_doc_ids_list: for each query, list of relevant doc_ids (from qrels passages).
+    - predicted_doc_ranking_list: for each query, list of unique doc_ids in order of first appearance in top-k passages.
+    """
+    true_doc_ids_list = []
+    predicted_doc_ranking_list = []
+    for q_idx, qid in enumerate(query_ids):
+        # Relevant docs = docs that have at least one relevant passage in qrels
+        rel_passages = qrels_passage_ids.get(qid, [])
+        true_doc_ids_list.append(list({_clefip_passage_id_to_doc_id(pid) for pid in rel_passages}))
+        # Predicted doc ranking: unique doc_ids in order of first occurrence in top-k predicted passages
+        seen = set()
+        doc_ranking = []
+        pred_list = predicted_passage_labels_list[q_idx][:k] if q_idx < len(predicted_passage_labels_list) else []
+        for pid in pred_list:
+            doc_id = _clefip_passage_id_to_doc_id(pid)
+            if doc_id not in seen:
+                seen.add(doc_id)
+                doc_ranking.append(doc_id)
+        predicted_doc_ranking_list.append(doc_ranking)
+    return true_doc_ids_list, predicted_doc_ranking_list
+
+
+def _clefip_mean_agp_passage(true_labels_list: list, predicted_labels_list: list, k: int = 100) -> float:
+    """
+    Official CLEF-IP passage-level MAP(D) — Mean Average Precision at Document level.
+
+    Per Piroi et al. (CLEF-IP 2012), passage-level evaluation measures system
+    performance for ranking passages *within each relevant document*:
+
+      1. For each relevant document D_i of topic T, extract the subsequence of
+         passages belonging to D_i from the system's global passage ranking
+         (preserving relative order).
+      2. Compute AP(D_i; T) on that document-local ranking:
+           AP(D_i; T) = (1 / n_p(D_i; T)) * sum_r [Precision(r) * rel(r)]
+         where r indexes the document-local ranked list, n_p is the number of
+         relevant passages in D_i for topic T.
+      3. Average across all relevant documents of the topic:
+           AP(D; T) = sum_i AP(D_i; T) / n(T)
+      4. Average across all topics to get MAP(D).
+
+    If a relevant document has zero passages retrieved, AP(D_i) = 0 (recall penalty).
+    """
+    if not true_labels_list:
+        return 0.0
+
+    topic_scores = []
+    for q_true_passages, q_pred_passages in zip(true_labels_list, predicted_labels_list):
+        if not q_true_passages:
+            # No relevant passages for this topic — skip (undefined)
+            continue
+
+        # Group relevant passages by document
+        doc_to_rel_passages: dict[str, set] = {}
+        for pid in q_true_passages:
+            doc_id = _clefip_passage_id_to_doc_id(pid)
+            doc_to_rel_passages.setdefault(doc_id, set()).add(pid)
+
+        n_relevant_docs = len(doc_to_rel_passages)
+        if n_relevant_docs == 0:
+            continue
+
+        # Truncate predicted list to top-k
+        pred_truncated = q_pred_passages[:k] if k else q_pred_passages
+
+        doc_ap_sum = 0.0
+        for doc_id, rel_pids in doc_to_rel_passages.items():
+            # Extract document-local subsequence from predicted ranking
+            doc_local_ranking = [
+                pid for pid in pred_truncated
+                if _clefip_passage_id_to_doc_id(pid) == doc_id
+            ]
+            # Compute AP within this document-local ranking
+            n_rel = len(rel_pids)
+            hits = 0
+            ap_sum = 0.0
+            for rank_idx, pid in enumerate(doc_local_ranking):
+                if pid in rel_pids:
+                    hits += 1
+                    ap_sum += hits / (rank_idx + 1)
+            ap_d = ap_sum / n_rel  # 0 if no hits (recall penalty)
+            doc_ap_sum += ap_d
+
+        topic_scores.append(doc_ap_sum / n_relevant_docs)
+
+    return float(np.mean(topic_scores)) if topic_scores else 0.0
+
+
+def _get_clefip_dense_encoder(args, model_name: str, device):
+    """
+    Load the dense model for CLEF-IP and return (encode_fn, model_label).
+    encode_fn(texts: list[str], batch_size=32) -> np.ndarray.
+    """
+    def _batch_encode(texts, tokenizer, model, device, forward_and_pool, hidden_size, batch_size=32):
+        """Batch-encode texts with a custom forward+pool function.
+        forward_and_pool(inp_dict) -> np.ndarray (cpu, 2D)."""
+        embs = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            inp = tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt").to(device)
+            with torch.no_grad():
+                embs.append(forward_and_pool(model, inp))
+        return np.vstack(embs) if embs else np.zeros((0, hidden_size), dtype=np.float32)
+
+    if model_name in ["allenai/specter2_base"]:
+        from adapters import AutoAdapterModel
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        model = AutoAdapterModel.from_pretrained(args.model_name)
+        model.load_adapter("allenai/specter2", source="hf", load_as="specter2", set_active=True)
+        model.to(device)
+
+        def _fwd_cls(m, inp):
+            return cls_pooling(m(**inp), inp["attention_mask"]).cpu().numpy()
+        def _encode(texts, batch_size=32):
+            return _batch_encode(texts, tokenizer, model, device, _fwd_cls, model.config.hidden_size, batch_size)
+        return _encode, "Specter2"
+
+    if model_name in ["mpi-inno-comp/paecter", "anferico/bert-for-patents"]:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        model = AutoModel.from_pretrained(args.model_name)
+        if "anferico/bert-for-patents" in model_name:
+            tokenizer.add_special_tokens({'additional_special_tokens': ['[abstract]', '[claim]', '[invention]']})
+            model.resize_token_embeddings(len(tokenizer))
+        model.to(device)
+
+        def _fwd_mean(m, inp):
+            return mean_pooling(m(**inp).last_hidden_state, inp["attention_mask"]).cpu().numpy()
+        def _encode(texts, batch_size=32):
+            return _batch_encode(texts, tokenizer, model, device, _fwd_mean, model.config.hidden_size, batch_size)
+        return _encode, "PAECTer" if "paecter" in model_name else "bert-for-patents"
+
+    if model_name in ["datalyes/patembed-large", "patembed-large"]:
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer("datalyes/patembed-large")
+        model.to(device)
+        PATEN_TEB_RETRIEVAL_PROMPT_NAME = "retrieval_MIXED"
+        def _encode(texts, batch_size=256, role="document"):
+            try:
+                if role == "query":
+                    return model.encode_query(texts, prompt_name=PATEN_TEB_RETRIEVAL_PROMPT_NAME, batch_size=batch_size, show_progress_bar=False, convert_to_numpy=True)
+                return model.encode_document(texts, prompt_name=PATEN_TEB_RETRIEVAL_PROMPT_NAME, batch_size=batch_size, show_progress_bar=False, convert_to_numpy=True)
+            except (TypeError, AttributeError):
+                return model.encode(texts, batch_size=batch_size, show_progress_bar=False, convert_to_numpy=True)
+        return _encode, "Patembed"
+
+    # PatentMap models: pooler_output / CLS pooling + section tokens
+    if "patentmap" in model_name.lower():
+        import utils
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        model = AutoModel.from_pretrained(args.model_name, trust_remote_code=True)
+        utils.ensure_section_tokens(tokenizer, model)
+        model.to(device).eval()
+
+        def _fwd_patentmap(m, inp):
+            try:
+                out = m(**inp, output_hidden_states=True, return_dict=True, sent_emb=True)
+                return out.pooler_output.cpu().numpy()
+            except TypeError:
+                out = m(**inp, output_hidden_states=True, return_dict=True)
+                return out.last_hidden_state[:, 0].cpu().numpy()
+        def _encode(texts, batch_size=32):
+            return _batch_encode(texts, tokenizer, model, device, _fwd_patentmap, model.config.hidden_size, batch_size)
+        return _encode, "PatentMap"
+
+    # Fallback
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    model = AutoModel.from_pretrained(args.model_name)
+    model.to(device)
+
+    def _fwd_mean(m, inp):
+        return mean_pooling(m(**inp).last_hidden_state, inp["attention_mask"]).cpu().numpy()
+    def _encode(texts, batch_size=32):
+        return _batch_encode(texts, tokenizer, model, device, _fwd_mean, model.config.hidden_size, batch_size)
+        return np.vstack(embs) if embs else np.zeros((0, model.config.hidden_size), dtype=np.float32)
+    return _encode, "Dense"
+
+
 def _clefip_format_for_model(query_texts, passage_ids, passage_texts, model_name):
     """
     Format CLEF-IP query/passage texts per utils encoder format scheme. Returns (query_list, passage_list).
-    - ENCODER_FORMAT_TITLE_SEP_ONLY (Specter2, PatentBERT, PAECTer, Patembed): raw text, no section tokens.
+    - ENCODER_FORMAT_TITLE_SEP_ONLY (Specter2, PAECTer, Patembed): raw text, no section tokens.
     - ENCODER_FORMAT_SECTION_TOKENS (e.g. bert-for-patents): [claim] query, [abstract]/[invention]/[claim] passage.
     """
     if not query_texts or not passage_texts:
@@ -362,10 +651,7 @@ def _report_flops_and_postings_one_line(
     if total_flops is not None and n_queries > 0:
         print(f"   FLOPs: total={total_flops:,}, mean per query={total_flops // n_queries:,} (2 × sum of posting lengths per query term)")
     else:
-        raise RuntimeError(
-            f"FLOPs evaluation required but not available for {model_label} {label}: "
-            "query term ids or vocab mapping unavailable. Ensure query_tokens_list is passed and retriever supports get_tokens_ids()."
-        )
+        print(f"   FLOPs: not available (query term ids or vocab mapping unavailable)")
     print(f"   Total postings: {total_postings:,}, non-empty terms: {n_non_empty_terms:,} / {n_terms:,}")
 
 
@@ -477,8 +763,13 @@ def _splade_build_inverted_index(doc_sparse, vocab_size: int):
     return posting_lists, n_docs
 
 
-def _splade_retrieve_with_index(query_sparse, posting_lists, top_k: int):
-    """Term-at-a-time: for each query accumulate doc scores via posting lists. Returns list of top_k doc index arrays."""
+def _splade_retrieve_with_index(query_sparse, posting_lists, top_k: int, *, return_scores: bool = False):
+    """Term-at-a-time: for each query accumulate doc scores via posting lists.
+
+    Returns list of top_k doc index arrays.  When *return_scores* is True,
+    returns (top_indices, score_dicts) where score_dicts is a per-query list of
+    {doc_idx: float} covering **all** scored documents (not just top_k).
+    """
     if hasattr(query_sparse, "is_sparse") and query_sparse.is_sparse:
         query_sparse = query_sparse.coalesce()
         q_row = query_sparse.indices()[0].cpu().numpy()
@@ -498,6 +789,7 @@ def _splade_retrieve_with_index(query_sparse, posting_lists, top_k: int):
     for i in range(len(q_row)):
         q_terms[int(q_row[i])].append((int(q_col[i]), float(q_val[i])))
     top_indices = []
+    all_scores = [] if return_scores else None
     for q_idx in range(n_queries):
         doc_scores = defaultdict(float)
         for term_id, q_w in q_terms.get(q_idx, []):
@@ -510,6 +802,10 @@ def _splade_retrieve_with_index(query_sparse, posting_lists, top_k: int):
             doc_idx_arr = np.array(list(doc_scores.keys()))
             score_arr = np.array([doc_scores[d] for d in doc_idx_arr])
             top_indices.append(doc_idx_arr[np.argsort(-score_arr)[:top_k]])
+        if return_scores:
+            all_scores.append(dict(doc_scores))
+    if return_scores:
+        return top_indices, all_scores
     return top_indices
 
 
@@ -575,239 +871,305 @@ def _make_prior_art_metrics(true_labels_list, predicted_labels_list, k=100, **ex
     return metrics
 
 
-def _run_clefip_sparse_coverage(args, query_ids, query_texts, passage_ids, passage_texts, qrels_passage_ids):
-    """Sparse-coverage retrieval for CLEF-IP: passages are 'documents', queries are claims."""
-    import utils
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    if args.dense_model is None:
-        raise ValueError("--dense_model is required for sparse_coverage on CLEF-IP")
-
-    # Load model
-    tokenizer = AutoTokenizer.from_pretrained(args.dense_model)
-    model = AutoModel.from_pretrained(args.dense_model, trust_remote_code=True)
-    utils.ensure_section_tokens(tokenizer, model)
-    model.to(device).eval()
-    d = model.config.hidden_size
-
-    # SpaCy
-    if args.tokenization_unit != "encoder_token":
-        import spacy
-        if args.spacy_model.startswith("sci_"):
-            spacy_name = f"en_core_sci_{args.spacy_model[4:]}"
-        else:
-            spacy_name = f"en_core_web_{args.spacy_model}"
-        nlp = spacy.load(spacy_name, disable=["ner", "textcat", "lemmatizer"])
-        nlp.max_length = 1_000_000
-        utils.NLP = nlp
-
-    process_doc_batch = utils.process_doc_batch
-    include_cls = True
-
-    # Find centers (claim2all mode — queries are claims, passages are mixed sections)
-    try:
-        centers_path, _centers_dir = find_centers(
-            dense_model=args.dense_model,
-            tokenization_unit=args.tokenization_unit,
-            include_cls=include_cls,
-            search_dir=".",
-            mode="claim2all",
-            layer=getattr(args, "layer", "last"),
-            centers_suffix=getattr(args, "centers_suffix", ""),
-        )
-    except FileNotFoundError:
-        print("CLEF-IP sparse_coverage: no centers found for claim2all; skipping.")
-        return
-
-    centers = np.load(centers_path).astype(np.float32)
-    V, d_c = centers.shape
-    if d_c != d:
-        raise ValueError(f"Dimension mismatch: model={d}, centers={d_c}")
-    centers_json = centers_path.replace(".npy", ".json")
-    centers_info = {}
-    if os.path.exists(centers_json):
-        with open(centers_json, "r") as f:
-            centers_info = json.load(f)
-    r = float(centers_info.get("r", 0.1))
-    sim_threshold = 1.0 - r
-    stop_centers = set(centers_info.get("stop_centers", []))
-    if stop_centers:
-        print(f"CLEF-IP sparse_coverage: {len(stop_centers)} stop-centers disabled (df >= threshold)")
-
-    centers_norm = centers.copy()
-    faiss.normalize_L2(centers_norm)
-    center_index = faiss.IndexFlatIP(d)
-    center_index.add(centers_norm.astype(np.float32))
-    print(f"CLEF-IP sparse_coverage: {V:,} centers, r={r:.4f}")
-
-    # Derive section per passage and format text with section tokens
-    format_scheme = get_encoder_format_scheme(args.dense_model)
-    passage_sections_raw = [_clefip_passage_section(pid) for pid in passage_ids]
-    section_map = {"abstract": "abstract", "description": "invention", "claim": "claim"}
-
-    def _format_passage(text: str, sec_raw: str) -> str:
-        sec = section_map.get(sec_raw, sec_raw)
-        if sec == "claim":
-            return format_claim_for_encoder(format_scheme, text)
-        elif sec == "invention":
-            return format_invention_for_encoder(format_scheme, text)
-        return f"[abstract] {text}".strip() if format_scheme != "title_sep_only" else text
-
-    formatted_passages = [_format_passage(t, s) for t, s in zip(passage_texts, passage_sections_raw)]
-
-    # Encode passages grouped by section
-    print("Encoding passages...")
-    passage_embs: list[np.ndarray] = [None] * len(passage_ids)
-    for sec_raw in ["abstract", "claim", "description"]:
-        sec = section_map.get(sec_raw, sec_raw)
-        idxs = [i for i, s in enumerate(passage_sections_raw) if s == sec_raw]
-        if not idxs:
-            continue
-        texts = [formatted_passages[i] for i in idxs]
-        pids = [passage_ids[i] for i in idxs]
-        for b_start in tqdm(range(0, len(texts), 32), desc=f"  passages ({sec})", leave=False):
-            b_end = min(b_start + 32, len(texts))
-            results = process_doc_batch(
-                doc_texts=texts[b_start:b_end],
-                doc_ids=pids[b_start:b_end],
-                sections=[sec] * (b_end - b_start),
-                unit=args.tokenization_unit,
-                model=model, tokenizer=tokenizer, device=device,
-                max_length=512, keep_cls=include_cls, span_pooling="mean",
-                layer=getattr(args, "layer", "last"),
-            )
-            span_groups: dict[str, list[np.ndarray]] = {}
-            for doc_id, _s, _dt, _sr, _sc, emb in results:
-                span_groups.setdefault(doc_id, []).append(emb)
-            for local_i, pid in enumerate(pids[b_start:b_end]):
-                spans = span_groups.get(pid, [])
-                if spans:
-                    passage_embs[idxs[b_start + local_i]] = np.stack(spans).astype(np.float32)
-                else:
-                    passage_embs[idxs[b_start + local_i]] = np.zeros((0, d), dtype=np.float32)
-
-    # Build posting lists (passage-level): for each center, list of (passage_idx, weight)
-    print("Building posting lists...")
-    posting_lists: list[list[tuple[int, float]]] = [[] for _ in range(V)]
-    weight_agg = getattr(args, "weight_aggregation", "max")
-    for p_idx, p_spans in enumerate(tqdm(passage_embs, desc="  passages -> centers", leave=False)):
-        if p_spans is None or p_spans.shape[0] == 0:
-            continue
-        p_norm = p_spans.astype(np.float32).copy()
-        faiss.normalize_L2(p_norm)
-        lims, D, I = center_index.range_search(p_norm, sim_threshold)
-        center_weights: dict[int, float] = {}
-        for span_i in range(p_norm.shape[0]):
-            start, end = int(lims[span_i]), int(lims[span_i + 1])
-            for j in range(start, end):
-                c = int(I[j])
-                if c in stop_centers:
-                    continue
-                sim = float(D[j])
-                if sim <= 0:
-                    continue
-                if weight_agg == "sum":
-                    center_weights[c] = center_weights.get(c, 0.0) + sim
-                else:
-                    if sim > center_weights.get(c, 0.0):
-                        center_weights[c] = sim
-        for c, w in center_weights.items():
-            posting_lists[c].append((p_idx, w))
-
-    N_passages = len(passage_ids)
-    df = np.array([len(set(e[0] for e in pl)) if pl else 0 for pl in posting_lists], dtype=np.float32)
-    idf = (np.log((N_passages + 1.0) / (df + 1.0)) + 1.0).astype(np.float32)
-    idf_exponent = float(getattr(args, "idf_exponent", 1.0))
-
-    # Encode queries (claims — format with section tokens)
-    formatted_queries = [format_claim_for_encoder(format_scheme, qt) for qt in query_texts]
-    print("Encoding queries...")
-    query_spans_list: list[np.ndarray] = []
-    for b_start in tqdm(range(0, len(formatted_queries), 32), desc="  queries", leave=False):
-        b_end = min(b_start + 32, len(formatted_queries))
-        results = process_doc_batch(
-            doc_texts=formatted_queries[b_start:b_end],
-            doc_ids=[f"q_{i}" for i in range(b_start, b_end)],
-            sections=["claim"] * (b_end - b_start),
-            unit=args.tokenization_unit,
-            model=model, tokenizer=tokenizer, device=device,
-            max_length=512, keep_cls=include_cls, span_pooling="mean",
-            layer=getattr(args, "layer", "last"),
-        )
-        q_groups: dict[str, list[np.ndarray]] = {}
-        for doc_id, _s, _dt, _sr, _sc, emb in results:
-            q_groups.setdefault(doc_id, []).append(emb)
-        for qi in range(b_start, b_end):
-            spans = q_groups.get(f"q_{qi}", [])
-            if spans:
-                query_spans_list.append(np.stack(spans).astype(np.float32))
+def _display_prior_art_results(results: dict, results_key: str, retrieved_sections: list,
+                               query_section: str = "claim", header_suffix: str = ""):
+    """Print prior-art results table and run retrieved sections analysis if available."""
+    print_subsection_header(f"Prior Art Search Results{header_suffix}")
+    for task_key, task_results in results.items():
+        if isinstance(task_results, dict):
+            if '->' in task_key:
+                clean_name = f"Query: {task_key.split('->')[0]} → Document: {task_key.split('->')[1]}"
             else:
-                query_spans_list.append(np.zeros((0, d), dtype=np.float32))
-
-    # Retrieve: score passages per query
-    print("Retrieving...")
-    top_k = 100
-    predicted_labels: list[list[str]] = []
-    for q_idx, q_spans in enumerate(query_spans_list):
-        if q_spans.shape[0] == 0:
-            predicted_labels.append([])
-            continue
-        q_norm = q_spans.astype(np.float32).copy()
-        faiss.normalize_L2(q_norm)
-        lims, D, I = center_index.range_search(q_norm, sim_threshold)
-        q_center_weights: dict[int, float] = {}
-        for si in range(q_norm.shape[0]):
-            start, end = int(lims[si]), int(lims[si + 1])
-            for j in range(start, end):
-                c = int(I[j])
-                if c in stop_centers:
-                    continue
-                sim = float(D[j])
-                if sim > q_center_weights.get(c, 0.0):
-                    q_center_weights[c] = sim
-        passage_scores: dict[int, float] = {}
-        for c, q_sim in q_center_weights.items():
-            idf_t = float(idf[c]) ** idf_exponent
-            for p_idx, p_sim in posting_lists[c]:
-                score = q_sim * p_sim * idf_t
-                passage_scores[p_idx] = passage_scores.get(p_idx, 0.0) + score
-        sorted_p = sorted(passage_scores.items(), key=lambda x: -x[1])[:top_k]
-        predicted_labels.append([passage_ids[pi] for pi, _ in sorted_p])
-
-    true_labels = [qrels_passage_ids.get(qid, []) for qid in query_ids]
-    results = _make_prior_art_metrics(true_labels, predicted_labels)
-    print_subsection_header("CLEF-IP 2013 EN claims-to-passages")
-    print_metric_table(results, "Sparse Coverage (CLEF-IP)")
+                clean_name = task_key
+            print_metric_table(task_results, clean_name)
+    results[results_key]['retrieved_sections_full'] = retrieved_sections
+    if retrieved_sections:
+        from patentmap_eval.patenteval.utils import analyze_retrieved_sections_integrated
+        section_analysis = analyze_retrieved_sections_integrated(
+            retrieved_sections, query_section=query_section, print_results=True,
+        )
+        results[results_key]['section_analysis'] = section_analysis
 
 
-def run_clefip_eval(args):
-    """Load CLEF-IP EN data, run the selected model, and evaluate passage retrieval."""
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    clefip_root = os.path.join(current_dir, "clefip2013")
-    if not os.path.isdir(clefip_root):
-        raise FileNotFoundError(f"CLEF-IP root not found: {clefip_root}")
-    if current_dir not in sys.path:
-        sys.path.insert(0, current_dir)
-    from clefip2013.load_clefip import load_clefip_en_for_eval
-    doc_root = getattr(args, "clefip_doc_root", None)
-    if not doc_root:
-        print("CLEF-IP skipped: --clefip_doc_root not set (required for official task).")
-        return
-    print("Loading CLEF-IP 2013 EN (claims-to-passages, official 01 collection)...")
-    query_ids, query_texts, passage_ids, passage_texts, qrels_passage_ids = load_clefip_en_for_eval(
-        clefip_root, doc_collection_root=doc_root
+def _make_clefip_official_metrics(
+    true_labels_list: list,
+    predicted_labels_list: list,
+    k: int = 100,
+) -> dict:
+    """
+    CLEF-IP official metrics: passage-level + document-level.
+    - Passage: recall@k, NDCG@k, MRR, MAP (flat), pres@100.
+    - Official passage-level: MAP(D) (per-document AP averaged over relevant docs,
+      then over topics; Piroi et al. CLEF-IP 2012 Eq. 1-2). Reported as "magp".
+    - Document: pres_doc@100 (PRES on doc ranking derived from passage ranking).
+    """
+    # Passage-level (same as prior-art)
+    metrics = _make_prior_art_metrics(true_labels_list, predicted_labels_list, k=k)
+    # Official passage-level: MAP(D) — hierarchical per-document AP (Piroi et al. 2012)
+    metrics["magp"] = _clefip_mean_agp_passage(true_labels_list, predicted_labels_list, k=k)
+    # Document-level PRES@100: derive doc rankings from passage rankings (official CLEF-IP doc-level metric)
+    qids_fake = list(range(len(true_labels_list)))
+    qrels_by_idx = {i: true_labels_list[i] for i in range(len(true_labels_list))}
+    true_doc_ids_list, predicted_doc_ranking_list = _clefip_derive_doc_level_rankings(
+        qids_fake, qrels_by_idx, predicted_labels_list, k=k
     )
-    print(f"  Queries: {len(query_ids)}, Passages: {len(passage_ids)}")
+    metrics["pres_doc@100"] = mean_pres_at_k(true_doc_ids_list, predicted_doc_ranking_list, k=100, N_max=100)
+    # Additional doc-level metrics
+    metrics["recall_doc@100"] = mean_recall_at_k(true_doc_ids_list, predicted_doc_ranking_list, k=100)
+    metrics["ndcg_doc@100"] = mean_ndcg_at_k(true_doc_ids_list, predicted_doc_ranking_list, k=100)
+    metrics["map_doc"] = mean_average_precision(true_doc_ids_list, predicted_doc_ranking_list, k=100)
+    return metrics
+
+
+def _evaluate_and_print_clefip(
+    qrels: dict,
+    query_ids: list,
+    predicted_labels_list: list,
+    model_label: str,
+    *,
+    save_path: "Optional[str]" = None,
+    two_stage: bool = True,
+    topk_docs: int = 100,
+    header_extra: str = "",
+) -> dict:
+    """Evaluate CLEF-IP passage retrieval: compute metrics, print, save rankings."""
+    true_labels_list = [qrels.get(qid, []) for qid in query_ids]
+    results = _make_clefip_official_metrics(true_labels_list, predicted_labels_list)
+    label_suffix = f" (two-stage top-{topk_docs} docs)" if two_stage else ""
+    print_subsection_header(f"CLEF-IP 2013 EN claims-to-passages{header_extra}{label_suffix}")
+    print_metric_table(results, f"{model_label}{label_suffix}")
+    _save_rankings(save_path, query_ids, predicted_labels_list, "CLEF-IP passage")
+    return results
+
+
+def _score_queries_against_postings(
+    query_sparse: list,
+    doc_postings: list,
+    idf: "np.ndarray",
+    idf_exponent: float,
+    top_k: int,
+    *,
+    pca_proj_alpha: float = 0.0,
+    angle_sim_beta: float = 0.0,
+    residual_alpha: float = 0.0,
+    center_dot_pca: "Optional[np.ndarray]" = None,
+    length_norm: str = "none",
+    length_norm_exp: float = 0.5,
+    doc_nspans: "Optional[np.ndarray]" = None,
+    show_progress: bool = True,
+) -> list:
+    """Score queries against an inverted index and return top-k doc indices per query.
+
+    Handles both the fast path (pure q_sim * d_sim * idf^alpha) and the full path
+    (with PCA projection, angle similarity, and residual correction terms).
+
+    Parameters
+    ----------
+    query_sparse : list of (terms, weights, projs) tuples
+    doc_postings : list of posting lists; doc_postings[center_id] = [(doc_idx, d_weight, d_proj), ...]
+    idf : ndarray (V,)
+    idf_exponent : float
+    top_k : int
+    pca_proj_alpha, angle_sim_beta, residual_alpha : float
+        Scoring feature weights (0.0 disables the feature).
+    center_dot_pca : ndarray or None
+        Pre-computed centers_norm[c] @ center_pca_dirs[c] for residual term.
+    length_norm : str  — "sqrt_spans" to enable length normalization.
+    length_norm_exp : float
+    doc_nspans : ndarray or None  — per-document span counts.
+    show_progress : bool
+
+    Returns
+    -------
+    list[list[int]]  — per-query top-k document indices, descending by score.
+    """
+    _use_proj = (pca_proj_alpha != 0.0
+                 or angle_sim_beta != 0.0
+                 or (residual_alpha != 0.0 and center_dot_pca is not None))
+    _use_len_norm = (length_norm == "sqrt_spans" and doc_nspans is not None)
+
+    top_indices: list[list[int]] = []
+    iterator = enumerate(query_sparse)
+    if show_progress:
+        iterator = enumerate(tqdm(query_sparse, desc="Retrieving"))
+
+    for _q_idx, qpack in iterator:
+        terms, weights, projs = qpack[0], qpack[1], qpack[2]
+        doc_scores: dict[int, float] = {}
+
+        if not _use_proj:
+            # Fast path: score = q_sim * d_sim * idf^alpha
+            for i, term in enumerate(terms):
+                pl = doc_postings[term]
+                if not pl:
+                    continue
+                q_idf = float(weights[i]) * (float(idf[term]) ** idf_exponent)
+                for doc_idx, d_weight, _ in pl:
+                    doc_scores[doc_idx] = doc_scores.get(doc_idx, 0.0) + q_idf * float(d_weight)
+        else:
+            # Full path: PCA projection / angle similarity / residual terms
+            for i, term in enumerate(terms):
+                pl = doc_postings[term]
+                if not pl:
+                    continue
+                q_sim = float(weights[i])
+                q_proj = float(projs[i]) if i < len(projs) else 0.0
+                idf_t = float(idf[term]) ** idf_exponent
+                for doc_idx, d_weight, d_proj in pl:
+                    d_sim = float(d_weight)
+                    sim_approx = q_sim * d_sim
+                    if pca_proj_alpha != 0.0:
+                        sim_approx += pca_proj_alpha * q_proj * float(d_proj)
+                    contrib = sim_approx * idf_t
+                    if angle_sim_beta != 0.0:
+                        contrib += angle_sim_beta * (1.0 - abs(q_sim - d_sim)) * idf_t
+                    if residual_alpha != 0.0 and center_dot_pca is not None:
+                        cdu = float(center_dot_pca[term])
+                        q_res_proj = q_proj - q_sim * cdu
+                        d_res_proj = float(d_proj) - d_sim * cdu
+                        contrib += residual_alpha * (q_res_proj * d_res_proj) * idf_t
+                    doc_scores[doc_idx] = doc_scores.get(doc_idx, 0.0) + contrib
+
+        # Apply document length normalization
+        if _use_len_norm and doc_scores:
+            for doc_idx in list(doc_scores.keys()):
+                norm_factor = max(doc_nspans[doc_idx] ** length_norm_exp, 1e-6)
+                doc_scores[doc_idx] /= norm_factor
+
+        if doc_scores:
+            sorted_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
+            top_indices.append([doc_idx for doc_idx, _ in sorted_docs[:top_k]])
+        else:
+            top_indices.append([])
+
+    return top_indices
+
+
+# ── ColBERT helpers ──────────────────────────────────────────────────────────
+
+_COLBERT_MODEL_NAMES = {"colbert", "colbertv2", "colbert-ir/colbertv2.0"}
+
+
+def _colbert_encode(checkpoint, texts: list, is_query: bool = False, batch_size: int = 32) -> list:
+    """Encode *texts* with a ColBERT checkpoint into per-token embeddings.
+
+    Returns a list of numpy arrays, each shaped ``[n_tokens, dim]``.
+    For queries the checkpoint pads with [MASK] to ``query_maxlen`` and returns
+    a fixed-length matrix; for documents length varies with actual tokens.
+    """
+    import torch as _th
+    all_embs: list[np.ndarray] = []
+    _label = "queries" if is_query else "documents"
+    for i in trange(0, len(texts), batch_size, desc=f"ColBERT encode {_label}"):
+        batch = texts[i : i + batch_size]
+        with _th.no_grad():
+            if is_query:
+                embs = checkpoint.queryFromText(batch)           # [B, query_maxlen, dim]
+            else:
+                embs = checkpoint.docFromText(batch, bsize=batch_size)  # [B, *, dim]
+        if isinstance(embs, _th.Tensor):
+            embs_np = embs.cpu().float().numpy()
+            for j in range(embs_np.shape[0]):
+                all_embs.append(embs_np[j])  # [n_tok, dim]
+        elif isinstance(embs, (list, tuple)):
+            for e in embs:
+                all_embs.append(e.cpu().float().numpy() if isinstance(e, _th.Tensor) else np.asarray(e, dtype=np.float32))
+        else:
+            all_embs.append(embs.cpu().float().numpy() if isinstance(embs, _th.Tensor) else np.asarray(embs, dtype=np.float32))
+    return all_embs
+
+
+def _colbert_maxsim_matrix(query_embs: list, doc_embs: list, batch_doc: int = 512) -> np.ndarray:
+    """Compute the MaxSim similarity matrix ``[n_queries, n_docs]``.
+
+    For each query token, take the max cosine similarity with any document
+    token, then sum over query tokens:
+
+        score(q, d) = sum_i max_j (q_i · d_j)
+
+    All embeddings are assumed **already** L2-normalised (ColBERT checkpoint
+    normalises internally).
+
+    Documents are padded and batched (size *batch_doc*) for vectorised torch
+    computation on GPU/CPU.  This is orders of magnitude faster than the naive
+    Python loop.
+    """
+    import torch as _th
+    _device = _th.device("cuda" if _th.cuda.is_available() else "cpu")
+    n_q = len(query_embs)
+    n_d = len(doc_embs)
+    sim = np.zeros((n_q, n_d), dtype=np.float32)
+
+    for q_idx in tqdm(range(n_q), desc="MaxSim scoring"):
+        q = _th.from_numpy(query_embs[q_idx]).to(_device)  # [q_tok, dim]
+        for d_start in range(0, n_d, batch_doc):
+            d_end = min(d_start + batch_doc, n_d)
+            batch = [doc_embs[j] for j in range(d_start, d_end)]
+            lengths = [d.shape[0] for d in batch]
+            max_d_tok = max(lengths)
+            B = len(batch)
+            # Pad documents to same length → [B, max_d_tok, dim]
+            D = _th.zeros(B, max_d_tok, q.shape[1], device=_device)
+            mask = _th.zeros(B, max_d_tok, device=_device, dtype=_th.bool)
+            for i, d_np in enumerate(batch):
+                L = d_np.shape[0]
+                D[i, :L] = _th.from_numpy(d_np)
+                mask[i, :L] = True
+            # Batched MaxSim: q [q_tok, dim] × D [B, d_tok, dim]^T → [B, q_tok, d_tok]
+            scores = _th.einsum("qd,bkd->bqk", q, D)
+            # Mask padding positions to -inf so they never win the max
+            scores.masked_fill_(~mask.unsqueeze(1), float("-inf"))
+            # max over d_tok → [B, q_tok], sum over q_tok → [B]
+            sim[q_idx, d_start:d_end] = scores.max(dim=2).values.sum(dim=1).cpu().numpy()
+    return sim
+
+
+def _colbert_maxsim_rankings_and_scores(
+    query_embs: list, doc_embs: list, doc_ids: list
+) -> tuple:
+    """Compute MaxSim, derive ranked ID lists and per-query score dicts.
+
+    Returns ``(predicted_labels_list, passage_scores_list)`` ready for
+    ``_clefip_two_stage_rerank``.
+    """
+    sim = _colbert_maxsim_matrix(query_embs, doc_embs)
+    predicted_labels_list = []
+    passage_scores_list = []
+    ranking_indices = np.argsort(-sim, axis=1)
+    for q_idx in range(sim.shape[0]):
+        ranked_ids = [doc_ids[j] for j in ranking_indices[q_idx]]
+        scores = {doc_ids[j]: float(sim[q_idx, j]) for j in range(sim.shape[1])}
+        predicted_labels_list.append(ranked_ids)
+        passage_scores_list.append(scores)
+    return predicted_labels_list, passage_scores_list
+
+
+def _run_clefip_eval_full_corpus(
+    args,
+    query_ids: list,
+    query_texts: list,
+    passage_ids: list,
+    corpus_jsonl_path: str,
+    ids_txt_path: str,
+    qrels_passage_ids: dict,
+    save_rankings_path: str = None,
+):
+    """Run CLEF-IP retrieval over the full 01 passage corpus (streaming where possible)."""
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_name = args.model_name.lower() if hasattr(args.model_name, "lower") else str(args.model_name).lower()
+    model_name = (args.model_name or "").lower() if hasattr(args.model_name, "lower") else str(args.model_name or "").lower()
 
-    if model_name == "sparse_coverage":
-        _run_clefip_sparse_coverage(args, query_ids, query_texts, passage_ids, passage_texts, qrels_passage_ids)
-        return
+    topk_docs = getattr(args, "clefip_two_stage_topk_docs", 100)
 
     if model_name == "bm25":
-        # Use same BM25 stack as prior-art: bm25s + stemmer, one logic for both tasks
+        # Load all passage texts from JSONL (same order as passage_ids); may be heavy for huge corpora
+        print("Loading passage texts from corpus for BM25...", flush=True)
+        passage_texts = []
+        with open(corpus_jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                rec = json.loads(line)
+                passage_texts.append(rec["text"])
+        assert len(passage_texts) == len(passage_ids)
         import bm25s
         import snowballstemmer
         stemmer = snowballstemmer.stemmer("english")
@@ -815,109 +1177,406 @@ def run_clefip_eval(args):
         query_tokens = bm25s.tokenize(query_texts, stemmer=stemmer)
         retriever = bm25s.BM25()
         retriever.index(passage_tokens)
-        _report_bm25_posting_stats(retriever, "CLEF-IP passage", query_tokens_list=query_tokens)
+        _report_bm25_posting_stats(retriever, "CLEF-IP passage (full corpus)", query_tokens_list=query_tokens)
         k = 100
-        clefip_results, _ = retriever.retrieve(query_tokens, k=k)
+        clefip_results, clefip_scores = retriever.retrieve(query_tokens, k=len(passage_ids))
         predicted_labels_list = [[passage_ids[j] for j in result] for result in clefip_results]
-        true_labels_list = [qrels_passage_ids.get(qid, []) for qid in query_ids]
-        results = _make_prior_art_metrics(true_labels_list, predicted_labels_list)
-        print_subsection_header("CLEF-IP 2013 EN claims-to-passages")
-        print_metric_table(results, "BM25 passage retrieval")
+        # Build per-query score dicts from BM25 retrieval results
+        passage_scores_list = []
+        for q_idx in range(len(clefip_results)):
+            scores = {passage_ids[int(clefip_results[q_idx][j])]: float(clefip_scores[q_idx][j])
+                      for j in range(len(clefip_results[q_idx]))}
+            passage_scores_list.append(scores)
+        predicted_labels_list = _clefip_two_stage_rerank(
+            passage_ids, predicted_labels_list, passage_scores_list,
+            topk_docs=topk_docs,
+        )
+        print(f"  🔄 Two-stage retrieval: top-{topk_docs} docs → re-ranked passages per query")
+        _evaluate_and_print_clefip(
+            qrels_passage_ids, query_ids, predicted_labels_list,
+            "BM25 passage retrieval", save_path=save_rankings_path,
+            two_stage=True, topk_docs=topk_docs, header_extra=" (full 01 corpus)",
+        )
         return
 
-    # Format query/passage for dense models (section tags like prior-art)
-    query_texts, passage_texts = _clefip_format_for_model(query_texts, passage_ids, passage_texts, args.model_name)
+    if model_name in ["naver/splade-v2", "splade-v2", "naver/splade_v2_max", "naver/splade_v2_distil"]:
+        splade_model_map = {
+            "splade-v2": "naver/splade-cocondenser-ensembledistil",
+            "naver/splade-v2": "naver/splade-cocondenser-ensembledistil",
+            "naver/splade_v2_max": "naver/splade_v2_max",
+            "naver/splade_v2_distil": "naver/splade_v2_distil",
+        }
+        actual_model_name = splade_model_map.get(model_name, model_name)
 
-    # Dense models: encode with model-appropriate input format
-    if model_name in ["allenai/specter2_base", "patentbert"]:
-        from adapters import AutoAdapterModel
-        if model_name == "patentbert":
-            model_path = "./PatentBert/encoder_only_model"
-            tokenizer = AutoTokenizer.from_pretrained(model_path)
-            model = AutoAdapterModel.from_pretrained(model_path)
-        else:
-            tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-            model = AutoAdapterModel.from_pretrained(args.model_name)
-            model.load_adapter("allenai/specter2", source="hf", load_as="specter2", set_active=True)
-        model.to(device)
-        # Specter2/PatentBERT use title_sep_only (no section tokens); no add_special_tokens needed for CLEF-IP raw text
-        def _encode(texts, batch_size=32):
-            embs = []
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i : i + batch_size]
-                inp = tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt").to(device)
-                with torch.no_grad():
-                    out = model(**inp)
-                embs.append(cls_pooling(out.last_hidden_state, inp["attention_mask"]).cpu().numpy())
-            return np.vstack(embs)
-        query_emb = _encode(query_texts)
-        passage_emb = _encode(passage_texts)
-        _cl_label = "Specter2" if "specter" in model_name else "PatentBERT"
-        clefip_passage_evaluation(query_ids, passage_ids, query_emb, passage_emb, qrels_passage_ids, k=100, model_label=_cl_label)
+        # ---- SPLADE sparse embedding cache ----
+        from scipy.sparse import save_npz as _sp_save_npz, load_npz as _sp_load_npz
+        _splade_clean = (args.model_name or "").rstrip("/").replace("/", "_").strip("_")
+        _sample_sz = getattr(args, "clefip_sample_size", 0) or 0
+        _splade_cache_dir = os.path.join("temp", "clefip_splade_cache", f"{_splade_clean}_s{_sample_sz}")
+        _splade_q_path = os.path.join(_splade_cache_dir, "query_sparse.npz")
+        _splade_p_path = os.path.join(_splade_cache_dir, "passage_sparse.npz")
+        _splade_meta_path = os.path.join(_splade_cache_dir, "meta.json")
+
+        _splade_cache_hit = False
+        if os.path.isfile(_splade_q_path) and os.path.isfile(_splade_p_path) and os.path.isfile(_splade_meta_path):
+            try:
+                with open(_splade_meta_path, "r") as _mf:
+                    _splade_meta = json.load(_mf)
+                if (_splade_meta.get("n_queries") == len(query_ids)
+                        and _splade_meta.get("n_passages") == len(passage_ids)
+                        and _splade_meta.get("model") == actual_model_name):
+                    Q = _sp_load_npz(_splade_q_path)
+                    D = _sp_load_npz(_splade_p_path)
+                    _splade_cache_hit = True
+                    print(f"✅ Loaded SPLADE cache from {_splade_cache_dir}")
+                    print(f"   queries: {Q.shape}, passages: {D.shape}")
+                else:
+                    print(f"⚠️  SPLADE cache metadata mismatch, re-encoding...")
+            except Exception as e:
+                print(f"⚠️  SPLADE cache load failed ({e}), re-encoding...")
+
+        if not _splade_cache_hit:
+            print(f"Loading passage texts from corpus for SPLADE...", flush=True)
+            passage_texts = []
+            with open(corpus_jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    rec = json.loads(line)
+                    passage_texts.append(rec["text"])
+            assert len(passage_texts) == len(passage_ids)
+
+            from sentence_transformers import SparseEncoder
+            splade_model = SparseEncoder(actual_model_name)
+            encode_bs = _auto_batch_size(device, hidden_size=768)
+            print(f"  Encoding {len(query_texts)} queries...", flush=True)
+            query_sparse = splade_model.encode_query(query_texts, batch_size=encode_bs, show_progress_bar=True)
+            print(f"  Encoding {len(passage_texts)} passages...", flush=True)
+            passage_sparse = splade_model.encode_document(passage_texts, batch_size=encode_bs, show_progress_bar=True)
+
+            def _sparse_torch_to_csr(t):
+                """Convert torch sparse tensor → scipy CSR without dense."""
+                import torch as _th
+                t = t.cpu().coalesce()
+                idx = t.indices().numpy()
+                vals = t.values().numpy()
+                from scipy.sparse import coo_matrix as _coo
+                return _coo((vals, (idx[0], idx[1])), shape=t.shape).tocsr()
+
+            if hasattr(query_sparse, "is_sparse") and query_sparse.is_sparse:
+                Q = _sparse_torch_to_csr(query_sparse)
+            else:
+                q_np = query_sparse.cpu().numpy() if hasattr(query_sparse, "cpu") else np.asarray(query_sparse)
+                Q = csr_matrix(q_np)
+            if hasattr(passage_sparse, "is_sparse") and passage_sparse.is_sparse:
+                D = _sparse_torch_to_csr(passage_sparse)
+            else:
+                d_np = passage_sparse.cpu().numpy() if hasattr(passage_sparse, "cpu") else np.asarray(passage_sparse)
+                D = csr_matrix(d_np)
+
+            # Save cache
+            os.makedirs(_splade_cache_dir, exist_ok=True)
+            _sp_save_npz(_splade_q_path, Q)
+            _sp_save_npz(_splade_p_path, D)
+            with open(_splade_meta_path, "w") as _mf:
+                json.dump({
+                    "model": actual_model_name,
+                    "n_queries": len(query_ids),
+                    "n_passages": len(passage_ids),
+                    "vocab_size": int(D.shape[1]),
+                    "q_nnz": int(Q.nnz),
+                    "p_nnz": int(D.nnz),
+                }, _mf, indent=2)
+            _q_mb = os.path.getsize(_splade_q_path) / 1024**2
+            _p_mb = os.path.getsize(_splade_p_path) / 1024**2
+            print(f"💾 Saved SPLADE cache to {_splade_cache_dir}")
+            print(f"   queries: {_q_mb:.1f} MB ({Q.nnz:,} nnz), passages: {_p_mb:.1f} MB ({D.nnz:,} nnz)")
+            del splade_model, passage_texts  # free GPU memory
+        vocab_size = D.shape[1]
+        posting_lists, _ = _splade_build_inverted_index(D, vocab_size)
+        _report_splade_flops_and_postings(posting_lists, Q, "CLEF-IP passage (SPLADE)")
+        k = min(100, len(passage_ids))
+        top_k_list, idx_scores_list = _splade_retrieve_with_index(
+            Q, posting_lists, top_k=len(passage_ids), return_scores=True,
+        )
+        predicted_labels_list = [[passage_ids[j] for j in result] for result in top_k_list]
+        # Convert index-keyed score dicts to passage_id-keyed score dicts
+        passage_scores_list = [
+            {passage_ids[d]: s for d, s in sd.items()} for sd in idx_scores_list
+        ]
+        predicted_labels_list = _clefip_two_stage_rerank(
+            passage_ids, predicted_labels_list, passage_scores_list,
+            topk_docs=topk_docs,
+        )
+        print(f"  \U0001f504 Two-stage retrieval: top-{topk_docs} docs \u2192 re-ranked passages per query")
+        _evaluate_and_print_clefip(
+            qrels_passage_ids, query_ids, predicted_labels_list,
+            "SPLADE passage retrieval", save_path=save_rankings_path,
+            two_stage=True, topk_docs=topk_docs, header_extra=" (full 01 corpus)",
+        )
         return
 
-    if model_name in ["mpi-inno-comp/paecter", "anferico/bert-for-patents"]:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-        model = AutoModel.from_pretrained(args.model_name)
-        if "anferico/bert-for-patents" in model_name:
-            tokenizer.add_special_tokens({'additional_special_tokens': ['[abstract]', '[claim]', '[invention]']})
-            model.resize_token_embeddings(len(tokenizer))
-        model.to(device)
-        def _encode(texts, batch_size=32):
-            embs = []
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i : i + batch_size]
-                inp = tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt").to(device)
-                with torch.no_grad():
-                    out = model(**inp)
-                embs.append(mean_pooling(out.last_hidden_state, inp["attention_mask"]).cpu().numpy())
-            return np.vstack(embs)
-        query_emb = _encode(query_texts)
-        passage_emb = _encode(passage_texts)
-        _cl_label = "PAECTer" if "paecter" in model_name else "bert-for-patents"
-        clefip_passage_evaluation(query_ids, passage_ids, query_emb, passage_emb, qrels_passage_ids, k=100, model_label=_cl_label)
-        return
-
-    if model_name in ["datalyes/patembed-large", "patembed-large"]:
-        from sentence_transformers import SentenceTransformer
-        actual_model_id = "datalyes/patembed-large"
-        model = SentenceTransformer(actual_model_id)
-        model.to(device)
-        PATEN_TEB_RETRIEVAL_PROMPT_NAME = "retrieval_MIXED"
+    if model_name in _COLBERT_MODEL_NAMES:
+        # ── ColBERT CLEF-IP passage retrieval ──
+        import pickle
         try:
-            query_emb = model.encode_query(query_texts, prompt_name=PATEN_TEB_RETRIEVAL_PROMPT_NAME, batch_size=256, show_progress_bar=True, convert_to_numpy=True)
-            passage_emb = model.encode_document(passage_texts, prompt_name=PATEN_TEB_RETRIEVAL_PROMPT_NAME, batch_size=256, show_progress_bar=True, convert_to_numpy=True)
-        except Exception:
-            query_emb = model.encode(query_texts, batch_size=256, show_progress_bar=True, convert_to_numpy=True)
-            passage_emb = model.encode(passage_texts, batch_size=256, show_progress_bar=True, convert_to_numpy=True)
-        clefip_passage_evaluation(query_ids, passage_ids, query_emb, passage_emb, qrels_passage_ids, k=100, model_label="Patembed")
+            from colbert.modeling.checkpoint import Checkpoint
+            from colbert.infra import ColBERTConfig as _ColBERTConfig
+        except ImportError:
+            print("❌  colbert-ai package not installed. Install with:  pip install colbert-ai")
+            return
+
+        _colbert_config = _ColBERTConfig(doc_maxlen=512, query_maxlen=64, nbits=2)
+
+        # ── Cache (per-token embeddings are large; save as .pkl) ──
+        _model_clean = (args.model_name or "").rstrip("/").replace("/", "_").strip("_")
+        _sample_sz = getattr(args, "clefip_sample_size", 0) or 0
+        _cache_dir = os.path.join("temp", "clefip_colbert_cache", f"{_model_clean}_s{_sample_sz}")
+        _cache_q = os.path.join(_cache_dir, "query_embs.pkl")
+        _cache_p = os.path.join(_cache_dir, "passage_embs.pkl")
+        _cache_meta = os.path.join(_cache_dir, "meta.json")
+
+        _cache_hit = False
+        if os.path.isfile(_cache_q) and os.path.isfile(_cache_p) and os.path.isfile(_cache_meta):
+            try:
+                with open(_cache_meta, "r") as _mf:
+                    _meta = json.load(_mf)
+                if (_meta.get("n_queries") == len(query_ids)
+                        and _meta.get("n_passages") == len(passage_ids)
+                        and _meta.get("model") == "colbert-ir/colbertv2.0"):
+                    with open(_cache_q, "rb") as _f:
+                        query_embs = pickle.load(_f)
+                    with open(_cache_p, "rb") as _f:
+                        passage_embs = pickle.load(_f)
+                    _cache_hit = True
+                    print(f"✅ Loaded ColBERT cache from {_cache_dir}")
+                    print(f"   queries: {len(query_embs)}, passages: {len(passage_embs)}")
+            except Exception as e:
+                print(f"⚠️  ColBERT cache load failed ({e}), re-encoding...")
+
+        if not _cache_hit:
+            _colbert_ckpt = Checkpoint("colbert-ir/colbertv2.0", colbert_config=_colbert_config)
+
+            print(f"  Encoding {len(query_texts)} queries with ColBERT...", flush=True)
+            query_embs = _colbert_encode(_colbert_ckpt, query_texts, is_query=True, batch_size=32)
+
+            print(f"  Encoding passages from corpus with ColBERT...", flush=True)
+            passage_texts_all = []
+            with open(corpus_jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    rec = json.loads(line)
+                    passage_texts_all.append(rec["text"])
+            assert len(passage_texts_all) == len(passage_ids)
+            passage_embs = _colbert_encode(_colbert_ckpt, passage_texts_all, is_query=False, batch_size=32)
+            del passage_texts_all, _colbert_ckpt
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # Save cache
+            os.makedirs(_cache_dir, exist_ok=True)
+            with open(_cache_q, "wb") as _f:
+                pickle.dump(query_embs, _f, protocol=4)
+            with open(_cache_p, "wb") as _f:
+                pickle.dump(passage_embs, _f, protocol=4)
+            with open(_cache_meta, "w") as _mf:
+                json.dump({
+                    "model": "colbert-ir/colbertv2.0",
+                    "n_queries": len(query_ids),
+                    "n_passages": len(passage_ids),
+                    "sample_size": _sample_sz,
+                }, _mf, indent=2)
+            _q_mb = os.path.getsize(_cache_q) / 1024**2
+            _p_mb = os.path.getsize(_cache_p) / 1024**2
+            print(f"💾 Saved ColBERT cache to {_cache_dir}")
+            print(f"   queries: {_q_mb:.1f} MB, passages: {_p_mb:.1f} MB")
+
+        # MaxSim scoring → rankings + score dicts → two-stage rerank → evaluate
+        print("  Computing MaxSim similarity matrix...", flush=True)
+        predicted_labels_list, passage_scores_list = _colbert_maxsim_rankings_and_scores(
+            query_embs, passage_embs, passage_ids,
+        )
+        predicted_labels_list = _clefip_two_stage_rerank(
+            passage_ids, predicted_labels_list, passage_scores_list,
+            topk_docs=topk_docs,
+        )
+        print(f"  🔄 Two-stage retrieval: top-{topk_docs} docs → re-ranked passages per query")
+        _evaluate_and_print_clefip(
+            qrels_passage_ids, query_ids, predicted_labels_list,
+            "ColBERT passage retrieval", save_path=save_rankings_path,
+            two_stage=True, topk_docs=topk_docs, header_extra=" (full 01 corpus)",
+        )
         return
 
-    # Fallback: generic AutoModel + mean pooling (raw formatted text with section tags)
-    print(f"CLEF-IP eval: trying generic encoder for {args.model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = AutoModel.from_pretrained(args.model_name)
-    model.to(device)
-    def _encode(texts, batch_size=32):
-        embs = []
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            inp = tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt").to(device)
-            with torch.no_grad():
-                out = model(**inp)
-            embs.append(mean_pooling(out.last_hidden_state, inp["attention_mask"]).cpu().numpy())
-        return np.vstack(embs)
-    query_emb = _encode(query_texts)
-    passage_emb = _encode(passage_texts)
-    clefip_passage_evaluation(query_ids, passage_ids, query_emb, passage_emb, qrels_passage_ids, k=100, model_label="Dense")
+    if model_name == "sparse_coverage":
+        # sparse_coverage CLEF-IP is handled by the `clefip_passage` mode in main();
+        # this standalone path was removed (it was a stale duplicate without PCA/angle/residual support).
+        print("sparse_coverage CLEF-IP: skipped here — handled by clefip_passage mode in main().")
+        return
+
+    # Dense model: encode in batches, build FAISS index
+    _model_clean = (args.model_name or "").rstrip("/").replace("/", "_").strip("_")
+    _sample_sz = getattr(args, "clefip_sample_size", 0) or 0
+    _dense_cache_dir = os.path.join("temp", "clefip_dense_cache", f"{_model_clean}_s{_sample_sz}")
+    _dense_q_path = os.path.join(_dense_cache_dir, "query_embeddings.npy")
+    _dense_p_path = os.path.join(_dense_cache_dir, "passage_embeddings.npy")
+    _dense_meta_path = os.path.join(_dense_cache_dir, "meta.json")
+
+    query_texts_fmt, _ = _clefip_format_for_model(query_texts, passage_ids[:1], [""], args.model_name)
+    encode_fn, model_label = _get_clefip_dense_encoder(args, model_name, device)
+
+    # Try loading from cache
+    _cache_hit = False
+    if os.path.isfile(_dense_q_path) and os.path.isfile(_dense_p_path) and os.path.isfile(_dense_meta_path):
+        try:
+            with open(_dense_meta_path, "r") as f:
+                _meta = json.load(f)
+            if (_meta.get("model_name") == args.model_name
+                    and _meta.get("n_queries") == len(query_ids)
+                    and _meta.get("n_passages") == len(passage_ids)):
+                query_emb = np.load(_dense_q_path)
+                passage_emb = np.load(_dense_p_path)
+                assert query_emb.shape[0] == len(query_ids), f"query cache shape mismatch: {query_emb.shape[0]} vs {len(query_ids)}"
+                assert passage_emb.shape[0] == len(passage_ids), f"passage cache shape mismatch: {passage_emb.shape[0]} vs {len(passage_ids)}"
+                _cache_hit = True
+                print(f"✅ Loaded CLEF-IP dense embeddings from cache: {_dense_cache_dir}")
+                print(f"   queries: {query_emb.shape}, passages: {passage_emb.shape}")
+        except Exception as e:
+            print(f"⚠️  CLEF-IP dense cache load failed ({e}), re-encoding...")
+            _cache_hit = False
+
+    if not _cache_hit:
+        query_emb = encode_fn(query_texts_fmt, batch_size=32) if model_name not in ["datalyes/patembed-large", "patembed-large"] else encode_fn(query_texts_fmt, role="query")
+        batch_size = 256
+        passage_emb_list = []
+        with open(corpus_jsonl_path, "r", encoding="utf-8") as f:
+            batch_pids, batch_texts = [], []
+            for line in tqdm(f, desc="  corpus", leave=False):
+                rec = json.loads(line)
+                batch_pids.append(rec["pid"])
+                batch_texts.append(rec["text"])
+                if len(batch_pids) >= batch_size:
+                    _, batch_fmt = _clefip_format_for_model([""], batch_pids, batch_texts, args.model_name)
+                    if model_name in ["datalyes/patembed-large", "patembed-large"]:
+                        passage_emb_list.append(encode_fn(batch_fmt, role="document"))
+                    else:
+                        passage_emb_list.append(encode_fn(batch_fmt, batch_size=32))
+                    batch_pids, batch_texts = [], []
+            if batch_pids:
+                _, batch_fmt = _clefip_format_for_model([""], batch_pids, batch_texts, args.model_name)
+                if model_name in ["datalyes/patembed-large", "patembed-large"]:
+                    passage_emb_list.append(encode_fn(batch_fmt, role="document"))
+                else:
+                    passage_emb_list.append(encode_fn(batch_fmt, batch_size=32))
+        passage_emb = np.vstack(passage_emb_list) if passage_emb_list else np.zeros((0, query_emb.shape[1]), dtype=np.float32)
+        del passage_emb_list  # free memory before saving
+
+        # Save to cache
+        os.makedirs(_dense_cache_dir, exist_ok=True)
+        np.save(_dense_p_path, passage_emb)
+        np.save(_dense_q_path, query_emb)
+        with open(_dense_meta_path, "w") as f:
+            json.dump({
+                "model_name": args.model_name,
+                "n_queries": len(query_ids),
+                "n_passages": len(passage_ids),
+                "dim": int(passage_emb.shape[1]),
+                "sample_size": _sample_sz,
+            }, f, indent=2)
+        print(f"💾 Saved CLEF-IP dense embeddings to {_dense_cache_dir}")
+        print(f"   queries: {query_emb.shape} ({os.path.getsize(_dense_q_path) / 1024**2:.0f} MB)")
+        print(f"   passages: {passage_emb.shape} ({os.path.getsize(_dense_p_path) / 1024**2:.0f} MB)")
+
+    clefip_passage_evaluation(query_ids, passage_ids, query_emb, passage_emb, qrels_passage_ids, k=100, model_label=model_label + " (full 01)",
+                              topk_docs=topk_docs, save_rankings_path=save_rankings_path)
+
+
+def run_clefip_eval(args, save_rankings_path: str = None):
+    """Load CLEF-IP EN data, run the selected model, and evaluate passage retrieval."""
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    raw_clefip = getattr(args, "clefip_root", None) or ""
+    if raw_clefip and os.path.isabs(raw_clefip):
+        clefip_root = raw_clefip
+    else:
+        clefip_root = os.path.normpath(os.path.join(current_dir, raw_clefip or "clefip2013"))
+    if not os.path.isdir(clefip_root):
+        fallback = os.path.normpath(os.path.join(current_dir, "clefip2013"))
+        if fallback != clefip_root and os.path.isdir(fallback):
+            print(f"Warning: CLEF-IP root not found: {clefip_root}; using {fallback}")
+            clefip_root = fallback
+        else:
+            raise FileNotFoundError(
+                f"CLEF-IP root not found: {clefip_root}. "
+                "Create it or pass --clefip_root with an existing path (e.g. ./clefip2013)."
+            )
+    if current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
+    from clefip2013.load_clefip import (
+        load_clefip_en_for_eval_full_corpus,
+        load_clefip_en_for_eval_sampled_corpus,
+        FULL_CORPUS_DIR_EN,
+        CORPUS_JSONL,
+        IDS_TXT,
+    )
+    doc_root = os.path.join(clefip_root, "01_document_collection", "01_extracted")
+    if not os.path.isdir(doc_root):
+        raise FileNotFoundError(
+            f"CLEF-IP document collection not found: {doc_root}. "
+            f"Extract 01 collection: bash clefip2013/extract_01_collection.sh"
+        )
+    rebuild_corpus = getattr(args, "clefip_rebuild_corpus", False)
+    sample_size = getattr(args, "clefip_sample_size", 0) or 0
+    en_corpus_cache_dir = os.path.join(clefip_root, FULL_CORPUS_DIR_EN)
+    cache_exists = os.path.isfile(os.path.join(en_corpus_cache_dir, CORPUS_JSONL)) and os.path.isfile(os.path.join(en_corpus_cache_dir, IDS_TXT))
+
+    if sample_size != 0:
+        if sample_size == -1:
+            sample_cache_dir = os.path.join(clefip_root, "01_passage_corpus_en_qrels_only")
+            _corpus_label = "qrels-only corpus"
+        elif sample_size == -2:
+            sample_cache_dir = os.path.join(clefip_root, "01_passage_corpus_en_qrels_docs")
+            _corpus_label = "qrels-docs corpus (all passages from cited documents)"
+        else:
+            sample_cache_dir = os.path.join(clefip_root, f"01_passage_corpus_en_sample_{sample_size}docs")
+            _corpus_label = f"sampled corpus ({sample_size:,} docs)"
+        sample_cache_exists = os.path.isfile(os.path.join(sample_cache_dir, CORPUS_JSONL)) and os.path.isfile(os.path.join(sample_cache_dir, IDS_TXT))
+        if sample_cache_exists and not rebuild_corpus:
+            print(f"Loading CLEF-IP 2013 EN (claims-to-passages, {_corpus_label}, using cache)...")
+        else:
+            print(f"Loading CLEF-IP 2013 EN (claims-to-passages, {_corpus_label})...")
+        query_ids, query_texts, corpus_jsonl_path, ids_txt_path, num_passages, qrels_passage_ids = load_clefip_en_for_eval_sampled_corpus(
+            clefip_root, doc_root, sample_size=sample_size, rebuild_corpus=rebuild_corpus
+        )
+        print(f"  Queries: {len(query_ids)}, Corpus passages: {num_passages:,}")
+    elif cache_exists and not rebuild_corpus:
+        print("Loading CLEF-IP 2013 EN (claims-to-passages, **full EN collection**, using cache)...")
+        query_ids, query_texts, corpus_jsonl_path, ids_txt_path, num_passages, qrels_passage_ids = load_clefip_en_for_eval_full_corpus(
+            clefip_root, doc_root, corpus_dir=None, rebuild_corpus=rebuild_corpus
+        )
+        print(f"  Queries: {len(query_ids)}, Full corpus passages: {num_passages:,}")
+    else:
+        print("Loading CLEF-IP 2013 EN (claims-to-passages, **full EN collection**)...")
+        if not cache_exists:
+            print("  Full EN corpus cache not found; building from 01 collection (this may take a while).")
+        query_ids, query_texts, corpus_jsonl_path, ids_txt_path, num_passages, qrels_passage_ids = load_clefip_en_for_eval_full_corpus(
+            clefip_root, doc_root, corpus_dir=None, rebuild_corpus=rebuild_corpus
+        )
+        print(f"  Queries: {len(query_ids)}, Full corpus passages: {num_passages:,}")
+    # Load passage_ids for index -> passage_id mapping (same order as corpus)
+    with open(ids_txt_path, "r", encoding="utf-8") as f:
+        passage_ids = [line.strip() for line in f]
+    assert len(passage_ids) == num_passages, "ids file length vs num_passages"
+    # Full-corpus retrieval branch (BM25 / Dense / sparse_coverage)
+    _run_clefip_eval_full_corpus(
+        args, query_ids, query_texts, passage_ids, corpus_jsonl_path, ids_txt_path, qrels_passage_ids,
+        save_rankings_path=save_rankings_path,
+    )
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default=None, 
                        help="Path to pretrained model or model ID. Supported models: "
-                            "allenai/specter2_base, patentbert, mpi-inno-comp/paecter, "
+                            "allenai/specter2_base, mpi-inno-comp/paecter, "
                             "anferico/bert-for-patents, datalyes/patembed-large, naver/splade-v2, bm25, "
+                            "colbert / colbertv2 / colbert-ir/colbertv2.0, "
                             "sparse_coverage, SentenceTransformer checkpoint dir (e.g. checkpoint-1142), or other checkpoint paths.")
     parser.add_argument("--temp_dir", type=str, default="./temp", help="Temporary directory for embeddings creation and evaluation.")
     parser.add_argument("--local_rank", type=int, default=0, help="Local rank for distributed training")
@@ -953,9 +1612,9 @@ def main():
     _soft_grp.add_argument("--no_soft_assignment", action="store_true", default=False,
                        help="Force hard assignment for query spans (nearest center only).")
     parser.add_argument("--soft_assignment_max_centers_per_span", type=int, default=10,
-                       help="Cap each query span to at most this many centers (by similarity). "
-                            "If span falls in >K centers, keep top-K; if <=K, keep all. "
-                            "Default: 10. Main efficiency knob for query-side soft assignment.")
+                       help="Cap each span (query or document) to at most this many centers (by similarity) during soft assignment. "
+                           "If a span falls in >K centers, keep top-K; if <=K, keep all. "
+                           "Default: 10. Applies to BOTH query-side and document-side soft assignment.")
     parser.add_argument("--query_first_span_weight", type=float, default=1.0,
                        help="Multiply weight of first span per query by this factor (e.g. 1.5 for claim2all). Default: 1.0.")
     parser.add_argument("--query_full_chunks", action="store_true", default=False,
@@ -970,12 +1629,12 @@ def main():
                        help="Power applied to IDF in scoring: contrib uses idf^idf_exponent. "
                             "Default: 1.0. Try 0.5 (flatter), 1.5 or 2.0 (more discriminative).")
 
-    parser.add_argument("--length_norm", type=str, default="none",
+    parser.add_argument("--length_norm", type=str, default="sqrt_centers",
                        choices=["none", "sqrt_spans", "sqrt_centers"],
                        help="Document length normalization for sparse_coverage. "
                             "none: no normalization. sqrt_spans: divide by doc_span_count^exponent "
                             "(BM25-like, stable across stop-center changes). "
-                            "sqrt_centers: legacy alias for sqrt_spans. Default: none.")
+                            "sqrt_centers: legacy alias for sqrt_spans. Default: sqrt_centers.")
     parser.add_argument("--length_norm_exponent", type=float, default=0.5,
                        help="Exponent for length norm: divide by doc_span_count^exponent. "
                             "0.5 => sqrt (default). 0.8 => stronger penalization of long docs.")
@@ -983,10 +1642,6 @@ def main():
                        help="Suffix appended to centers directory name for discovery. Required when centers were "
                             "built with a suffix: greedy (e.g. '_soft', '_percenter'), k-means (e.g. '_kmeans_V50000'), "
                             "k-center (e.g. '_kcenter_V25000'), or quantile (e.g. '_quantile'). Must match build script output.")
-    parser.add_argument("--embeddings_dir", type=str, default=None,
-                       help="Path to directory containing pre-computed doc-side embeddings and metadata. "
-                            "Must contain {section}_{unit}.npy/.npz and {section}_{unit}_metadata.jsonl. "
-                            "If unset, documents from the evaluation corpus (perf200/clefip) are encoded at runtime.")
     parser.add_argument("--spacy_model", type=str, default="sci_lg",
                        choices=["sm", "md", "lg", "sci_sm", "sci_md", "sci_lg"],
                        help="SpaCy model for span tokenization (sparse_coverage). Default: sci_lg.")
@@ -1005,14 +1660,48 @@ def main():
                             "Requires center_pca_dirs.npy. 0 = off. Try 0.1–0.5.")
                             
     parser.add_argument("--save_rankings", type=str, default=None,
-                       help="If set (directory path), save rankings for hybrid fusion: "
-                            "rankings_abstract2abstract.json and rankings_claim2all.json. "
-                            "Format: {query_id: [doc_id, ...]}. Use with dense or sparse_coverage runs.")
-    parser.add_argument("--clefip_doc_root", type=str, default='./clefip2013/01_document_collection/01_extracted',
-                       help="Path to extracted CLEF-IP 01 document collection. If set, official CLEF-IP EN evaluation runs after prior-art. If unset, CLEF-IP is skipped. Extract with: bash clefip2013/extract_01_collection.sh")
+                       help="If set (directory path), save ranking files for hybrid fusion: "
+                            "rankings_abstract2abstract.json (prior-art abstract→abstract), "
+                            "rankings_claim2all.json (prior-art claim→all), and "
+                            "rankings_clefip_passage.json (CLEF-IP passage-level). "
+                            "Format: {query_id: [doc_or_passage_id, ...]}. Use with dense or sparse_coverage runs.")
+    parser.add_argument("--clefip_root", type=str, default="",
+                       help="CLEF-IP data root (02_topics, qrels). Default: ./clefip2013. Use e.g. ./clefip2023 if your full download is there.")
+    parser.add_argument("--clefip_rebuild_corpus", action="store_true",
+                       help="Force rebuild of the full 01 passage corpus (ignores existing cache). Only applies when using full corpus (default).")
+    parser.add_argument("--clefip_sample_size", type=int, default=25000,
+                       help="Controls the CLEF-IP corpus size (document-level sampling for >0): "
+                            "0 = full EN corpus (~100M passages, cache under 01_passage_corpus_en/). "
+                            "-1 = qrels-only corpus: only the exact passages referenced in qrels (~1.8k unique, "
+                            "fastest; cache under 01_passage_corpus_en_qrels_only/). "
+                            "-2 = qrels-docs corpus: ALL passages from any document cited in qrels — includes "
+                            "abstracts, claims, descriptions of each cited doc (~90 docs; "
+                            "cache under 01_passage_corpus_en_qrels_docs/). "
+                            ">0 (default: 25000) = number of DOCUMENTS to sample. All passages from qrels-cited documents are "
+                            "always included; remaining slots filled by reservoir-sampled EN documents. "
+                            "All passages from each selected document are kept (preserves document structure). "
+                            "Example: --clefip_sample_size 10000 (~10k docs → ~800k passages at ~80 passages/doc). "
+                            "Cache is built under 01_passage_corpus_en_sample_<N>docs/ and reused on subsequent runs.")
+    parser.add_argument("--clefip_two_stage_topk_docs", type=int, default=100,
+                       help="Number of top documents to keep in Stage 1 of two-stage retrieval (default: 100). "
+                            "Two-stage is always enabled: Stage 1 ranks passages → derives doc ranking → keeps top-K docs; "
+                            "Stage 2 re-ranks ALL passages from those top-K docs by original scores. "
+                            "Higher values include more candidate documents (higher recall, lower precision of pool).")
+    parser.add_argument("--clefip_neg_doc_sizes", type=str, default="",
+                       help="Comma-separated list of corpus sizes (number of documents) for CLEF-IP robustness test. "
+                            "For each size N, keeps all relevant documents (from qrels) and samples (N - n_relevant) "
+                            "negative documents from the full pool. Evaluates with each reduced pool. "
+                            "Example: '100,500,1000,5000,10000,20000'. "
+                            "Requires CLEF-IP passage embeddings to be cached (runs after normal CLEF-IP eval).")
+    parser.add_argument("--clefip_only", action="store_true", default=False,
+                       help="Run only CLEF-IP evaluation, skip prior-art (perf200) tasks. "
+                            "Useful for targeted CLEF-IP hyperparameter sweeps.")
 
     args = parser.parse_args()
-    save_rankings_abs, save_rankings_claim = _save_rankings_paths_from_args(args)
+    save_rankings_paths = _save_rankings_paths_from_args(args)
+    save_rankings_abs = save_rankings_paths.get("priorart_abs2abs")
+    save_rankings_claim = save_rankings_paths.get("priorart_claim2all")
+    _clefip_data = None  # Set by sparse_coverage block if CLEF-IP data loads successfully
 
     print(f"Running evaluation for model: {args.model_name}")
     print("=============================================>>>>>>>>>")
@@ -1039,39 +1728,47 @@ def main():
 
 
     ############################################## create dataset for prior-art search ##################################################
-    print("Running Prior-art search task.")
+    if getattr(args, 'clefip_only', False):
+        print("⏭️  --clefip_only: skipping prior-art (perf200) data loading.")
+        queries, documents, queries_df, documents_df = None, None, None, None
+        query_ids, doc_ids, query_types, doc_types = [], [], [], []
+        citation_mapping = {}
+        original_query_count = original_doc_count = 0
+    else:
+        print("Running Prior-art search task.")
     Prior_art_dataset_dir = './patentmap_eval/data/downstream/perf200'
 
-    queries = load_corpus(f"{Prior_art_dataset_dir}/content/queries.json")
-    documents = load_corpus(f"{Prior_art_dataset_dir}/content/documents.json")
+    if not getattr(args, 'clefip_only', False):
+        queries = load_corpus(f"{Prior_art_dataset_dir}/content/queries.json")
+        documents = load_corpus(f"{Prior_art_dataset_dir}/content/documents.json")
 
-    # Convert dict_keys to lists so we can index them safely
-    query_ids = list(queries.keys())       # e.g. ['Q1', 'Q2', 'Q3', ...]
-    doc_ids = list(documents.keys())       # e.g. ['D1', 'D2', 'D3', ...]
+        # Convert dict_keys to lists so we can index them safely
+        query_ids = list(queries.keys())       # e.g. ['Q1', 'Q2', 'Q3', ...]
+        doc_ids = list(documents.keys())       # e.g. ['D1', 'D2', 'D3', ...]
 
-    # convert to dataframe
-    queries_df = pd.DataFrame(queries).T
-    documents_df = pd.DataFrame(documents).T
+        # convert to dataframe
+        queries_df = pd.DataFrame(queries).T
+        documents_df = pd.DataFrame(documents).T
 
-    # 2) Load citation mappings (gold standard)
-    citation_file = f"{Prior_art_dataset_dir}/mapping/gold.json"
-    with open(citation_file) as f:
-        raw_citations = json.load(f)
+        # 2) Load citation mappings (gold standard)
+        citation_file = f"{Prior_art_dataset_dir}/mapping/gold.json"
+        with open(citation_file) as f:
+            raw_citations = json.load(f)
 
-    # format: {query_id: [list_of_cited_doc_ids], ...}
-    citation_mapping = citation_to_citing_to_cited_dict(raw_citations)
-    
-    # Multiply IDs to match concatenated embeddings
-    original_query_count = len(query_ids)
-    original_doc_count = len(doc_ids)
-    
-    query_ids = query_ids * 3
-    doc_ids = doc_ids * 3
-    
-    # Create types to match the order of concatenated embeddings
-    # Both query and document embeddings: [abstract1, abstract2, ..., claim1, claim2, ..., invention1, invention2, ...]
-    query_types = ['abstract'] * original_query_count + ['claim'] * original_query_count + ['invention'] * original_query_count
-    doc_types = ['abstract'] * original_doc_count + ['claim'] * original_doc_count + ['invention'] * original_doc_count
+        # format: {query_id: [list_of_cited_doc_ids], ...}
+        citation_mapping = citation_to_citing_to_cited_dict(raw_citations)
+        
+        # Multiply IDs to match concatenated embeddings
+        original_query_count = len(query_ids)
+        original_doc_count = len(doc_ids)
+        
+        query_ids = query_ids * 3
+        doc_ids = doc_ids * 3
+        
+        # Create types to match the order of concatenated embeddings
+        # Both query and document embeddings: [abstract1, abstract2, ..., claim1, claim2, ..., invention1, invention2, ...]
+        query_types = ['abstract'] * original_query_count + ['claim'] * original_query_count + ['invention'] * original_query_count
+        doc_types = ['abstract'] * original_doc_count + ['claim'] * original_doc_count + ['invention'] * original_doc_count
 
 
 ########################################################################################################################################################
@@ -1081,60 +1778,52 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Choose the model class based on model name or path
-    if args.model_name.lower() in ["allenai/specter2_base", "patentbert"]:
+    if args.model_name.lower() in ["allenai/specter2_base"]:
         from adapters import AutoAdapterModel
-        if args.model_name.lower() == "patentbert":
-            model_path = "./PatentBert/encoder_only_model"
-            tokenizer = AutoTokenizer.from_pretrained(model_path)
-            model = AutoAdapterModel.from_pretrained(model_path)
-        else:
-            # load the model and tokenizer
-            tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-            model = AutoAdapterModel.from_pretrained(args.model_name)
-            #load the adapter(s) as per the required task, provide an identifier for the adapter in load_as argument and activate it
-            model.load_adapter("allenai/specter2", source="hf", load_as="specter2", set_active=True)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        model = AutoAdapterModel.from_pretrained(args.model_name)
+        model.load_adapter("allenai/specter2", source="hf", load_as="specter2", set_active=True)
         embedding_dim = model.config.hidden_size
         model.to(device)
 
-        def _compute_specter2_embeddings():
-            query_embeddings_dict = {}
-            doc_embeddings_dict = {}
-            for texttype in ["abstract", "claim", "invention"]:
-                if texttype == "abstract":
-                    query_texts = [queries_df.iloc[i]['title'] + f" {tokenizer.sep_token} " + queries_df.iloc[i][texttype] for i in range(len(queries_df))]
-                    doc_texts = [documents_df.iloc[i]['title'] + f" {tokenizer.sep_token} " + documents_df.iloc[i][texttype] for i in range(len(documents_df))]
-                else:
-                    query_texts = [queries_df.iloc[i][texttype] for i in range(len(queries_df))]
-                    doc_texts = [documents_df.iloc[i][texttype] for i in range(len(documents_df))]
-                query_encodings = tokenizer(query_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
-                doc_encodings = tokenizer(doc_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
-                batch_size = 256
-                query_embs = np.zeros((len(query_encodings['input_ids']), embedding_dim))
-                doc_embs = np.zeros((len(doc_encodings['input_ids']), embedding_dim))
-                with torch.no_grad():
-                    for i in trange(0, len(query_encodings['input_ids']), batch_size, desc=f"Computing {texttype} query embeddings"):
-                        batch = {key: val[i:i+batch_size].to(device) for key, val in query_encodings.items()}
-                        outputs = model(**batch)
-                        query_embs[i:i+batch_size] = outputs['last_hidden_state'][:, 0, :].detach().cpu().numpy()
-                    for i in trange(0, len(doc_encodings['input_ids']), batch_size, desc=f"Computing {texttype} document embeddings"):
-                        batch = {key: val[i:i+batch_size].to(device) for key, val in doc_encodings.items()}
-                        outputs = model(**batch)
-                        doc_embs[i:i+batch_size] = outputs['last_hidden_state'][:, 0, :].detach().cpu().numpy()
-                query_embeddings_dict[texttype] = query_embs
-                doc_embeddings_dict[texttype] = doc_embs
-            q = np.concatenate([query_embeddings_dict["abstract"], query_embeddings_dict["claim"], query_embeddings_dict["invention"]], axis=0)
-            d = np.concatenate([doc_embeddings_dict["abstract"], doc_embeddings_dict["claim"], doc_embeddings_dict["invention"]], axis=0)
-            print(q.shape, d.shape)
-            return q, d
+        if not getattr(args, 'clefip_only', False):
+            def _compute_specter2_embeddings():
+                query_embeddings_dict = {}
+                doc_embeddings_dict = {}
+                for texttype in ["abstract", "claim", "invention"]:
+                    if texttype == "abstract":
+                        query_texts = [queries_df.iloc[i]['title'] + f" {tokenizer.sep_token} " + queries_df.iloc[i][texttype] for i in range(len(queries_df))]
+                        doc_texts = [documents_df.iloc[i]['title'] + f" {tokenizer.sep_token} " + documents_df.iloc[i][texttype] for i in range(len(documents_df))]
+                    else:
+                        query_texts = [queries_df.iloc[i][texttype] for i in range(len(queries_df))]
+                        doc_texts = [documents_df.iloc[i][texttype] for i in range(len(documents_df))]
+                    query_encodings = tokenizer(query_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
+                    doc_encodings = tokenizer(doc_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
+                    batch_size = _auto_batch_size(device, hidden_size=embedding_dim)
+                    query_embs = np.zeros((len(query_encodings['input_ids']), embedding_dim))
+                    doc_embs = np.zeros((len(doc_encodings['input_ids']), embedding_dim))
+                    with torch.no_grad():
+                        for i in trange(0, len(query_encodings['input_ids']), batch_size, desc=f"Computing {texttype} query embeddings"):
+                            batch = {key: val[i:i+batch_size].to(device) for key, val in query_encodings.items()}
+                            outputs = model(**batch)
+                            query_embs[i:i+batch_size] = outputs['last_hidden_state'][:, 0, :].detach().cpu().numpy()
+                        for i in trange(0, len(doc_encodings['input_ids']), batch_size, desc=f"Computing {texttype} document embeddings"):
+                            batch = {key: val[i:i+batch_size].to(device) for key, val in doc_encodings.items()}
+                            outputs = model(**batch)
+                            doc_embs[i:i+batch_size] = outputs['last_hidden_state'][:, 0, :].detach().cpu().numpy()
+                    query_embeddings_dict[texttype] = query_embs
+                    doc_embeddings_dict[texttype] = doc_embs
+                q = np.concatenate([query_embeddings_dict["abstract"], query_embeddings_dict["claim"], query_embeddings_dict["invention"]], axis=0)
+                d = np.concatenate([doc_embeddings_dict["abstract"], doc_embeddings_dict["claim"], doc_embeddings_dict["invention"]], axis=0)
+                print(q.shape, d.shape)
+                return q, d
 
-        query_embeddings, document_embeddings = _load_or_compute_prior_art_embeddings(
-            f'{priorart_temp_dir}/query_embeddings.pt',
-            f'{priorart_temp_dir}/document_embeddings.pt',
-            _compute_specter2_embeddings,
-        )
-        query_embeddings = query_embeddings.astype('float32')
-        document_embeddings = document_embeddings.astype('float32')
-        prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=save_rankings_abs, save_rankings_claim2all_path=save_rankings_claim, model_label="Specter2")
+            query_embeddings, document_embeddings = _load_or_compute_prior_art_embeddings(
+                f'{priorart_temp_dir}/query_embeddings.pt',
+                f'{priorart_temp_dir}/document_embeddings.pt',
+                _compute_specter2_embeddings,
+            )
+            prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=save_rankings_abs, save_rankings_claim2all_path=save_rankings_claim, model_label="Specter2")
 
 
 ########################################################################################################################################################
@@ -1152,55 +1841,54 @@ def main():
         embedding_dim = model.config.hidden_size
         model.to(device)
 
-        def _compute_paecter_embeddings():
-            query_embeddings_dict = {}
-            doc_embeddings_dict = {}
-            for texttype in ["abstract", "claim", "invention"]:
-                if args.model_name.lower() == "mpi-inno-comp/paecter":
-                    if texttype == "abstract":
-                        query_texts = [queries_df.iloc[i]['title'] + f" {tokenizer.sep_token} " + queries_df.iloc[i][texttype] for i in range(len(queries_df))]
-                        doc_texts = [documents_df.iloc[i]['title'] + f" {tokenizer.sep_token} " + documents_df.iloc[i][texttype] for i in range(len(documents_df))]
+        if not getattr(args, 'clefip_only', False):
+            def _compute_paecter_embeddings():
+                query_embeddings_dict = {}
+                doc_embeddings_dict = {}
+                for texttype in ["abstract", "claim", "invention"]:
+                    if args.model_name.lower() == "mpi-inno-comp/paecter":
+                        if texttype == "abstract":
+                            query_texts = [queries_df.iloc[i]['title'] + f" {tokenizer.sep_token} " + queries_df.iloc[i][texttype] for i in range(len(queries_df))]
+                            doc_texts = [documents_df.iloc[i]['title'] + f" {tokenizer.sep_token} " + documents_df.iloc[i][texttype] for i in range(len(documents_df))]
+                        else:
+                            query_texts = [queries_df.iloc[i][texttype] for i in range(len(queries_df))]
+                            doc_texts = [documents_df.iloc[i][texttype] for i in range(len(documents_df))]
                     else:
-                        query_texts = [queries_df.iloc[i][texttype] for i in range(len(queries_df))]
-                        doc_texts = [documents_df.iloc[i][texttype] for i in range(len(documents_df))]
-                else:
-                    if texttype == "abstract":
-                        query_texts = [queries_df.iloc[i]['title'] + f" [SEP] [{texttype}] " + queries_df.iloc[i][texttype] for i in range(len(queries_df))]
-                        doc_texts = [documents_df.iloc[i]['title'] + f" [SEP] [{texttype}] " + documents_df.iloc[i][texttype] for i in range(len(documents_df))]
-                    else:
-                        query_texts = [f"[{texttype}] " + queries_df.iloc[i][texttype] for i in range(len(queries_df))]
-                        doc_texts = [f"[{texttype}] " + documents_df.iloc[i][texttype] for i in range(len(documents_df))]
-                query_encodings = tokenizer(query_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
-                doc_encodings = tokenizer(doc_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
-                batch_size = 256
-                query_embs = np.zeros((len(query_encodings['input_ids']), embedding_dim))
-                doc_embs = np.zeros((len(doc_encodings['input_ids']), embedding_dim))
-                with torch.no_grad():
-                    for i in trange(0, len(query_encodings['input_ids']), batch_size, desc=f"Computing {texttype} query embeddings"):
-                        batch = {key: torch.tensor(val[i:i+batch_size]).to(device) for key, val in query_encodings.items()}
-                        outputs = model(**batch)
-                        query_embs[i:i+batch_size] = mean_pooling(outputs.last_hidden_state, batch['attention_mask']).detach().cpu().numpy()
-                    for i in trange(0, len(doc_encodings['input_ids']), batch_size, desc=f"Computing {texttype} document embeddings"):
-                        batch = {key: torch.tensor(val[i:i+batch_size]).to(device) for key, val in doc_encodings.items()}
-                        outputs = model(**batch)
-                        doc_embs[i:i+batch_size] = mean_pooling(outputs.last_hidden_state, batch['attention_mask']).detach().cpu().numpy()
-                query_embeddings_dict[texttype] = query_embs
-                doc_embeddings_dict[texttype] = doc_embs
-            q = np.concatenate([query_embeddings_dict["abstract"], query_embeddings_dict["claim"], query_embeddings_dict["invention"]], axis=0)
-            d = np.concatenate([doc_embeddings_dict["abstract"], doc_embeddings_dict["claim"], doc_embeddings_dict["invention"]], axis=0)
-            print(q.shape, d.shape)
-            return q, d
+                        if texttype == "abstract":
+                            query_texts = [queries_df.iloc[i]['title'] + f" [SEP] [{texttype}] " + queries_df.iloc[i][texttype] for i in range(len(queries_df))]
+                            doc_texts = [documents_df.iloc[i]['title'] + f" [SEP] [{texttype}] " + documents_df.iloc[i][texttype] for i in range(len(documents_df))]
+                        else:
+                            query_texts = [f"[{texttype}] " + queries_df.iloc[i][texttype] for i in range(len(queries_df))]
+                            doc_texts = [f"[{texttype}] " + documents_df.iloc[i][texttype] for i in range(len(documents_df))]
+                    query_encodings = tokenizer(query_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
+                    doc_encodings = tokenizer(doc_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
+                    batch_size = _auto_batch_size(device, hidden_size=embedding_dim)
+                    query_embs = np.zeros((len(query_encodings['input_ids']), embedding_dim))
+                    doc_embs = np.zeros((len(doc_encodings['input_ids']), embedding_dim))
+                    with torch.no_grad():
+                        for i in trange(0, len(query_encodings['input_ids']), batch_size, desc=f"Computing {texttype} query embeddings"):
+                            batch = {key: val[i:i+batch_size].to(device) for key, val in query_encodings.items()}
+                            outputs = model(**batch)
+                            query_embs[i:i+batch_size] = mean_pooling(outputs.last_hidden_state, batch['attention_mask']).detach().cpu().numpy()
+                        for i in trange(0, len(doc_encodings['input_ids']), batch_size, desc=f"Computing {texttype} document embeddings"):
+                            batch = {key: val[i:i+batch_size].to(device) for key, val in doc_encodings.items()}
+                            outputs = model(**batch)
+                            doc_embs[i:i+batch_size] = mean_pooling(outputs.last_hidden_state, batch['attention_mask']).detach().cpu().numpy()
+                    query_embeddings_dict[texttype] = query_embs
+                    doc_embeddings_dict[texttype] = doc_embs
+                q = np.concatenate([query_embeddings_dict["abstract"], query_embeddings_dict["claim"], query_embeddings_dict["invention"]], axis=0)
+                d = np.concatenate([doc_embeddings_dict["abstract"], doc_embeddings_dict["claim"], doc_embeddings_dict["invention"]], axis=0)
+                print(q.shape, d.shape)
+                return q, d
 
-        query_embeddings, document_embeddings = _load_or_compute_prior_art_embeddings(
-            f'{priorart_temp_dir}/query_embeddings.pt',
-            f'{priorart_temp_dir}/document_embeddings.pt',
-            _compute_paecter_embeddings,
-            pickle_protocol=4,
-        )
-        query_embeddings = query_embeddings.astype('float32')
-        document_embeddings = document_embeddings.astype('float32')
-        _paecter_label = "PAECTer" if "paecter" in args.model_name.lower() else "bert-for-patents"
-        prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=save_rankings_abs, save_rankings_claim2all_path=save_rankings_claim, model_label=_paecter_label)
+            query_embeddings, document_embeddings = _load_or_compute_prior_art_embeddings(
+                f'{priorart_temp_dir}/query_embeddings.pt',
+                f'{priorart_temp_dir}/document_embeddings.pt',
+                _compute_paecter_embeddings,
+                pickle_protocol=4,
+            )
+            _paecter_label = "PAECTer" if "paecter" in args.model_name.lower() else "bert-for-patents"
+            prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=save_rankings_abs, save_rankings_claim2all_path=save_rankings_claim, model_label=_paecter_label)
 
 
 ########################################################################################################################################################
@@ -1233,38 +1921,38 @@ def main():
         query_cache = os.path.join(priorart_temp_dir, "query_embeddings_prompted.pt")
         doc_cache = os.path.join(priorart_temp_dir, "document_embeddings_prompted.pt")
 
-        def _compute_patembed_embeddings():
-            query_embeddings_dict = {}
-            doc_embeddings_dict = {}
-            sep = getattr(model.tokenizer, 'sep_token', ' [SEP] ')
-            for texttype in ["abstract", "claim", "invention"]:
-                if texttype == "abstract":
-                    raw_query = [queries_df.iloc[i]['title'] + sep + queries_df.iloc[i][texttype] for i in range(len(queries_df))]
-                    raw_doc = [documents_df.iloc[i]['title'] + sep + documents_df.iloc[i][texttype] for i in range(len(documents_df))]
-                else:
-                    raw_query = [queries_df.iloc[i][texttype] for i in range(len(queries_df))]
-                    raw_doc = [documents_df.iloc[i][texttype] for i in range(len(documents_df))]
-                try:
-                    query_embs = model.encode_query(raw_query, prompt_name=PATEN_TEB_RETRIEVAL_PROMPT_NAME, batch_size=256, show_progress_bar=True, convert_to_numpy=True)
-                    doc_embs = model.encode_document(raw_doc, prompt_name=PATEN_TEB_RETRIEVAL_PROMPT_NAME, batch_size=256, show_progress_bar=True, convert_to_numpy=True)
-                except Exception:
-                    PROMPT_QUERY = "encode query for mixed document retrieval: "
-                    PROMPT_DOC = "encode document for mixed retrieval: "
-                    query_embs = model.encode([PROMPT_QUERY + t for t in raw_query], batch_size=256, show_progress_bar=True, convert_to_numpy=True)
-                    doc_embs = model.encode([PROMPT_DOC + t for t in raw_doc], batch_size=256, show_progress_bar=True, convert_to_numpy=True)
-                query_embeddings_dict[texttype] = query_embs
-                doc_embeddings_dict[texttype] = doc_embs
-            q = np.concatenate([query_embeddings_dict["abstract"], query_embeddings_dict["claim"], query_embeddings_dict["invention"]], axis=0)
-            d = np.concatenate([doc_embeddings_dict["abstract"], doc_embeddings_dict["claim"], doc_embeddings_dict["invention"]], axis=0)
-            print(q.shape, d.shape)
-            return q, d
+        if not getattr(args, 'clefip_only', False):
+            def _compute_patembed_embeddings():
+                query_embeddings_dict = {}
+                doc_embeddings_dict = {}
+                sep = getattr(model.tokenizer, 'sep_token', ' [SEP] ')
+                _patembed_bs = _auto_batch_size(device, hidden_size=embedding_dim)
+                for texttype in ["abstract", "claim", "invention"]:
+                    if texttype == "abstract":
+                        raw_query = [queries_df.iloc[i]['title'] + sep + queries_df.iloc[i][texttype] for i in range(len(queries_df))]
+                        raw_doc = [documents_df.iloc[i]['title'] + sep + documents_df.iloc[i][texttype] for i in range(len(documents_df))]
+                    else:
+                        raw_query = [queries_df.iloc[i][texttype] for i in range(len(queries_df))]
+                        raw_doc = [documents_df.iloc[i][texttype] for i in range(len(documents_df))]
+                    try:
+                        query_embs = model.encode_query(raw_query, prompt_name=PATEN_TEB_RETRIEVAL_PROMPT_NAME, batch_size=_patembed_bs, show_progress_bar=True, convert_to_numpy=True)
+                        doc_embs = model.encode_document(raw_doc, prompt_name=PATEN_TEB_RETRIEVAL_PROMPT_NAME, batch_size=_patembed_bs, show_progress_bar=True, convert_to_numpy=True)
+                    except Exception:
+                        PROMPT_QUERY = "encode query for mixed document retrieval: "
+                        PROMPT_DOC = "encode document for mixed retrieval: "
+                        query_embs = model.encode([PROMPT_QUERY + t for t in raw_query], batch_size=_patembed_bs, show_progress_bar=True, convert_to_numpy=True)
+                        doc_embs = model.encode([PROMPT_DOC + t for t in raw_doc], batch_size=_patembed_bs, show_progress_bar=True, convert_to_numpy=True)
+                    query_embeddings_dict[texttype] = query_embs
+                    doc_embeddings_dict[texttype] = doc_embs
+                q = np.concatenate([query_embeddings_dict["abstract"], query_embeddings_dict["claim"], query_embeddings_dict["invention"]], axis=0)
+                d = np.concatenate([doc_embeddings_dict["abstract"], doc_embeddings_dict["claim"], doc_embeddings_dict["invention"]], axis=0)
+                print(q.shape, d.shape)
+                return q, d
 
-        query_embeddings, document_embeddings = _load_or_compute_prior_art_embeddings(
-            query_cache, doc_cache, _compute_patembed_embeddings, pickle_protocol=4,
-        )
-        query_embeddings = query_embeddings.astype('float32')
-        document_embeddings = document_embeddings.astype('float32')
-        prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=save_rankings_abs, save_rankings_claim2all_path=save_rankings_claim, model_label="Patembed")
+            query_embeddings, document_embeddings = _load_or_compute_prior_art_embeddings(
+                query_cache, doc_cache, _compute_patembed_embeddings, pickle_protocol=4,
+            )
+            prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=save_rankings_abs, save_rankings_claim2all_path=save_rankings_claim, model_label="Patembed")
 
 
 ########################################################################################################################################################
@@ -1274,82 +1962,75 @@ def main():
         import snowballstemmer
 
         ############################ BM25 Evaluation ############################
-        print("Running BM25 (Standard) Prior-art search evaluation")
+        if not getattr(args, 'clefip_only', False):
+            print("Running BM25 (Standard) Prior-art search evaluation")
         
-        stemmer = snowballstemmer.stemmer('english')
-        original_doc_ids = list(documents.keys())
+            stemmer = snowballstemmer.stemmer('english')
+            original_doc_ids = list(documents.keys())
         
-        # 1) Abstract-to-Abstract evaluation (like other models' abstract->abstract)
-        print("\nBM25 Evaluation 1: Abstract-to-Abstract retrieval")
-        abstract_train_corpus = documents_df['title'] + ' ' + documents_df['abstract']
-        abstract_test_corpus = queries_df['title'] + ' ' + queries_df['abstract']
+            # 1) Abstract-to-Abstract evaluation (like other models' abstract->abstract)
+            print("\nBM25 Evaluation 1: Abstract-to-Abstract retrieval")
+            abstract_train_corpus = documents_df['title'] + ' ' + documents_df['abstract']
+            abstract_test_corpus = queries_df['title'] + ' ' + queries_df['abstract']
         
-        # Tokenize corpus
-        abstract_corpus_tokens = bm25s.tokenize(abstract_train_corpus.tolist(), stopwords="en", stemmer=stemmer)
+            # Tokenize corpus
+            abstract_corpus_tokens = bm25s.tokenize(abstract_train_corpus.tolist(), stopwords="en", stemmer=stemmer)
         
-        # Create and index BM25 model
-        abstract_retriever = bm25s.BM25()
-        abstract_retriever.index(abstract_corpus_tokens)
-        # Tokenize queries then report efficiency (postings + FLOPs when query term ids available)
-        abstract_queries_tokens = bm25s.tokenize(abstract_test_corpus.tolist(), stemmer=stemmer)
-        _report_bm25_posting_stats(abstract_retriever, "Abstract-to-Abstract", query_tokens_list=abstract_queries_tokens)
-        abstract_results, _ = abstract_retriever.retrieve(abstract_queries_tokens, k=100)
+            # Create and index BM25 model
+            abstract_retriever = bm25s.BM25()
+            abstract_retriever.index(abstract_corpus_tokens)
+            # Tokenize queries then report efficiency (postings + FLOPs when query term ids available)
+            abstract_queries_tokens = bm25s.tokenize(abstract_test_corpus.tolist(), stemmer=stemmer)
+            _report_bm25_posting_stats(abstract_retriever, "Abstract-to-Abstract", query_tokens_list=abstract_queries_tokens)
+            abstract_results, _ = abstract_retriever.retrieve(abstract_queries_tokens, k=100)
         
-        # Map results back to document IDs (only abstract docs)
-        abstract_retrieved_ids = [[original_doc_ids[i] for i in result] for result in abstract_results]
+            # Map results back to document IDs (only abstract docs)
+            abstract_retrieved_ids = [[original_doc_ids[i] for i in result] for result in abstract_results]
         
-        # Calculate metrics for abstract-to-abstract
-        query_ids_list = list(queries.keys())
-        true_labels_list = [citation_mapping.get(q, []) for q in query_ids_list]
+            # Calculate metrics for abstract-to-abstract
+            query_ids_list = list(queries.keys())
+            true_labels_list = [citation_mapping.get(q, []) for q in query_ids_list]
         
-        bm25_abstract_results = _make_prior_art_metrics(true_labels_list, abstract_retrieved_ids)
-        print_metric_table(bm25_abstract_results, "BM25: Abstract → Abstract")
-        if save_rankings_abs:
-            ranking_dict = {str(query_ids_list[i]): abstract_retrieved_ids[i] for i in range(len(abstract_retrieved_ids))}
-            with open(save_rankings_abs, "w") as f:
-                json.dump(ranking_dict, f, indent=0)
-            print(f"   Saved abstract->abstract rankings to {save_rankings_abs} ({len(abstract_retrieved_ids)} queries)")
+            bm25_abstract_results = _make_prior_art_metrics(true_labels_list, abstract_retrieved_ids)
+            print_metric_table(bm25_abstract_results, "BM25: Abstract → Abstract")
+            _save_rankings(save_rankings_abs, query_ids_list, abstract_retrieved_ids, "abstract->abstract")
         
-        # 2) Claim-to-All evaluation (like other models' claim->all)
-        print("\nBM25 Evaluation 2: Claim-to-All retrieval")
-        all_train_corpus = (
-            (documents_df['title'] + ' ' + documents_df['abstract']).tolist() + 
-            documents_df['claim'].tolist() + 
-            documents_df['invention'].tolist()
-        )
-        claim_test_corpus = queries_df['claim'].tolist()
+            # 2) Claim-to-All evaluation (like other models' claim->all)
+            print("\nBM25 Evaluation 2: Claim-to-All retrieval")
+            all_train_corpus = (
+                (documents_df['title'] + ' ' + documents_df['abstract']).tolist() + 
+                documents_df['claim'].tolist() + 
+                documents_df['invention'].tolist()
+            )
+            claim_test_corpus = queries_df['claim'].tolist()
         
-        all_corpus_tokens = bm25s.tokenize(all_train_corpus, stopwords="en", stemmer=stemmer)
-        all_retriever = bm25s.BM25()
-        all_retriever.index(all_corpus_tokens)
-        claim_queries_tokens = bm25s.tokenize(claim_test_corpus, stemmer=stemmer)
-        _report_bm25_posting_stats(all_retriever, "Claim-to-All", query_tokens_list=claim_queries_tokens)
-        claim_results, _ = all_retriever.retrieve(claim_queries_tokens, k=300)
+            all_corpus_tokens = bm25s.tokenize(all_train_corpus, stopwords="en", stemmer=stemmer)
+            all_retriever = bm25s.BM25()
+            all_retriever.index(all_corpus_tokens)
+            claim_queries_tokens = bm25s.tokenize(claim_test_corpus, stemmer=stemmer)
+            _report_bm25_posting_stats(all_retriever, "Claim-to-All", query_tokens_list=claim_queries_tokens)
+            claim_results, _ = all_retriever.retrieve(claim_queries_tokens, k=300)
         
-        original_doc_count = len(original_doc_ids)
-        claim_retrieved_ids = []
-        for result in claim_results:
-            doc_ids_for_query = []
-            for idx in result:
-                if idx < original_doc_count:
-                    doc_id = original_doc_ids[idx]
-                elif idx < 2 * original_doc_count:
-                    doc_id = original_doc_ids[idx - original_doc_count]
-                else:
-                    doc_id = original_doc_ids[idx - 2 * original_doc_count]
-                doc_ids_for_query.append(doc_id)
-            unique_doc_ids = list(dict.fromkeys(doc_ids_for_query))[:100]
-            claim_retrieved_ids.append(unique_doc_ids)
+            original_doc_count = len(original_doc_ids)
+            claim_retrieved_ids = []
+            for result in claim_results:
+                doc_ids_for_query = []
+                for idx in result:
+                    if idx < original_doc_count:
+                        doc_id = original_doc_ids[idx]
+                    elif idx < 2 * original_doc_count:
+                        doc_id = original_doc_ids[idx - original_doc_count]
+                    else:
+                        doc_id = original_doc_ids[idx - 2 * original_doc_count]
+                    doc_ids_for_query.append(doc_id)
+                unique_doc_ids = list(dict.fromkeys(doc_ids_for_query))[:100]
+                claim_retrieved_ids.append(unique_doc_ids)
         
-        bm25_claim_results = _make_prior_art_metrics(true_labels_list, claim_retrieved_ids)
-        print_metric_table(bm25_claim_results, "BM25: Claim → All Sections")
-        if save_rankings_claim:
-            ranking_dict = {str(query_ids_list[i]): claim_retrieved_ids[i] for i in range(len(claim_retrieved_ids))}
-            with open(save_rankings_claim, "w") as f:
-                json.dump(ranking_dict, f, indent=0)
-            print(f"   Saved claim->all rankings to {save_rankings_claim} ({len(claim_retrieved_ids)} queries)")
+            bm25_claim_results = _make_prior_art_metrics(true_labels_list, claim_retrieved_ids)
+            print_metric_table(bm25_claim_results, "BM25: Claim → All Sections")
+            _save_rankings(save_rankings_claim, query_ids_list, claim_retrieved_ids, "claim->all")
         
-        print("\n📝 Note: BM25 evaluation completed.")
+            print("\n📝 Note: BM25 evaluation completed.")
 
 
 ########################################################################################################################################################
@@ -1388,225 +2069,328 @@ def main():
         ############################ Prior-art Search evaluation ############################
         print("\n🔍 SPLADE-v2 Prior-art search evaluation")
         
-        if os.path.exists(f'{priorart_temp_dir}/query_embeddings.npz') and os.path.exists(f'{priorart_temp_dir}/document_embeddings.npz'):
-            print("📦 Loading precomputed SPLADE sparse embeddings...")
-            from scipy.sparse import load_npz
+        if not getattr(args, 'clefip_only', False):
+            if os.path.exists(f'{priorart_temp_dir}/query_embeddings.npz') and os.path.exists(f'{priorart_temp_dir}/document_embeddings.npz'):
+                print("📦 Loading precomputed SPLADE sparse embeddings...")
+                from scipy.sparse import load_npz
             
-            # Load sparse matrices from disk (scipy format)
-            query_scipy = load_npz(f'{priorart_temp_dir}/query_embeddings.npz')
-            document_scipy = load_npz(f'{priorart_temp_dir}/document_embeddings.npz')
+                # Load sparse matrices from disk (scipy format)
+                query_scipy = load_npz(f'{priorart_temp_dir}/query_embeddings.npz')
+                document_scipy = load_npz(f'{priorart_temp_dir}/document_embeddings.npz')
             
-            # Convert to PyTorch sparse tensors for use with model.similarity()
-            def scipy_to_torch_sparse(scipy_matrix):
-                """Convert scipy sparse matrix to PyTorch sparse tensor."""
-                coo = scipy_matrix.tocoo()
-                indices = torch.from_numpy(np.vstack([coo.row, coo.col])).long()
-                values = torch.from_numpy(coo.data).float()
-                shape = coo.shape
-                return torch.sparse_coo_tensor(indices, values, shape)
+                # Convert to PyTorch sparse tensors for use with model.similarity()
+                def scipy_to_torch_sparse(scipy_matrix):
+                    """Convert scipy sparse matrix to PyTorch sparse tensor."""
+                    coo = scipy_matrix.tocoo()
+                    indices = torch.from_numpy(np.vstack([coo.row, coo.col])).long()
+                    values = torch.from_numpy(coo.data).float()
+                    shape = coo.shape
+                    return torch.sparse_coo_tensor(indices, values, shape)
             
-            query_embeddings_sparse = scipy_to_torch_sparse(query_scipy)
-            document_embeddings_sparse = scipy_to_torch_sparse(document_scipy)
+                query_embeddings_sparse = scipy_to_torch_sparse(query_scipy)
+                document_embeddings_sparse = scipy_to_torch_sparse(document_scipy)
             
-            print(f"   Query embeddings: {query_embeddings_sparse.shape}")
-            print(f"   Document embeddings: {document_embeddings_sparse.shape}")
-        else:
-            print("🔄 Computing SPLADE sparse representations...")
-            
-            # Compute embeddings for each text type separately
-            query_sparse_dict = {}
-            doc_sparse_dict = {}
-            
-            for texttype in ["abstract", "claim", "invention"]:
-                print(f"\n   Processing {texttype}...")
-                
-                # Format texts - SPLADE doesn't need special section tokens
-                if texttype == "abstract":
-                    query_texts = (queries_df['title'] + '. ' + queries_df['abstract']).fillna('').tolist()
-                    doc_texts = (documents_df['title'] + '. ' + documents_df['abstract']).fillna('').tolist()
-                else:
-                    query_texts = queries_df[texttype].fillna('').tolist()
-                    doc_texts = documents_df[texttype].fillna('').tolist()
-                
-                # Compute sparse embeddings
-                print(f"      Computing query embeddings ({len(query_texts)} queries)...")
-                query_sparse_dict[texttype] = model.encode_query(
-                    query_texts, 
-                    batch_size=encode_batch_size,
-                    show_progress_bar=True
-                )
-                
-                print(f"      Computing document embeddings ({len(doc_texts)} documents)...")
-                doc_sparse_dict[texttype] = model.encode_document(
-                    doc_texts, 
-                    batch_size=encode_batch_size,
-                    show_progress_bar=True
-                )
-                
-                print(f"      ✓ {texttype}: Query shape {query_sparse_dict[texttype].shape}, Doc shape {doc_sparse_dict[texttype].shape}")
-            
-            # Stack PyTorch tensors vertically (concatenate different text types)
-            # Keep in PyTorch format for use with model.similarity()
-            query_embeddings_sparse = torch.cat([query_sparse_dict["abstract"], 
-                                                 query_sparse_dict["claim"], 
-                                                 query_sparse_dict["invention"]], dim=0)
-            document_embeddings_sparse = torch.cat([doc_sparse_dict["abstract"], 
-                                                    doc_sparse_dict["claim"], 
-                                                    doc_sparse_dict["invention"]], dim=0)
-            
-            print(f"\n📊 Final SPLADE embeddings:")
-            print(f"   Query embeddings: {query_embeddings_sparse.shape}")
-            print(f"   Document embeddings: {document_embeddings_sparse.shape}")
-            
-            # Convert to scipy sparse format only for saving
-            from scipy.sparse import save_npz, csr_matrix
-            
-            def torch_sparse_to_scipy(tensor):
-                """Convert PyTorch sparse tensor to scipy sparse matrix."""
-                if tensor.is_sparse:
-                    tensor = tensor.coalesce()
-                    indices = tensor.indices().cpu().numpy()
-                    values = tensor.values().cpu().numpy()
-                    shape = tensor.shape
-                    from scipy.sparse import coo_matrix
-                    return coo_matrix((values, (indices[0], indices[1])), shape=shape).tocsr()
-                else:
-                    # Dense tensor
-                    return csr_matrix(tensor.cpu().numpy())
-            
-            # Save in scipy format for disk storage
-            save_npz(f'{priorart_temp_dir}/query_embeddings.npz', torch_sparse_to_scipy(query_embeddings_sparse))
-            save_npz(f'{priorart_temp_dir}/document_embeddings.npz', torch_sparse_to_scipy(document_embeddings_sparse))
-            print(f"💾 Saved embeddings to {priorart_temp_dir}")
-
-        print("\n🎯 Running Prior-art search evaluation...")
-        
-        def splade_prior_art_evaluation(query_ids, doc_ids, query_sparse, doc_sparse, 
-                                        citation_mapping, query_types, doc_types, model):
-            """SPLADE evaluation via inverted index (term-at-a-time retrieval)."""
-            results = {}
-            
-            # Calculate original counts (before 3x multiplication)
-            original_query_count = len(query_ids) // 3
-            original_doc_count = len(doc_ids) // 3
-            
-            # Get original IDs (first segment before multiplication)
-            original_query_ids = query_ids[:original_query_count]
-            original_doc_ids = doc_ids[:original_doc_count]
-            
-            # Convert sparse tensors to dense for indexing (sparse tensors don't support boolean indexing)
-            if query_sparse.is_sparse:
-                query_dense = query_sparse.to_dense()
-                doc_dense = doc_sparse.to_dense()
+                print(f"   Query embeddings: {query_embeddings_sparse.shape}")
+                print(f"   Document embeddings: {document_embeddings_sparse.shape}")
             else:
-                query_dense = query_sparse
-                doc_dense = doc_sparse
+                print("🔄 Computing SPLADE sparse representations...")
             
-            # 1) Abstract-to-Abstract: inverted index (term -> doc postings), then term-at-a-time retrieval
-            texttype_q = "abstract"
-            texttype_d = "abstract"
-            query_types_arr = np.array(query_types)
-            doc_types_arr = np.array(doc_types)
-            query_type_masks = (query_types_arr == texttype_q)
-            doc_type_masks = (doc_types_arr == texttype_d)
-            D_abs = doc_dense[doc_type_masks]
-            Q_abs = query_dense[query_type_masks]
-            D_abs, Q_abs = _to_numpy_if_torch(D_abs, Q_abs)
-            vocab_size = D_abs.shape[1]
-            posting_abs, _ = _splade_build_inverted_index(csr_matrix(D_abs), vocab_size)
-            _report_splade_flops_and_postings(posting_abs, csr_matrix(Q_abs), "Abstract-to-Abstract")
-            top_k_list_abs = _splade_retrieve_with_index(csr_matrix(Q_abs), posting_abs, top_k=100)
-
-            # Build true/predicted labels using ORIGINAL IDs (abstract: doc index = original doc index)
-            true_labels_list, predicted_labels_list = [], []
-            for q_idx, retrieved_docs_indices in enumerate(top_k_list_abs):
-                q_id_str = original_query_ids[q_idx]  # Use original query ID
-                true_labels = citation_mapping.get(q_id_str, [])
-                predicted_labels = [original_doc_ids[d_idx] for d_idx in retrieved_docs_indices]  # Use original doc IDs
-                true_labels_list.append(true_labels)
-                predicted_labels_list.append(predicted_labels)
+                # Compute embeddings for each text type separately
+                query_sparse_dict = {}
+                doc_sparse_dict = {}
             
-            results_key = "abstract->abstract"
-            results[results_key] = _make_prior_art_metrics(true_labels_list, predicted_labels_list)
-
-            # 2) Claim-to-All: inverted index over all sections, term-at-a-time retrieval, then dedupe by doc
-            texttype_q = "claim"
-            query_type_masks = (query_types_arr == texttype_q)
-            Q_claim = query_dense[query_type_masks]
-            D_all = doc_dense  # All document sections (abstract, claim, invention)
-            D_all, Q_claim = _to_numpy_if_torch(D_all, Q_claim)
-            posting_all, _ = _splade_build_inverted_index(csr_matrix(D_all), D_all.shape[1])
-            _report_splade_flops_and_postings(posting_all, csr_matrix(Q_claim), "Claim-to-All")
-            top_k_list_claim = _splade_retrieve_with_index(csr_matrix(Q_claim), posting_all, top_k=300)
-            # Pad to 300 with -1 so zero-result queries don't pollute; skip d_idx < 0 in loop
-            top_k_indices = np.full((len(top_k_list_claim), 300), -1, dtype=np.int64)
-            for i, t in enumerate(top_k_list_claim):
-                n = min(len(t), 300)
-                if n > 0:
-                    top_k_indices[i, :n] = t[:n]
-
-            retrieved_sections = []
-            true_labels_list, predicted_labels_list = [], []
-
-            for q_idx, retrieved_docs_indices in enumerate(top_k_indices):
-                q_id_str = original_query_ids[q_idx]
-                true_labels = citation_mapping.get(q_id_str, [])
-
-                # Map (d_idx -> orig doc ID); skip padding -1
-                doc_entries = []
-                for d_idx in retrieved_docs_indices:
-                    if d_idx < 0:
-                        continue
-                    orig_doc_idx = d_idx % original_doc_count
-                    doc_entries.append((d_idx, original_doc_ids[orig_doc_idx]))
-                # Dedupe by doc ID, preserve order; track d_idx for section
-                seen = set()
-                unique_predicted = []
-                section_d_indices = []
-                for d_idx, label in doc_entries:
-                    if label not in seen:
-                        seen.add(label)
-                        unique_predicted.append(label)
-                        section_d_indices.append(d_idx)
-                predicted_labels = unique_predicted[:100]
-                retrieved_sections.append([
-                    ["abstract", "claim", "invention"][d_idx // original_doc_count]
-                    for d_idx in section_d_indices[:100]
-                ])
+                for texttype in ["abstract", "claim", "invention"]:
+                    print(f"\n   Processing {texttype}...")
                 
-                true_labels_list.append(true_labels)
-                predicted_labels_list.append(predicted_labels)
-            
-            results_key = f"{texttype_q}->all"
-            results[results_key] = _make_prior_art_metrics(
-                true_labels_list, predicted_labels_list,
-                retrieved_sections=f"[{len(retrieved_sections)} queries with retrieved sections]"
-            )
-
-            # Format and display results
-            print_subsection_header("Prior Art Search Results (SPLADE)")
-            for task_key, task_results in results.items():
-                if isinstance(task_results, dict):
-                    if '->' in task_key:
-                        clean_name = f"Query: {task_key.split('->')[0]} → Document: {task_key.split('->')[1]}"
+                    # Format texts - SPLADE doesn't need special section tokens
+                    if texttype == "abstract":
+                        query_texts = (queries_df['title'] + '. ' + queries_df['abstract']).fillna('').tolist()
+                        doc_texts = (documents_df['title'] + '. ' + documents_df['abstract']).fillna('').tolist()
                     else:
-                        clean_name = task_key
-                    print_metric_table(task_results, clean_name)
+                        query_texts = queries_df[texttype].fillna('').tolist()
+                        doc_texts = documents_df[texttype].fillna('').tolist()
+                
+                    # Compute sparse embeddings
+                    print(f"      Computing query embeddings ({len(query_texts)} queries)...")
+                    query_sparse_dict[texttype] = model.encode_query(
+                        query_texts, 
+                        batch_size=encode_batch_size,
+                        show_progress_bar=True
+                    )
+                
+                    print(f"      Computing document embeddings ({len(doc_texts)} documents)...")
+                    doc_sparse_dict[texttype] = model.encode_document(
+                        doc_texts, 
+                        batch_size=encode_batch_size,
+                        show_progress_bar=True
+                    )
+                
+                    print(f"      ✓ {texttype}: Query shape {query_sparse_dict[texttype].shape}, Doc shape {doc_sparse_dict[texttype].shape}")
             
-            # Store and analyze retrieved sections
-            results[results_key]['retrieved_sections_full'] = retrieved_sections
-            if retrieved_sections:
-                from patentmap_eval.patenteval.utils import analyze_retrieved_sections_integrated
-                section_analysis = analyze_retrieved_sections_integrated(
-                    retrieved_sections, query_section=texttype_q, print_results=True
+                # Stack PyTorch tensors vertically (concatenate different text types)
+                # Keep in PyTorch format for use with model.similarity()
+                query_embeddings_sparse = torch.cat([query_sparse_dict["abstract"], 
+                                                     query_sparse_dict["claim"], 
+                                                     query_sparse_dict["invention"]], dim=0)
+                document_embeddings_sparse = torch.cat([doc_sparse_dict["abstract"], 
+                                                        doc_sparse_dict["claim"], 
+                                                        doc_sparse_dict["invention"]], dim=0)
+            
+                print(f"\n📊 Final SPLADE embeddings:")
+                print(f"   Query embeddings: {query_embeddings_sparse.shape}")
+                print(f"   Document embeddings: {document_embeddings_sparse.shape}")
+            
+                # Convert to scipy sparse format only for saving
+                from scipy.sparse import save_npz
+                def torch_sparse_to_scipy(tensor):
+                    """Convert PyTorch sparse tensor to scipy sparse matrix."""
+                    if tensor.is_sparse:
+                        tensor = tensor.coalesce()
+                        indices = tensor.indices().cpu().numpy()
+                        values = tensor.values().cpu().numpy()
+                        shape = tensor.shape
+                        from scipy.sparse import coo_matrix
+                        return coo_matrix((values, (indices[0], indices[1])), shape=shape).tocsr()
+                    else:
+                        # Dense tensor
+                        return csr_matrix(tensor.cpu().numpy())
+            
+                # Save in scipy format for disk storage
+                save_npz(f'{priorart_temp_dir}/query_embeddings.npz', torch_sparse_to_scipy(query_embeddings_sparse))
+                save_npz(f'{priorart_temp_dir}/document_embeddings.npz', torch_sparse_to_scipy(document_embeddings_sparse))
+                print(f"💾 Saved embeddings to {priorart_temp_dir}")
+
+            print("\n🎯 Running Prior-art search evaluation...")
+        
+            def splade_prior_art_evaluation(query_ids, doc_ids, query_sparse, doc_sparse, 
+                                            citation_mapping, query_types, doc_types,
+                                            save_rankings_path=None, save_rankings_claim2all_path=None):
+                """SPLADE evaluation via inverted index (term-at-a-time retrieval)."""
+                results = {}
+            
+                # Calculate original counts (before 3x multiplication)
+                original_query_count = len(query_ids) // 3
+                original_doc_count = len(doc_ids) // 3
+            
+                # Get original IDs (first segment before multiplication)
+                original_query_ids = query_ids[:original_query_count]
+                original_doc_ids = doc_ids[:original_doc_count]
+            
+                # Convert sparse tensors to dense for indexing (sparse tensors don't support boolean indexing)
+                if query_sparse.is_sparse:
+                    query_dense = query_sparse.to_dense()
+                    doc_dense = doc_sparse.to_dense()
+                else:
+                    query_dense = query_sparse
+                    doc_dense = doc_sparse
+            
+                # 1) Abstract-to-Abstract: inverted index (term -> doc postings), then term-at-a-time retrieval
+                texttype_q = "abstract"
+                texttype_d = "abstract"
+                query_types_arr = np.array(query_types)
+                doc_types_arr = np.array(doc_types)
+                query_type_masks = (query_types_arr == texttype_q)
+                doc_type_masks = (doc_types_arr == texttype_d)
+                D_abs = doc_dense[doc_type_masks]
+                Q_abs = query_dense[query_type_masks]
+                D_abs, Q_abs = _to_numpy_if_torch(D_abs, Q_abs)
+                vocab_size = D_abs.shape[1]
+                posting_abs, _ = _splade_build_inverted_index(csr_matrix(D_abs), vocab_size)
+                _report_splade_flops_and_postings(posting_abs, csr_matrix(Q_abs), "Abstract-to-Abstract")
+                top_k_list_abs = _splade_retrieve_with_index(csr_matrix(Q_abs), posting_abs, top_k=100)
+
+                # Build true/predicted labels using ORIGINAL IDs (abstract: doc index = original doc index)
+                true_labels_list, predicted_labels_list = [], []
+                for q_idx, retrieved_docs_indices in enumerate(top_k_list_abs):
+                    q_id_str = original_query_ids[q_idx]  # Use original query ID
+                    true_labels = citation_mapping.get(q_id_str, [])
+                    predicted_labels = [original_doc_ids[d_idx] for d_idx in retrieved_docs_indices]  # Use original doc IDs
+                    true_labels_list.append(true_labels)
+                    predicted_labels_list.append(predicted_labels)
+            
+                results_key = "abstract->abstract"
+                results[results_key] = _make_prior_art_metrics(true_labels_list, predicted_labels_list)
+                _save_rankings(save_rankings_path, original_query_ids, predicted_labels_list, "abstract->abstract")
+
+                # 2) Claim-to-All: inverted index over all sections, term-at-a-time retrieval, then dedupe by doc
+                texttype_q = "claim"
+                query_type_masks = (query_types_arr == texttype_q)
+                Q_claim = query_dense[query_type_masks]
+                D_all = doc_dense  # All document sections (abstract, claim, invention)
+                D_all, Q_claim = _to_numpy_if_torch(D_all, Q_claim)
+                posting_all, _ = _splade_build_inverted_index(csr_matrix(D_all), D_all.shape[1])
+                _report_splade_flops_and_postings(posting_all, csr_matrix(Q_claim), "Claim-to-All")
+                top_k_list_claim = _splade_retrieve_with_index(csr_matrix(Q_claim), posting_all, top_k=300)
+                # Pad to 300 with -1 so zero-result queries don't pollute; skip d_idx < 0 in loop
+                top_k_indices = np.full((len(top_k_list_claim), 300), -1, dtype=np.int64)
+                for i, t in enumerate(top_k_list_claim):
+                    n = min(len(t), 300)
+                    if n > 0:
+                        top_k_indices[i, :n] = t[:n]
+
+                retrieved_sections = []
+                true_labels_list, predicted_labels_list = [], []
+
+                for q_idx, retrieved_docs_indices in enumerate(top_k_indices):
+                    q_id_str = original_query_ids[q_idx]
+                    true_labels = citation_mapping.get(q_id_str, [])
+
+                    # Map (d_idx -> orig doc ID); skip padding -1
+                    doc_entries = []
+                    for d_idx in retrieved_docs_indices:
+                        if d_idx < 0:
+                            continue
+                        orig_doc_idx = d_idx % original_doc_count
+                        doc_entries.append((d_idx, original_doc_ids[orig_doc_idx]))
+                    # Dedupe by doc ID, preserve order; track d_idx for section
+                    seen = set()
+                    unique_predicted = []
+                    section_d_indices = []
+                    for d_idx, label in doc_entries:
+                        if label not in seen:
+                            seen.add(label)
+                            unique_predicted.append(label)
+                            section_d_indices.append(d_idx)
+                    predicted_labels = unique_predicted[:100]
+                    retrieved_sections.append([
+                        ["abstract", "claim", "invention"][d_idx // original_doc_count]
+                        for d_idx in section_d_indices[:100]
+                    ])
+                
+                    true_labels_list.append(true_labels)
+                    predicted_labels_list.append(predicted_labels)
+            
+                results_key = f"{texttype_q}->all"
+                results[results_key] = _make_prior_art_metrics(
+                    true_labels_list, predicted_labels_list,
+                    retrieved_sections=f"[{len(retrieved_sections)} queries with retrieved sections]"
                 )
-                results[results_key]['section_analysis'] = section_analysis
+                _save_rankings(save_rankings_claim2all_path, original_query_ids, predicted_labels_list, f"{texttype_q}->all")
+
+                _display_prior_art_results(results, results_key, retrieved_sections,
+                                           query_section=texttype_q, header_suffix=" (SPLADE)")
         
-        # Run SPLADE-specific evaluation
-        splade_prior_art_evaluation(query_ids, doc_ids, query_embeddings_sparse, document_embeddings_sparse,
-                                    citation_mapping, query_types, doc_types, model)
+            # Run SPLADE-specific evaluation
+            splade_prior_art_evaluation(query_ids, doc_ids, query_embeddings_sparse, document_embeddings_sparse,
+                                        citation_mapping, query_types, doc_types,
+                                        save_rankings_path=save_rankings_abs,
+                                        save_rankings_claim2all_path=save_rankings_claim)
         
-        print("\n✅ SPLADE-v2 evaluation completed!")
+            print("\n✅ SPLADE-v2 evaluation completed!")
+
+########################################################################################################################################################
+########################################################################################################################################################
+    elif args.model_name.lower() in _COLBERT_MODEL_NAMES:
+        """
+        ColBERTv2 – Contextualised Late Interaction over BERT (arXiv:2112.01488)
+
+        ColBERT encodes each text into a matrix of **token-level** 128-d embeddings.
+        Scoring is via MaxSim: for every query token, take the max cosine similarity
+        with any document token, then sum over all query tokens.  This is more
+        expressive than a single-vector dot product but more expensive.
+        """
+        print(f"\n🔍 Loading ColBERTv2 model: colbert-ir/colbertv2.0")
+        import pickle
+        try:
+            from colbert.modeling.checkpoint import Checkpoint
+            from colbert.infra import ColBERTConfig as _ColBERTConfig
+        except ImportError:
+            print("❌  colbert-ai package not installed. Install with:  pip install colbert-ai")
+            sys.exit(1)
+
+        _colbert_config = _ColBERTConfig(doc_maxlen=512, query_maxlen=64, nbits=2)
+
+        if not getattr(args, 'clefip_only', False):
+            # ── Encode prior-art texts by section ──
+            # ColBERT does **not** use section tokens; just raw text.
+            _colbert_cache_dir = os.path.join(priorart_temp_dir, "colbert_embs")
+            os.makedirs(_colbert_cache_dir, exist_ok=True)
+            _colbert_cache_path = os.path.join(_colbert_cache_dir, "embs.pkl")
+
+            if os.path.isfile(_colbert_cache_path):
+                print("📦 Loading cached ColBERT prior-art token embeddings...")
+                with open(_colbert_cache_path, "rb") as _f:
+                    _colbert_embs = pickle.load(_f)
+                query_embs_dict = _colbert_embs["query"]
+                doc_embs_dict = _colbert_embs["doc"]
+                print("✅ ColBERT embeddings loaded from cache (checkpoint not needed)")
+            else:
+                _colbert_ckpt = Checkpoint("colbert-ir/colbertv2.0", colbert_config=_colbert_config)
+                print("✅ ColBERTv2 checkpoint loaded")
+                query_embs_dict = {}
+                doc_embs_dict = {}
+                _bs = 32
+                for texttype in ["abstract", "claim", "invention"]:
+                    print(f"\n   Encoding {texttype}...")
+                    if texttype == "abstract":
+                        q_texts = (queries_df['title'] + '. ' + queries_df['abstract']).fillna('').tolist()
+                        d_texts = (documents_df['title'] + '. ' + documents_df['abstract']).fillna('').tolist()
+                    else:
+                        q_texts = queries_df[texttype].fillna('').tolist()
+                        d_texts = documents_df[texttype].fillna('').tolist()
+                    print(f"      queries ({len(q_texts)})...", flush=True)
+                    query_embs_dict[texttype] = _colbert_encode(_colbert_ckpt, q_texts, is_query=True, batch_size=_bs)
+                    print(f"      documents ({len(d_texts)})...", flush=True)
+                    doc_embs_dict[texttype] = _colbert_encode(_colbert_ckpt, d_texts, is_query=False, batch_size=_bs)
+
+                with open(_colbert_cache_path, "wb") as _f:
+                    pickle.dump({"query": query_embs_dict, "doc": doc_embs_dict}, _f, protocol=4)
+                print(f"💾 Saved ColBERT embeddings to {_colbert_cache_path}")
+                # Free GPU memory — checkpoint no longer needed after encoding
+                del _colbert_ckpt
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            original_query_ids = list(queries.keys())
+            original_doc_ids = list(documents.keys())
+
+            # ── Abstract→Abstract ──
+            print("\n🎯 ColBERT Abstract → Abstract evaluation")
+            sim_abs = _colbert_maxsim_matrix(query_embs_dict["abstract"], doc_embs_dict["abstract"])
+            top_k_abs = np.argsort(-sim_abs, axis=1)
+            true_labels_list, predicted_labels_list = [], []
+            for q_idx in range(len(original_query_ids)):
+                q_id = original_query_ids[q_idx]
+                true_labels_list.append(citation_mapping.get(q_id, []))
+                predicted_labels_list.append([original_doc_ids[d_idx] for d_idx in top_k_abs[q_idx]])
+            abs_results = _make_prior_art_metrics(true_labels_list, predicted_labels_list)
+            print_metric_table(abs_results, "ColBERT: Abstract → Abstract")
+            _save_rankings(save_rankings_abs, original_query_ids, predicted_labels_list, "abstract->abstract")
+
+            # ── Claim→All ──
+            print("\n🎯 ColBERT Claim → All evaluation")
+            # Query: claim embeddings.  Docs: abstract + claim + invention (3× stacked)
+            q_claim_embs = query_embs_dict["claim"]
+            d_all_embs = doc_embs_dict["abstract"] + doc_embs_dict["claim"] + doc_embs_dict["invention"]
+            sim_all = _colbert_maxsim_matrix(q_claim_embs, d_all_embs)
+            n_orig = len(original_doc_ids)
+            top_k_all = np.argsort(-sim_all, axis=1)[:, :300]
+            true_labels_list, predicted_labels_list = [], []
+            retrieved_sections = []
+            section_names = ["abstract", "claim", "invention"]
+            for q_idx in range(len(original_query_ids)):
+                q_id = original_query_ids[q_idx]
+                true_labels_list.append(citation_mapping.get(q_id, []))
+                seen = set()
+                preds, secs = [], []
+                for d_idx in top_k_all[q_idx]:
+                    orig_d = d_idx % n_orig
+                    doc_id = original_doc_ids[orig_d]
+                    if doc_id not in seen:
+                        seen.add(doc_id)
+                        preds.append(doc_id)
+                        secs.append(section_names[d_idx // n_orig])
+                predicted_labels_list.append(preds[:100])
+                retrieved_sections.append(secs[:100])
+            results = {"claim->all": _make_prior_art_metrics(
+                true_labels_list, predicted_labels_list,
+                retrieved_sections=f"[{len(retrieved_sections)} queries with retrieved sections]",
+            )}
+            _save_rankings(save_rankings_claim, original_query_ids, predicted_labels_list, "claim->all")
+            _display_prior_art_results(results, "claim->all", retrieved_sections,
+                                       query_section="claim", header_suffix=" (ColBERT)")
+
+            print("\n✅ ColBERT prior-art evaluation completed!")
 
 ########################################################################################################################################################
 ########################################################################################################################################################
@@ -1631,88 +2415,92 @@ def main():
         embedding_dim = model.config.hidden_size
         print(f"✅ Loaded tokenizer ({len(tokenizer)} tokens) and model (dim={embedding_dim})")
 
-        batch_size = 512
         # device already set at start of main()
         # Setup model for inference
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         model.to(device).eval()
         print(f"🚀 Model ready on {device}")
+        batch_size = _auto_batch_size(device, hidden_size=embedding_dim)
 
-        ############################ Prior-art Search evaluation ############################
-        if not os.path.exists(priorart_temp_dir):
-            os.makedirs(priorart_temp_dir)
-        if os.path.exists(f'{priorart_temp_dir}/query_embeddings.pt') and os.path.exists(f'{priorart_temp_dir}/document_embeddings.pt'):
-            print("Embeddings already created!")
-            query_embeddings = torch.load(f'{priorart_temp_dir}/query_embeddings.pt', weights_only=False)
-            document_embeddings = torch.load(f'{priorart_temp_dir}/document_embeddings.pt', weights_only=False)
-        else:
-            # Use EXACT same approach as patent.py: compute embeddings by text type separately
-            # This ensures complete consistency when evaluating checkpoint models
-            query_embeddings_dict = {}
-            doc_embeddings_dict = {}
+        if not getattr(args, 'clefip_only', False):
+            ############################ Prior-art Search evaluation ############################
+            if not os.path.exists(priorart_temp_dir):
+                os.makedirs(priorart_temp_dir)
+            if os.path.exists(f'{priorart_temp_dir}/query_embeddings.pt') and os.path.exists(f'{priorart_temp_dir}/document_embeddings.pt'):
+                print("Embeddings already created!")
+                query_embeddings = torch.load(f'{priorart_temp_dir}/query_embeddings.pt', weights_only=False)
+                document_embeddings = torch.load(f'{priorart_temp_dir}/document_embeddings.pt', weights_only=False)
+            else:
+                # Use EXACT same approach as patent.py: compute embeddings by text type separately
+                # This ensures complete consistency when evaluating checkpoint models
+                query_embeddings_dict = {}
+                doc_embeddings_dict = {}
             
-            # Process each text type separately, exactly like patent.py
-            for texttype in ["abstract", "claim", "invention"]:
-                # Format texts exactly like patent.py
-                if texttype == "abstract":
-                    query_texts = [queries_df.iloc[i]['title'] + f" [SEP] [{texttype}] " + queries_df.iloc[i][texttype] for i in range(len(queries_df))]
-                    doc_texts = [documents_df.iloc[i]['title'] + f" [SEP] [{texttype}] " + documents_df.iloc[i][texttype] for i in range(len(documents_df))]
-                else:
-                    query_texts = [f"[{texttype}] " + queries_df.iloc[i][texttype] for i in range(len(queries_df))]
-                    doc_texts = [f"[{texttype}] " + documents_df.iloc[i][texttype] for i in range(len(documents_df))]
+                # Process each text type separately, exactly like patent.py
+                for texttype in ["abstract", "claim", "invention"]:
+                    # Format texts exactly like patent.py
+                    if texttype == "abstract":
+                        query_texts = [queries_df.iloc[i]['title'] + f" [SEP] [{texttype}] " + queries_df.iloc[i][texttype] for i in range(len(queries_df))]
+                        doc_texts = [documents_df.iloc[i]['title'] + f" [SEP] [{texttype}] " + documents_df.iloc[i][texttype] for i in range(len(documents_df))]
+                    else:
+                        query_texts = [f"[{texttype}] " + queries_df.iloc[i][texttype] for i in range(len(queries_df))]
+                        doc_texts = [f"[{texttype}] " + documents_df.iloc[i][texttype] for i in range(len(documents_df))]
                 
-                # Tokenize and compute embeddings for this text type
-                query_encodings = tokenizer(query_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
-                doc_encodings = tokenizer(doc_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
+                    # Tokenize and compute embeddings for this text type
+                    query_encodings = tokenizer(query_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
+                    doc_encodings = tokenizer(doc_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
                 
-                # Compute embeddings
-                query_embs = np.zeros((len(query_encodings['input_ids']), embedding_dim))
-                doc_embs = np.zeros((len(doc_encodings['input_ids']), embedding_dim))
+                    # Compute embeddings
+                    query_embs = np.zeros((len(query_encodings['input_ids']), embedding_dim))
+                    doc_embs = np.zeros((len(doc_encodings['input_ids']), embedding_dim))
                 
-                def _get_embeddings(batch):
-                    """Pooler output (BertForCL) or CLS token (standard Bert); supports HF-loaded PatentMap models."""
-                    try:
-                        out = model(**batch, output_hidden_states=True, return_dict=True, sent_emb=True)
-                        return out.pooler_output
-                    except TypeError:
-                        out = model(**batch, output_hidden_states=True, return_dict=True)
-                        return out.last_hidden_state[:, 0]
+                    def _get_embeddings(batch):
+                        """Pooler output (BertForCL) or CLS token (standard Bert); supports HF-loaded PatentMap models."""
+                        try:
+                            out = model(**batch, output_hidden_states=True, return_dict=True, sent_emb=True)
+                            return out.pooler_output
+                        except TypeError:
+                            out = model(**batch, output_hidden_states=True, return_dict=True)
+                            return out.last_hidden_state[:, 0]
 
-                with torch.no_grad():
-                    for i in trange(0, len(query_encodings['input_ids']), batch_size, desc=f"Computing {texttype} query embeddings"):
-                        batch = {key: val[i:i+batch_size].to(device) for key, val in query_encodings.items()}
-                        query_embs[i:i+batch_size] = _get_embeddings(batch).detach().cpu().numpy()
-                    for i in trange(0, len(doc_encodings['input_ids']), batch_size, desc=f"Computing {texttype} document embeddings"):
-                        batch = {key: val[i:i+batch_size].to(device) for key, val in doc_encodings.items()}
-                        doc_embs[i:i+batch_size] = _get_embeddings(batch).detach().cpu().numpy()
+                    with torch.no_grad():
+                        for i in trange(0, len(query_encodings['input_ids']), batch_size, desc=f"Computing {texttype} query embeddings"):
+                            batch = {key: val[i:i+batch_size].to(device) for key, val in query_encodings.items()}
+                            query_embs[i:i+batch_size] = _get_embeddings(batch).detach().cpu().numpy()
+                        for i in trange(0, len(doc_encodings['input_ids']), batch_size, desc=f"Computing {texttype} document embeddings"):
+                            batch = {key: val[i:i+batch_size].to(device) for key, val in doc_encodings.items()}
+                            doc_embs[i:i+batch_size] = _get_embeddings(batch).detach().cpu().numpy()
                 
-                # Store embeddings by text type
-                query_embeddings_dict[texttype] = query_embs
-                doc_embeddings_dict[texttype] = doc_embs
+                    # Store embeddings by text type
+                    query_embeddings_dict[texttype] = query_embs
+                    doc_embeddings_dict[texttype] = doc_embs
+                    # Free GPU cache between text types to avoid fragmentation OOM
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
             
-            # For compatibility with existing evaluation code, we'll create the concatenated versions
-            # But the evaluation should use the separated versions to match patent.py exactly
-            query_embeddings = np.concatenate([query_embeddings_dict["abstract"], query_embeddings_dict["claim"], query_embeddings_dict["invention"]], axis=0)
-            document_embeddings = np.concatenate([doc_embeddings_dict["abstract"], doc_embeddings_dict["claim"], doc_embeddings_dict["invention"]], axis=0)
+                # For compatibility with existing evaluation code, we'll create the concatenated versions
+                # But the evaluation should use the separated versions to match patent.py exactly
+                query_embeddings = np.concatenate([query_embeddings_dict["abstract"], query_embeddings_dict["claim"], query_embeddings_dict["invention"]], axis=0)
+                document_embeddings = np.concatenate([doc_embeddings_dict["abstract"], doc_embeddings_dict["claim"], doc_embeddings_dict["invention"]], axis=0)
 
-            print(query_embeddings.shape, document_embeddings.shape)
+                print(query_embeddings.shape, document_embeddings.shape)
 
-            torch.save(query_embeddings, f'{priorart_temp_dir}/query_embeddings.pt')
-            torch.save(document_embeddings, f'{priorart_temp_dir}/document_embeddings.pt')
-            np.savez(f'{priorart_temp_dir}/query_embeddings_by_type.npz', **query_embeddings_dict)
-            np.savez(f'{priorart_temp_dir}/doc_embeddings_by_type.npz', **doc_embeddings_dict)
+                torch.save(query_embeddings, f'{priorart_temp_dir}/query_embeddings.pt')
+                torch.save(document_embeddings, f'{priorart_temp_dir}/document_embeddings.pt')
+                np.savez(f'{priorart_temp_dir}/query_embeddings_by_type.npz', **query_embeddings_dict)
+                np.savez(f'{priorart_temp_dir}/doc_embeddings_by_type.npz', **doc_embeddings_dict)
 
-        query_embeddings = query_embeddings.astype('float32')
-        document_embeddings = document_embeddings.astype('float32')
+            query_embeddings = np.asarray(query_embeddings, dtype=np.float32)
+            document_embeddings = np.asarray(document_embeddings, dtype=np.float32)
 
-        # For checkpoint models, use the exact same evaluation method as patent.py to ensure consistency
-        print("Using patent.py-compatible evaluation for checkpoint model...")
-        print("This ensures exact consistency with training-time evaluation results.")
+            # For checkpoint models, use the exact same evaluation method as patent.py to ensure consistency
+            print("Using patent.py-compatible evaluation for checkpoint model...")
+            print("This ensures exact consistency with training-time evaluation results.")
         
-        # Use the standard evaluation for now, but note that minor differences may exist
-        # due to different data organization methods between evaluate.py and patent.py
-        prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=save_rankings_abs, save_rankings_claim2all_path=save_rankings_claim, model_label="PatentMap")
+            # Use the standard evaluation for now, but note that minor differences may exist
+            # due to different data organization methods between evaluate.py and patent.py
+            prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, save_rankings_path=save_rankings_abs, save_rankings_claim2all_path=save_rankings_claim, model_label="PatentMap")
 
 
 ########################################################################################################################################################
@@ -1722,7 +2510,7 @@ def main():
         Sparse Coverage Retrieval
         
         Uses pre-built vocabulary centers for sparse retrieval.
-        Documents from the evaluation corpus are encoded at runtime (or loaded from cache/--embeddings_dir).
+        Documents from the evaluation corpus are encoded at runtime (or loaded from cache).
         Both queries and documents are encoded and assigned to centers.
         """
         print(f"\n🔍 Sparse Coverage Retrieval")
@@ -1780,49 +2568,19 @@ def main():
         model.to(device)
         model.eval()
         print(f"✅ Dense encoder loaded (hidden_size={model.config.hidden_size})")
-        
-        # Find centers and posting lists files
-        # Search in current directory (recursive search is handled by find_centers)
-        print(f"\n🔍 Searching for centers...")
-        print(f"   Search directory: {os.path.abspath('.')}")
-        
-        # Find all available centers for both modes
-        available_modes = []
-        centers_info_dict = {}  # mode -> (centers_path, centers_dir)
-        
-        for test_mode in ["abstract2abstract", "claim2all"]:
-            try:
-                c_path, c_dir = find_centers(
-                    dense_model=args.dense_model,
-                    tokenization_unit=args.tokenization_unit,
-                    include_cls=include_cls,
-                    search_dir=".",
-                    mode=test_mode,
-                    layer=getattr(args, 'layer', 'last'),
-                    centers_suffix=getattr(args, 'centers_suffix', ''),
-                )
-                centers_info_dict[test_mode] = (c_path, c_dir)
-                available_modes.append(test_mode)
-                print(f"✅ Found centers for mode: {test_mode}")
-                print(f"   Centers: {c_path}")
-            except FileNotFoundError as e:
-                layer = getattr(args, 'layer', 'last')
-                print(f"⚠️  No centers found for mode: {test_mode} (layer: {layer})")
-                continue
-        
-        if not available_modes:
-            layer = getattr(args, 'layer', 'last')
-            raise FileNotFoundError(
-                f"Could not find centers for any mode:\n"
-                f"  dense_model={args.dense_model}\n"
-                f"  tokenization_unit={args.tokenization_unit}\n"
-                f"  (eval assumes centers built with CLS; layer={layer})\n"
-                f"Searched in: {os.path.abspath('.')} (recursive)\n"
-                f"Expected pattern: centers_greedy_{{mode}}_{{model}}_{{unit}}_{{cls}}_{{layer}}\n"
-                f"Please ensure centers were built with matching parameters, or use --layer last if you have centers built with 'last' layer."
-            )
-        
-        print(f"\n📋 Will process {len(available_modes)} task(s): {', '.join(available_modes)}")
+
+        # Common kwargs for all process_doc_batch calls
+        import functools as _ft
+        _encode_spans = _ft.partial(
+            process_doc_batch,
+            unit=args.tokenization_unit,
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            max_length=512,
+            keep_cls=include_cls,
+            span_pooling="mean",
+        )
         
         # -----------------------------
         # Correct per-mode evaluation
@@ -1860,36 +2618,6 @@ def main():
             r = float(r)
             sim_threshold = float(sim_threshold) if sim_threshold is not None else (1.0 - r)
             return r, sim_threshold
-        
-        def _embeddings_dir_name() -> str:
-            if getattr(args, "embeddings_dir", None):
-                return os.path.abspath(args.embeddings_dir)
-            model_name_clean = args.dense_model.strip("/").split("/")[-1].replace("/", "_").replace("\\", "_")
-            cls_suffix = "cls" if include_cls else "nocls"
-            layer = getattr(args, "layer", "last")
-            return f"embeddings_{model_name_clean}_{args.tokenization_unit}_{cls_suffix}_{layer}"
-        
-        def _metadata_path(section_name: str) -> str:
-            return os.path.join(_embeddings_dir_name(), f"{section_name}_{args.tokenization_unit}_metadata.jsonl")
-        
-        def _embeddings_path(section_name: str) -> str:
-            # Prefer .npy, fallback to .npz
-            p_npy = os.path.join(_embeddings_dir_name(), f"{section_name}_{args.tokenization_unit}.npy")
-            if os.path.exists(p_npy):
-                return p_npy
-            p_npz = os.path.join(_embeddings_dir_name(), f"{section_name}_{args.tokenization_unit}.npz")
-            if os.path.exists(p_npz):
-                return p_npz
-            raise FileNotFoundError(f"Could not find embeddings for section={section_name} in {_embeddings_dir_name()}")
-        
-        def _load_embeddings(file_path: str) -> np.ndarray:
-            if file_path.endswith(".npz"):
-                with np.load(file_path) as data:
-                    keys = list(data.keys())
-                    if not keys:
-                        raise ValueError(f"Empty .npz file: {file_path}")
-                    return data[keys[0]].astype(np.float32)
-            return np.load(file_path).astype(np.float32)
         
         def _encode_doc_spans(
             documents: dict,
@@ -1933,17 +2661,10 @@ def main():
                 for b_start in tqdm(range(0, len(sec_texts), batch_size),
                                     desc=f"Encoding doc {section}", leave=False):
                     b_end = min(b_start + batch_size, len(sec_texts))
-                    results = process_doc_batch(
+                    results = _encode_spans(
                         doc_texts=sec_texts[b_start:b_end],
                         doc_ids=sec_ids[b_start:b_end],
                         sections=sec_sections[b_start:b_end],
-                        unit=args.tokenization_unit,
-                        model=model,
-                        tokenizer=tokenizer,
-                        device=device,
-                        max_length=512,
-                        keep_cls=include_cls,
-                        span_pooling="mean",
                         keep_doc_mean=False,
                         layer=getattr(args, "layer", "last"),
                     )
@@ -2004,10 +2725,21 @@ def main():
                 p = os.path.join(cache_dir, f"{sec}_{args.tokenization_unit}.npy")
                 if not os.path.exists(p):
                     raise FileNotFoundError(p)
-                arr = np.load(p).astype(np.float32)
+                arr = np.load(p)
+                if arr.dtype != np.float32:
+                    arr = arr.astype(np.float32)
                 embeddings_by_section[sec] = arr
                 total_loaded += arr.shape[0]
 
+            span_to_doc, exclude_cls_indices = _load_doc_cache_meta(cache_dir)
+            return embeddings_by_section, span_to_doc, exclude_cls_indices, total_loaded
+
+        def _load_doc_cache_meta(cache_dir: str) -> tuple[dict[int, str], set[int]]:
+            """Load only the span_to_doc metadata (no embeddings).
+            
+            Returns (span_to_doc, exclude_cls_indices).
+            Raises FileNotFoundError if meta file is missing.
+            """
             span_to_doc: dict[int, str] = {}
             exclude_cls_indices: set[int] = set()
             meta_path = os.path.join(cache_dir, f"span_to_doc_{args.tokenization_unit}.jsonl")
@@ -2021,7 +2753,34 @@ def main():
                     span_to_doc[entry["i"]] = entry["d"]
                     if entry.get("cls"):
                         exclude_cls_indices.add(entry["i"])
-            return embeddings_by_section, span_to_doc, exclude_cls_indices, total_loaded
+            return span_to_doc, exclude_cls_indices
+
+        def _get_section_shape(cache_dir: str, section: str) -> int:
+            """Read the row count of a cached .npy without loading the full array."""
+            p = os.path.join(cache_dir, f"{section}_{args.tokenization_unit}.npy")
+            if not os.path.exists(p):
+                raise FileNotFoundError(p)
+            arr = np.load(p, mmap_mode='r')
+            n = arr.shape[0]
+            del arr
+            return n
+
+        def _load_section_emb(cache_dir: str, section: str) -> np.ndarray:
+            """Load a single section's embeddings from cache using mmap.
+            
+            Returns a memory-mapped array (read-only). Callers should
+            np.array(..., copy=True) to get a writable copy when needed,
+            then del the mmap reference to keep peak RSS low.
+            """
+            p = os.path.join(cache_dir, f"{section}_{args.tokenization_unit}.npy")
+            return np.load(p, mmap_mode='r')
+        
+        def _doc_cache_exists(cache_dir: str, doc_sections: list[str]) -> bool:
+            """Lightweight check: do all cache files exist? Does NOT load data."""
+            for sec in doc_sections:
+                if not os.path.exists(os.path.join(cache_dir, f"{sec}_{args.tokenization_unit}.npy")):
+                    return False
+            return os.path.exists(os.path.join(cache_dir, f"span_to_doc_{args.tokenization_unit}.jsonl"))
         
         def _encode_query_spans(texts: list[str], section: str, d: int, batch_size: int = 32) -> list[np.ndarray]:
             all_query_spans: list[np.ndarray] = []
@@ -2034,17 +2793,10 @@ def main():
                 batch_sections = sections[batch_start:batch_end]
                 batch_doc_ids = doc_ids[batch_start:batch_end]
                 
-                batch_results = process_doc_batch(
+                batch_results = _encode_spans(
                     doc_texts=batch_texts,
                     doc_ids=batch_doc_ids,
                     sections=batch_sections,
-                    unit=args.tokenization_unit,
-                    model=model,
-                    tokenizer=tokenizer,
-                    device=device,
-                    max_length=512,
-                    keep_cls=include_cls,
-                    span_pooling="mean",
                 )
                 
                 query_exclude_cls = getattr(args, "exclude_cls_spans", False)
@@ -2100,17 +2852,10 @@ def main():
             all_batch_results: list[tuple] = []
             for b_start in range(0, len(batch_texts), batch_size):
                 b_end = min(b_start + batch_size, len(batch_texts))
-                br = process_doc_batch(
+                br = _encode_spans(
                     doc_texts=batch_texts[b_start:b_end],
                     doc_ids=batch_doc_ids[b_start:b_end],
                     sections=batch_sections[b_start:b_end],
-                    unit=args.tokenization_unit,
-                    model=model,
-                    tokenizer=tokenizer,
-                    device=device,
-                    max_length=512,
-                    keep_cls=include_cls,
-                    span_pooling="mean",
                 )
                 all_batch_results.extend(br)
             # Group spans by doc_id (= "query_{qidx}_{cidx}")
@@ -2307,72 +3052,320 @@ def main():
 
             return query_sparse
         
+        # ---- Pre-cache doc embeddings for all potential modes ----
+        # This runs BEFORE center search so that even if centers are not
+        # built yet the (expensive) doc-side embeddings are cached for later.
+        _mode_to_sections = {
+            "abstract2abstract": ["abstract"],
+            "claim2all": ["abstract", "claim", "invention"],
+        }
+        for _pre_mode, _pre_sections in _mode_to_sections.items():
+            _pre_cache = _doc_cache_dir(_pre_mode)
+            if _doc_cache_exists(_pre_cache, _pre_sections):
+                print(f"   ✅ Doc cache already exists for {_pre_mode}")
+            else:
+                print(f"   📦 Pre-caching doc embeddings for {_pre_mode}...")
+                _pre_emb, _pre_s2d, _pre_cls = _encode_doc_spans(
+                    documents, _pre_sections, batch_size=32
+                )
+                _save_doc_cache(_pre_cache, _pre_sections, _pre_emb, _pre_s2d, _pre_cls)
+                print(f"   ✅ Cached {sum(e.shape[0] for e in _pre_emb.values()):,} spans for {_pre_mode}")
+        
+        # ---- Load CLEF-IP data for clefip_passage mode ----
+        _clefip_data = None
+        try:
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            raw_clefip = getattr(args, "clefip_root", None) or ""
+            if raw_clefip and os.path.isabs(raw_clefip):
+                _clefip_root = raw_clefip
+            else:
+                _clefip_root = os.path.normpath(os.path.join(current_dir, raw_clefip or "clefip2013"))
+            if not os.path.isdir(_clefip_root):
+                _fallback = os.path.normpath(os.path.join(current_dir, "clefip2013"))
+                if _fallback != _clefip_root and os.path.isdir(_fallback):
+                    _clefip_root = _fallback
+                else:
+                    raise FileNotFoundError(f"CLEF-IP root not found: {_clefip_root}")
+            if current_dir not in sys.path:
+                sys.path.insert(0, current_dir)
+            from clefip2013.load_clefip import (
+                load_clefip_en_for_eval_full_corpus as _load_clefip_full,
+                load_clefip_en_for_eval_sampled_corpus as _load_clefip_sampled,
+                FULL_CORPUS_DIR_EN as _CLEFIP_FULL_DIR,
+                CORPUS_JSONL as _CLEFIP_JSONL,
+                IDS_TXT as _CLEFIP_IDS,
+            )
+            _doc_root = os.path.join(_clefip_root, "01_document_collection", "01_extracted")
+            if not os.path.isdir(_doc_root):
+                raise FileNotFoundError(f"CLEF-IP document collection not found: {_doc_root}")
+            _sample_size = getattr(args, "clefip_sample_size", 0) or 0
+            _rebuild = getattr(args, "clefip_rebuild_corpus", False)
+            if _sample_size != 0:
+                _cq_ids, _cq_texts, _c_jsonl, _c_ids_txt, _c_npsg, _c_qrels = _load_clefip_sampled(
+                    _clefip_root, _doc_root, sample_size=_sample_size, rebuild_corpus=_rebuild
+                )
+            else:
+                _cq_ids, _cq_texts, _c_jsonl, _c_ids_txt, _c_npsg, _c_qrels = _load_clefip_full(
+                    _clefip_root, _doc_root, corpus_dir=None, rebuild_corpus=_rebuild
+                )
+            with open(_c_ids_txt, "r", encoding="utf-8") as f:
+                _c_passage_ids = [line.strip() for line in f]
+            assert len(_c_passage_ids) == _c_npsg
+            # Load passage texts
+            print(f"Loading CLEF-IP passage texts for sparse_coverage ({_c_npsg:,} passages)...")
+            _c_passage_texts = []
+            with open(_c_jsonl, "r", encoding="utf-8") as f:
+                for line in f:
+                    _c_passage_texts.append(json.loads(line)["text"])
+            assert len(_c_passage_texts) == _c_npsg
+            _clefip_data = {
+                "query_ids": _cq_ids,
+                "query_texts": _cq_texts,
+                "passage_ids": _c_passage_ids,
+                "passage_texts": _c_passage_texts,
+                "qrels_passage_ids": _c_qrels,
+            }
+            print(f"   ✅ CLEF-IP data loaded: {len(_cq_ids)} queries, {_c_npsg:,} passages")
+        except FileNotFoundError as e:
+            print(f"   ⚠️ CLEF-IP data not available ({e}); skipping clefip_passage mode")
+            _clefip_data = None
+        except Exception as e:
+            print(f"   ⚠️ Failed to load CLEF-IP data: {e}; skipping clefip_passage mode")
+            _clefip_data = None
+
+        def _encode_clefip_spans(
+            passage_ids_list: list[str],
+            passage_texts_list: list[str],
+            doc_sections: list[str],
+            cache_dir: str,
+            batch_size: int = 32,
+        ) -> int:
+            """Encode CLEF-IP passages and stream directly to disk (memory-efficient).
+
+            Each passage is treated as a single-section document.
+            Embeddings are streamed to a raw binary file per section, then
+            converted to .npy via memmap so that peak RAM is bounded by one
+            batch rather than the entire section.
+
+            Saves .npy files and span_to_doc .jsonl into *cache_dir*.
+            Returns total number of spans saved.
+            """
+            os.makedirs(cache_dir, exist_ok=True)
+            hidden_size = model.config.hidden_size
+            format_scheme = get_encoder_format_scheme(args.dense_model)
+            section_map = {"abstract": "abstract", "description": "invention", "claim": "claim"}
+
+            # Group passages by section
+            items_by_section: dict[str, list[tuple[str, str, str]]] = {}
+            for pid, text in zip(passage_ids_list, passage_texts_list):
+                sec_raw = _clefip_passage_section(pid)
+                sec = section_map.get(sec_raw, sec_raw)
+                if sec not in doc_sections:
+                    continue
+                if sec == "claim":
+                    fmt_text = format_claim_for_encoder(format_scheme, text)
+                elif sec == "invention":
+                    fmt_text = format_invention_for_encoder(format_scheme, text)
+                else:
+                    fmt_text = format_abstract_for_encoder(format_scheme, "", text, sep="")
+                items_by_section.setdefault(sec, []).append((pid, sec, fmt_text))
+
+            span_to_doc: dict[int, str] = {}
+            exclude_cls_indices: set[int] = set()
+            exclude_cls = getattr(args, "exclude_cls_spans", False)
+            current_idx = 0
+            total_spans = 0
+
+            for section in doc_sections:
+                items = items_by_section.get(section, [])
+                npy_path = os.path.join(cache_dir, f"{section}_{args.tokenization_unit}.npy")
+                if not items:
+                    np.save(npy_path, np.zeros((0, hidden_size), dtype=np.float32))
+                    continue
+
+                sec_ids = [it[0] for it in items]
+                sec_sections = [it[1] for it in items]
+                sec_texts = [it[2] for it in items]
+
+                # Stream embeddings to a temporary raw binary file to avoid OOM.
+                # Peak RAM = one batch of embeddings + metadata lists (< 2 GB).
+                raw_path = os.path.join(cache_dir, f"_tmp_{section}.raw")
+                span_count = 0
+                section_doc_ids: list[str] = []
+                section_is_cls: list[bool] = []
+
+                with open(raw_path, "wb") as raw_f:
+                    for b_start in tqdm(range(0, len(sec_texts), batch_size),
+                                        desc=f"Encoding CLEF-IP {section}", leave=False):
+                        b_end = min(b_start + batch_size, len(sec_texts))
+                        results = _encode_spans(
+                            doc_texts=sec_texts[b_start:b_end],
+                            doc_ids=sec_ids[b_start:b_end],
+                            sections=sec_sections[b_start:b_end],
+                            keep_doc_mean=False,
+                            layer=getattr(args, "layer", "last"),
+                        )
+                        for doc_id, _sec, _dtxt, span_raw, span_canon, emb in results:
+                            raw_f.write(emb.astype(np.float32).tobytes())
+                            span_count += 1
+                            is_cls = (span_canon or "").strip().lower() == "cls" or (span_raw or "").strip() == "[CLS]"
+                            section_doc_ids.append(doc_id)
+                            section_is_cls.append(is_cls)
+
+                # Convert raw binary → proper .npy via memmap (constant RAM)
+                if span_count > 0:
+                    raw_mm = np.memmap(raw_path, dtype=np.float32, mode="r",
+                                       shape=(span_count, hidden_size))
+                    out_mm = np.lib.format.open_memmap(
+                        npy_path, mode="w+", dtype=np.float32,
+                        shape=(span_count, hidden_size),
+                    )
+                    CHUNK = 100_000  # ~400 MB per chunk at 1024-dim float32
+                    for ci in range(0, span_count, CHUNK):
+                        ce = min(ci + CHUNK, span_count)
+                        out_mm[ci:ce] = raw_mm[ci:ce]
+                    out_mm.flush()
+                    del out_mm, raw_mm
+                else:
+                    np.save(npy_path, np.zeros((0, hidden_size), dtype=np.float32))
+                os.remove(raw_path)
+
+                # Update global metadata
+                for did, is_c in zip(section_doc_ids, section_is_cls):
+                    span_to_doc[current_idx] = did
+                    if exclude_cls and is_c:
+                        exclude_cls_indices.add(current_idx)
+                    current_idx += 1
+
+                total_spans += span_count
+                print(f"   {section}: {span_count:,} spans from {len(items):,} passages")
+                del section_doc_ids, section_is_cls
+
+            # Save span_to_doc metadata
+            meta_path = os.path.join(cache_dir, f"span_to_doc_{args.tokenization_unit}.jsonl")
+            with open(meta_path, "w") as f:
+                for idx in sorted(span_to_doc.keys()):
+                    entry = {"i": idx, "d": span_to_doc[idx]}
+                    if idx in exclude_cls_indices:
+                        entry["cls"] = True
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+            return total_spans
+
+        # Pre-cache CLEF-IP passage embeddings if data is available
+        if _clefip_data is not None:
+            _clefip_cache = _doc_cache_dir("clefip_passage")
+            _clefip_sections = ["abstract", "claim", "invention"]
+            if _doc_cache_exists(_clefip_cache, _clefip_sections):
+                print(f"   ✅ CLEF-IP passage cache already exists")
+            else:
+                print(f"   📦 Pre-caching CLEF-IP passage embeddings...")
+                _total_clefip_spans = _encode_clefip_spans(
+                    _clefip_data["passage_ids"], _clefip_data["passage_texts"],
+                    _clefip_sections, cache_dir=_clefip_cache, batch_size=32,
+                )
+                print(f"   ✅ Cached {_total_clefip_spans:,} spans for clefip_passage")
+
+        # ---- Find centers (shared across all tasks) ----
+        print(f"\n🔍 Searching for centers...")
+        print(f"   Search directory: {os.path.abspath('.')}")
+        
+        try:
+            centers_path, _centers_dir = find_centers(
+                dense_model=args.dense_model,
+                tokenization_unit=args.tokenization_unit,
+                include_cls=include_cls,
+                search_dir=".",
+                layer=getattr(args, 'layer', 'last'),
+                centers_suffix=getattr(args, 'centers_suffix', ''),
+            )
+            print(f"✅ Found centers: {centers_path}")
+        except FileNotFoundError:
+            layer = getattr(args, 'layer', 'last')
+            raise FileNotFoundError(
+                f"Doc embeddings have been cached, but could not find centers:\n"
+                f"  dense_model={args.dense_model}\n"
+                f"  tokenization_unit={args.tokenization_unit}\n"
+                f"  (eval assumes centers built with CLS; layer={layer})\n"
+                f"Searched in: {os.path.abspath('.')} (recursive)\n"
+                f"Expected pattern: centers_greedy_{{model}}_{{unit}}_{{cls}}_{{layer}}\n"
+                f"Please ensure centers were built with matching parameters, or use --layer last if you have centers built with 'last' layer."
+            )
+        
+        if getattr(args, 'clefip_only', False):
+            available_modes = ["clefip_passage"] if _clefip_data is not None else []
+        else:
+            available_modes = ["abstract2abstract", "claim2all"]
+            if _clefip_data is not None:
+                available_modes.append("clefip_passage")
+        print(f"\n📋 Will process {len(available_modes)} task(s): {', '.join(available_modes)}")
+        
+        # ---- Load centers & build FAISS index ONCE (shared across all modes) ----
+        print(f"\n📦 Loading centers...")
+        centers = np.load(centers_path).astype(np.float32)
+        V_original, d = centers.shape
+        print(f"   Original vocabulary size: {V_original:,} centers")
+        print(f"   Embedding dimension: {d}")
+        
+        centers_info = _load_centers_info_json(centers_path)
+        V = int(centers.shape[0])
+        stop_centers = set(centers_info.get("stop_centers", []))
+        if stop_centers:
+            print(f"   stop_centers: {len(stop_centers)} disabled for activation (df >= threshold)")
+        print(f"   Final vocabulary size: {V:,} centers")
+        
+        pca_proj_alpha = float(getattr(args, "pca_proj_alpha", 0.0))
+        residual_alpha = float(getattr(args, "residual_alpha", 0.0))
+        center_pca_dirs: Optional[np.ndarray] = None
+        if pca_proj_alpha != 0.0 or residual_alpha != 0.0:
+            pca_path = os.path.join(os.path.dirname(centers_path), "center_pca_dirs.npy")
+            if os.path.exists(pca_path):
+                center_pca_dirs = np.load(pca_path).astype(np.float32)
+                if center_pca_dirs.shape != (V, d):
+                    print(f"   ⚠️  center_pca_dirs.npy shape {center_pca_dirs.shape} != (V,d)=({V},{d}), disabling PCA/residual")
+                    center_pca_dirs = None
+                else:
+                    if pca_proj_alpha != 0.0:
+                        print(f"   PCA proj: alpha={pca_proj_alpha} (center_pca_dirs loaded)")
+                    if residual_alpha != 0.0:
+                        print(f"   Residual term: alpha={residual_alpha} (center_pca_dirs loaded)")
+            else:
+                if pca_proj_alpha != 0.0:
+                    print(f"   ⚠️  --pca_proj_alpha={pca_proj_alpha} but {pca_path} not found, disabling")
+                if residual_alpha != 0.0:
+                    print(f"   ⚠️  --residual_alpha={residual_alpha} but {pca_path} not found, disabling")
+                center_pca_dirs = None
+        else:
+            center_pca_dirs = None
+        
+        r, sim_threshold = _get_r_and_sim_threshold(centers_info)
+        
+        # Per-center similarity thresholds (from k-center Voronoi radii)
+        _rpc = centers_info.get("r_per_center", None)
+        if _rpc is not None and len(_rpc) >= V:
+            sim_thr_per_center = 1.0 - np.array(_rpc[:V], dtype=np.float32)
+            print(f"   Per-center r_c loaded: sim thresholds in [{sim_thr_per_center.min():.4f}, {sim_thr_per_center.max():.4f}]")
+        else:
+            sim_thr_per_center = np.full(V, float(sim_threshold), dtype=np.float32)
+            print(f"   No per-center r_c found; using global sim_threshold={sim_threshold:.4f} for all centers")
+        
+        if model.config.hidden_size != d:
+            raise ValueError(f"Dimension mismatch: model hidden_size={model.config.hidden_size} but centers dimension={d}")
+        
+        print(f"\n🔨 Building FAISS index on centers...")
+        centers_norm = centers.copy()
+        faiss.normalize_L2(centers_norm)
+        center_index = faiss.IndexFlatIP(d)
+        center_index.add(centers_norm.astype(np.float32))
+        print(f"✅ Center index built")
+        center_dot_pca: Optional[np.ndarray] = None
+        if center_pca_dirs is not None and residual_alpha != 0.0:
+            center_dot_pca = np.array([float(centers_norm[c] @ center_pca_dirs[c]) for c in range(V)], dtype=np.float32)
+        
         for mode in available_modes:
             print(f"\n{'='*80}")
             print(f"Processing task: {mode}")
             print(f"{'='*80}")
-            
-            centers_path, _centers_dir = centers_info_dict[mode]
-            print(f"\n📦 Loading centers...")
-            centers = np.load(centers_path).astype(np.float32)
-            V_original, d = centers.shape
-            print(f"   Original vocabulary size: {V_original:,} centers")
-            print(f"   Embedding dimension: {d}")
-            
-            centers_info = _load_centers_info_json(centers_path)
-            V = int(centers.shape[0])
-            stop_centers = set(centers_info.get("stop_centers", []))
-            if stop_centers:
-                print(f"   stop_centers: {len(stop_centers)} disabled for activation (df >= threshold)")
-            print(f"   Final vocabulary size: {V:,} centers")
-            
-            pca_proj_alpha = float(getattr(args, "pca_proj_alpha", 0.0))
-            residual_alpha = float(getattr(args, "residual_alpha", 0.0))
-            center_pca_dirs: Optional[np.ndarray] = None
-            if pca_proj_alpha != 0.0 or residual_alpha != 0.0:
-                pca_path = os.path.join(os.path.dirname(centers_path), "center_pca_dirs.npy")
-                if os.path.exists(pca_path):
-                    center_pca_dirs = np.load(pca_path).astype(np.float32)
-                    if center_pca_dirs.shape != (V, d):
-                        print(f"   ⚠️  center_pca_dirs.npy shape {center_pca_dirs.shape} != (V,d)=({V},{d}), disabling PCA/residual")
-                        center_pca_dirs = None
-                    else:
-                        if pca_proj_alpha != 0.0:
-                            print(f"   PCA proj: alpha={pca_proj_alpha} (center_pca_dirs loaded)")
-                        if residual_alpha != 0.0:
-                            print(f"   Residual term: alpha={residual_alpha} (center_pca_dirs loaded)")
-                else:
-                    if pca_proj_alpha != 0.0:
-                        print(f"   ⚠️  --pca_proj_alpha={pca_proj_alpha} but {pca_path} not found, disabling")
-                    if residual_alpha != 0.0:
-                        print(f"   ⚠️  --residual_alpha={residual_alpha} but {pca_path} not found, disabling")
-                    center_pca_dirs = None
-            else:
-                center_pca_dirs = None
-            
-            r, sim_threshold = _get_r_and_sim_threshold(centers_info)
-            
-            # Per-center similarity thresholds (from k-center Voronoi radii)
-            _rpc = centers_info.get("r_per_center", None)
-            if _rpc is not None and len(_rpc) >= V:
-                sim_thr_per_center = 1.0 - np.array(_rpc[:V], dtype=np.float32)
-                print(f"   Per-center r_c loaded: sim thresholds in [{sim_thr_per_center.min():.4f}, {sim_thr_per_center.max():.4f}]")
-            else:
-                sim_thr_per_center = np.full(V, float(sim_threshold), dtype=np.float32)
-                print(f"   No per-center r_c found; using global sim_threshold={sim_threshold:.4f} for all centers")
-            
-            if model.config.hidden_size != d:
-                raise ValueError(f"Dimension mismatch: model hidden_size={model.config.hidden_size} but centers dimension={d}")
-            
-            print(f"\n🔨 Building FAISS index on centers...")
-            centers_norm = centers.copy()
-            faiss.normalize_L2(centers_norm)
-            center_index = faiss.IndexFlatIP(d)
-            center_index.add(centers_norm.astype(np.float32))
-            print(f"✅ Center index built")
-            center_dot_pca: Optional[np.ndarray] = None
-            if center_pca_dirs is not None and residual_alpha != 0.0:
-                center_dot_pca = np.array([float(centers_norm[c] @ center_pca_dirs[c]) for c in range(V)], dtype=np.float32)
 
             # Decide which sections to use for document indexing
             if mode == "abstract2abstract":
@@ -2381,67 +3374,49 @@ def main():
             elif mode == "claim2all":
                 doc_sections = ["abstract", "claim", "invention"]
                 query_section = "claim"
+            elif mode == "clefip_passage":
+                doc_sections = ["abstract", "claim", "invention"]
+                query_section = "claim"
             else:
                 doc_sections = ["abstract"]
                 query_section = "abstract"
             
             # ---- Obtain doc-side embeddings + span_to_doc mapping ----
-            # Priority: 1) --embeddings_dir (pre-computed), 2) cached runtime embeddings, 3) encode at runtime
+            # Priority: 1) cached runtime embeddings, 2) encode at runtime
+            # For cached case, we use LAZY loading: metadata + shapes only,
+            # actual embeddings loaded one section at a time during posting-list build.
             exclude_cls_spans = getattr(args, "exclude_cls_spans", False)
             embeddings_by_section: dict[str, np.ndarray] = {}
             span_to_doc: dict[int, str] = {}
             exclude_cls_span_indices: set[int] = set()
             total_loaded = 0
+            _lazy_cache_dir = None  # type: str | None  # set when using lazy loading path
 
-            use_precomputed = False
-            if getattr(args, "embeddings_dir", None):
-                try:
-                    _emb_dir = os.path.abspath(args.embeddings_dir)
-                    for sec in doc_sections:
-                        _embeddings_path(sec)  # will raise if missing
-                    use_precomputed = True
-                except FileNotFoundError:
-                    print(f"   --embeddings_dir set but files missing; falling back to runtime encoding")
-
-            if use_precomputed:
-                _emb_dir = os.path.abspath(args.embeddings_dir)
-                print(f"\n📦 Loading pre-computed doc embeddings from: {_emb_dir}")
-                current_span_idx = 0
-
-                def _is_cls_span(meta: dict) -> bool:
-                    t = (meta.get("t") or "").strip().lower()
-                    r = (meta.get("r") or "").strip()
-                    return t == "cls" or r == "[CLS]"
-
-                for section_name in doc_sections:
-                    ep = _embeddings_path(section_name)
-                    sec_emb = _load_embeddings(ep)
-                    embeddings_by_section[section_name] = sec_emb
-                    total_loaded += sec_emb.shape[0]
-                    mp = _metadata_path(section_name)
-                    if os.path.exists(mp):
-                        with open(mp, "r") as f:
-                            for line in f:
-                                if not line.strip():
-                                    continue
-                                meta = json.loads(line)
-                                doc_id = meta.get("d", meta.get("doc_id", ""))
-                                span_to_doc[current_span_idx] = doc_id
-                                if exclude_cls_spans and _is_cls_span(meta):
-                                    exclude_cls_span_indices.add(current_span_idx)
-                                current_span_idx += 1
-                    else:
-                        raise FileNotFoundError(f"Metadata file not found alongside embeddings: {mp}")
-                    print(f"   {section_name}: {sec_emb.shape[0]:,} spans")
-            else:
-                cache_dir = _doc_cache_dir(mode)
-                try:
-                    print(f"\n📦 Trying cached doc embeddings from: {cache_dir}")
-                    embeddings_by_section, span_to_doc, exclude_cls_span_indices, total_loaded = _load_doc_cache(cache_dir, doc_sections)
-                    print(f"   Loaded {total_loaded:,} spans from cache")
-                    for sec in doc_sections:
-                        print(f"   {sec}: {embeddings_by_section[sec].shape[0]:,} spans")
-                except FileNotFoundError:
+            cache_dir = _doc_cache_dir(mode)
+            try:
+                print(f"\n📦 Trying cached doc embeddings from: {cache_dir}")
+                # Lazy path: load only metadata + shapes (no giant arrays)
+                span_to_doc, exclude_cls_span_indices = _load_doc_cache_meta(cache_dir)
+                section_shapes: dict[str, int] = {}
+                for sec in doc_sections:
+                    n = _get_section_shape(cache_dir, sec)
+                    section_shapes[sec] = n
+                    total_loaded += n
+                _lazy_cache_dir = cache_dir
+                print(f"   Loaded metadata ({len(span_to_doc):,} spans) from cache (lazy mode — arrays loaded per-section)")
+                for sec in doc_sections:
+                    print(f"   {sec}: {section_shapes[sec]:,} spans")
+            except FileNotFoundError:
+                if mode == "clefip_passage":
+                    print(f"\n📦 Encoding CLEF-IP passages at runtime (first run; will cache for reuse)")
+                    total_loaded = _encode_clefip_spans(
+                        _clefip_data["passage_ids"], _clefip_data["passage_texts"],
+                        doc_sections, cache_dir=cache_dir, batch_size=32,
+                    )
+                    # Use lazy path for the just-written cache
+                    span_to_doc, exclude_cls_span_indices = _load_doc_cache_meta(cache_dir)
+                    _lazy_cache_dir = cache_dir
+                else:
                     print(f"\n📦 Encoding documents at runtime (first run; will cache for reuse)")
                     embeddings_by_section, span_to_doc, exclude_cls_span_indices = _encode_doc_spans(
                         documents, doc_sections, batch_size=32
@@ -2454,13 +3429,18 @@ def main():
             print(f"   Total: {len(span_to_doc):,} span-to-doc mappings, {total_loaded:,} embedding rows")
 
             # Build per-doc span count for length normalization (stable, pre-filtering)
-            doc_id_to_idx = {doc_id: idx for idx, doc_id in enumerate(documents_df.index)}
+            if mode == "clefip_passage":
+                _clefip_pid_list = _clefip_data["passage_ids"]
+                doc_id_to_idx = {pid: idx for idx, pid in enumerate(_clefip_pid_list)}
+                N_docs = len(_clefip_pid_list)
+            else:
+                doc_id_to_idx = {doc_id: idx for idx, doc_id in enumerate(documents_df.index)}
+                N_docs = len(documents_df)
             doc_span_count: dict[str, int] = {}
             for span_idx, doc_id in span_to_doc.items():
                 if exclude_cls_spans and span_idx in exclude_cls_span_indices:
                     continue
                 doc_span_count[doc_id] = doc_span_count.get(doc_id, 0) + 1
-            N_docs = len(documents_df)
             doc_nspans = np.ones(N_docs, dtype=np.float32)
             for doc_id, cnt in doc_span_count.items():
                 didx = doc_id_to_idx.get(doc_id)
@@ -2481,12 +3461,17 @@ def main():
                 posting_lists = [[] for _ in range(V)]
                 span_offset = 0
                 for section_name in doc_sections:
-                    sec_emb = embeddings_by_section[section_name]
-                    if sec_emb.shape[0] == 0:
+                    # Lazy load: load one section at a time to avoid holding all in memory
+                    if _lazy_cache_dir is not None:
+                        _raw = _load_section_emb(_lazy_cache_dir, section_name)
+                    else:
+                        _raw = embeddings_by_section[section_name]
+                    if _raw.shape[0] == 0:
                         continue
-                    if sec_emb.shape[1] != d:
-                        raise ValueError(f"Embedding dimension mismatch for {section_name}: {sec_emb.shape[1]} != {d}")
-                    sec_emb = sec_emb.astype(np.float32).copy()
+                    if _raw.shape[1] != d:
+                        raise ValueError(f"Embedding dimension mismatch for {section_name}: {_raw.shape[1]} != {d}")
+                    sec_emb = np.array(_raw, dtype=np.float32, copy=True)  # single contiguous copy
+                    del _raw; import gc; gc.collect()  # free before normalize
                     faiss.normalize_L2(sec_emb)
                     sims, assigned = center_index.search(sec_emb, 1)
                     for j in range(sec_emb.shape[0]):
@@ -2502,6 +3487,7 @@ def main():
                             posting_lists[c].append((global_idx, sim, proj))
                     span_offset += sec_emb.shape[0]
                     print(f"     {section_name}: {sec_emb.shape[0]:,} spans assigned")
+                    del sec_emb; import gc; gc.collect()
                 print(f"   Total spans: {total_loaded:,}")
             else:
                 # Doc soft: search(K) + per-center threshold filter + topK cap
@@ -2512,13 +3498,18 @@ def main():
                 posting_lists = [[] for _ in range(V)]
                 span_offset = 0
                 for section_name in doc_sections:
-                    sec_emb = embeddings_by_section[section_name]
-                    if sec_emb.shape[0] == 0:
+                    # Lazy load: load one section at a time to avoid holding all in memory
+                    if _lazy_cache_dir is not None:
+                        _raw = _load_section_emb(_lazy_cache_dir, section_name)
+                    else:
+                        _raw = embeddings_by_section[section_name]
+                    if _raw.shape[0] == 0:
                         span_offset += 0
                         continue
-                    if sec_emb.shape[1] != d:
-                        raise ValueError(f"Embedding dimension mismatch for {section_name}: {sec_emb.shape[1]} != {d}")
-                    sec_emb_n = sec_emb.astype(np.float32).copy()
+                    if _raw.shape[1] != d:
+                        raise ValueError(f"Embedding dimension mismatch for {section_name}: {_raw.shape[1]} != {d}")
+                    sec_emb_n = np.array(_raw, dtype=np.float32, copy=True)  # single contiguous copy
+                    del _raw; import gc; gc.collect()  # free original before normalize
                     faiss.normalize_L2(sec_emb_n)
                     batch_size = max(1, int(getattr(args, "posting_list_batch_size", 4096)))
                     for b_start in tqdm(range(0, sec_emb_n.shape[0], batch_size),
@@ -2549,7 +3540,7 @@ def main():
                                     break
                     span_offset += sec_emb_n.shape[0]
                     print(f"     {section_name}: {sec_emb_n.shape[0]:,} spans assigned")
-                    del sec_emb_n
+                    del sec_emb_n; import gc; gc.collect()
                 print(f"   Total spans: {total_loaded:,}")
             
             # Alignment sanity check
@@ -2615,8 +3606,8 @@ def main():
                       f"mean/non-empty center={float(doc_non_empty.mean()):.1f}, "
                       f"max={int(pl_lens.max()):,}")
 
-            N_docs = len(documents_df)
-            df = np.array([len(set(e[0] for e in pl)) if pl else 0 for pl in doc_postings], dtype=np.float32)
+            N_docs = len(_clefip_data["passage_ids"]) if mode == "clefip_passage" else len(documents_df)
+            df = np.array([len(pl) for pl in doc_postings], dtype=np.float32)  # doc_idx unique per center (aggregated above)
             idf = (np.log((N_docs + 1.0) / (df + 1.0)) + 1.0).astype(np.float32)
             idf_exponent = float(getattr(args, "idf_exponent", 1.0))
             if idf_exponent != 1.0:
@@ -2632,6 +3623,10 @@ def main():
                     title = queries_df.loc[idx, "title"] if "title" in queries_df.columns else ""
                     abstract = queries_df.loc[idx, "abstract"] if "abstract" in queries_df.columns else ""
                     query_texts.append(format_abstract_for_encoder(_fmt_scheme, title, abstract, sep=_sep))
+            elif mode == "clefip_passage":
+                print(f"\n📝 Evaluating: CLEF-IP Claims -> Passages")
+                _fmt_scheme = get_encoder_format_scheme(args.dense_model)
+                query_texts = [format_claim_for_encoder(_fmt_scheme, qt) for qt in _clefip_data["query_texts"]]
             else:
                 print(f"\n📝 Evaluating: Claim -> All")
                 # Must match format used when building embeddings (utils.collect_doc_texts): "[claim] {claim}"
@@ -2698,41 +3693,16 @@ def main():
                 print(f"   Query opts: {', '.join(q_opts)}")
             print(f"🔍 Retrieving documents...")
             top_k = 100
-            top_indices: list[list[int]] = []
-            for _q_idx, qpack in enumerate(tqdm(query_sparse, desc="Retrieving")):
-                terms, weights, projs = qpack[0], qpack[1], qpack[2]
-                doc_scores = {}
-                for i, term in enumerate(terms):
-                    if len(doc_postings[term]) == 0:
-                        continue
-                    q_sim = float(weights[i])
-                    q_proj = float(projs[i]) if i < len(projs) else 0.0
-                    idf_t = float(idf[term]) ** idf_exponent
-                    for doc_idx, d_weight, d_proj in doc_postings[term]:
-                        d_sim = float(d_weight)
-                        sim_approx = q_sim * d_sim
-                        if pca_proj_alpha != 0.0:
-                            sim_approx += pca_proj_alpha * q_proj * float(d_proj)
-                        contrib = sim_approx * idf_t
-                        if angle_sim_beta != 0.0:
-                            contrib += angle_sim_beta * (1.0 - abs(q_sim - d_sim)) * idf_t
-                        if residual_alpha != 0.0 and center_dot_pca is not None:
-                            cdu = float(center_dot_pca[term])
-                            q_res_proj = q_proj - q_sim * cdu
-                            d_res_proj = float(d_proj) - d_sim * cdu
-                            contrib += residual_alpha * (q_res_proj * d_res_proj) * idf_t
-                        doc_scores[doc_idx] = doc_scores.get(doc_idx, 0.0) + contrib
-                # Apply document length normalization
-                if length_norm == "sqrt_spans" and doc_scores:
-                    for doc_idx in list(doc_scores.keys()):
-                        norm_factor = max(doc_nspans[doc_idx] ** length_norm_exp, 1e-6)
-                        doc_scores[doc_idx] /= norm_factor
-                if doc_scores:
-                    sorted_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
-                    top_docs = [doc_idx for doc_idx, _ in sorted_docs[:top_k]]
-                    top_indices.append(top_docs)
-                else:
-                    top_indices.append([])
+            top_indices = _score_queries_against_postings(
+                query_sparse, doc_postings, idf, idf_exponent, top_k,
+                pca_proj_alpha=pca_proj_alpha,
+                angle_sim_beta=angle_sim_beta,
+                residual_alpha=residual_alpha,
+                center_dot_pca=center_dot_pca,
+                length_norm=length_norm,
+                length_norm_exp=length_norm_exp,
+                doc_nspans=doc_nspans,
+            )
             
             # ---- Helper: compute metrics for a given query subset ----
             def _compute_metrics_for_qids(allowed_qids=None):
@@ -2754,33 +3724,176 @@ def main():
                 res["pres@100"] = mean_pres_at_k(tl, rl, k=100)
                 return res, len(tl), rl
 
-            task_label = "Abstract -> Abstract" if mode == "abstract2abstract" else "Claim -> All"
-            results, _, retrieved_ids_list = _compute_metrics_for_qids(None)
+            if mode == "clefip_passage":
+                # CLEF-IP passage-level evaluation: retrieve passage_ids, use CLEF-IP official metrics
+                _clefip_pid_list = _clefip_data["passage_ids"]
+                _clefip_qids = _clefip_data["query_ids"]
+                _clefip_qrels = _clefip_data["qrels_passage_ids"]
 
-            if mode == "abstract2abstract":
-                print_metric_table(results, f"Sparse Coverage: {task_label}")
-                if save_rankings_abs:
-                    ranking_dict = {str(queries_df.index[i]): retrieved_ids_list[i] for i in range(len(retrieved_ids_list))}
-                    with open(save_rankings_abs, "w") as f:
-                        json.dump(ranking_dict, f, indent=0)
-                    print(f"   Saved abstract->abstract rankings to {save_rankings_abs} ({len(retrieved_ids_list)} queries)")
+                predicted_labels_list: list[list[str]] = []
+                for q_idx in range(len(_clefip_qids)):
+                    if q_idx < len(top_indices) and top_indices[q_idx]:
+                        predicted_labels_list.append([_clefip_pid_list[pi] for pi in top_indices[q_idx]])
+                    else:
+                        predicted_labels_list.append([])
+
+                topk_docs = getattr(args, "clefip_two_stage_topk_docs", 100)
+                # Build per-query score dicts for two-stage reranking
+                all_passage_scores_list: list[dict] = []
+                for q_idx in range(len(_clefip_qids)):
+                    # Reconstruct passage scores from doc_scores in retrieval
+                    # We need the full doc_scores — re-derive from top_indices
+                    # (scores are not stored, so just use rank-based two-stage)
+                    pscores = {_clefip_pid_list[pi]: float(top_k - rank)
+                               for rank, pi in enumerate(top_indices[q_idx])} if q_idx < len(top_indices) else {}
+                    all_passage_scores_list.append(pscores)
+                predicted_labels_list = _clefip_two_stage_rerank(
+                    _clefip_pid_list, predicted_labels_list, all_passage_scores_list,
+                    topk_docs=topk_docs,
+                )
+                print(f"  🔄 Two-stage retrieval: top-{topk_docs} docs → re-ranked passages per query")
+
+                _evaluate_and_print_clefip(
+                    _clefip_qrels, _clefip_qids, predicted_labels_list,
+                    "Sparse Coverage (CLEF-IP)",
+                    save_path=save_rankings_paths.get("clefip_passage") if save_rankings_paths else None,
+                    two_stage=True, topk_docs=topk_docs,
+                )
+
+                # ---- CLEF-IP Robustness Test: varying negative pool sizes ----
+                _neg_doc_sizes_str = getattr(args, "clefip_neg_doc_sizes", "")
+                if _neg_doc_sizes_str:
+                    import random as _random_mod
+
+                    # passage_id -> doc_id mapping
+                    _pid_to_docid = {pid: _clefip_passage_id_to_doc_id(pid) for pid in _clefip_pid_list}
+                    _all_doc_ids_sorted = sorted(set(_pid_to_docid.values()))
+
+                    # Relevant doc_ids (must always be included)
+                    _rel_doc_ids = set()
+                    for _qid_r, _rel_pids in _clefip_qrels.items():
+                        for _rpid in _rel_pids:
+                            _rel_doc_ids.add(_clefip_passage_id_to_doc_id(_rpid))
+                    _neg_doc_ids_sorted = sorted([d for d in _all_doc_ids_sorted if d not in _rel_doc_ids])
+                    _n_rel = len(_rel_doc_ids)
+
+                    _target_sizes = sorted([int(s.strip()) for s in _neg_doc_sizes_str.split(",") if s.strip()])
+                    print(f"\n{'='*80}")
+                    print(f"📊 CLEF-IP Robustness Test: varying negative pool sizes")
+                    print(f"   Total docs: {len(_all_doc_ids_sorted):,}, Relevant docs: {_n_rel}, "
+                          f"Negative docs: {len(_neg_doc_ids_sorted):,}")
+                    print(f"   Pool sizes to test: {_target_sizes}")
+                    print(f"{'='*80}")
+
+                    _robustness_results = []
+                    for _target_n in _target_sizes:
+                        if _target_n >= len(_all_doc_ids_sorted):
+                            print(f"\n   ⏭️  {_target_n} docs >= total {len(_all_doc_ids_sorted)}, already evaluated above")
+                            continue
+                        if _target_n < _n_rel:
+                            print(f"\n   ⏭️  {_target_n} docs < {_n_rel} relevant docs, skipping")
+                            continue
+
+                        # Sample negatives (deterministic seed per pool size)
+                        _n_neg_keep = min(_target_n - _n_rel, len(_neg_doc_ids_sorted))
+                        _rng_local = _random_mod.Random(42 + _target_n)
+                        _sampled_negs = set(_rng_local.sample(_neg_doc_ids_sorted, _n_neg_keep))
+                        _allowed_docs = _rel_doc_ids | _sampled_negs
+
+                        # Build allowed passage index set
+                        _allowed_pidx = set()
+                        for _pi, _pid in enumerate(_clefip_pid_list):
+                            if _pid_to_docid[_pid] in _allowed_docs:
+                                _allowed_pidx.add(_pi)
+                        _n_passages_f = len(_allowed_pidx)
+                        _n_docs_f = len(_allowed_docs)
+
+                        # Filter doc_postings
+                        _dp_f = [
+                            [(di, w, p) for di, w, p in pl if di in _allowed_pidx]
+                            for pl in doc_postings
+                        ]
+
+                        # Recompute IDF with filtered pool
+                        _df_f = np.array(
+                            [len(pl) for pl in _dp_f],
+                            dtype=np.float32,
+                        )
+                        _idf_f = (np.log((_n_passages_f + 1.0) / (_df_f + 1.0)) + 1.0).astype(np.float32)
+
+                        # Retrieve with filtered inverted index
+                        _top_indices_f = _score_queries_against_postings(
+                            query_sparse, _dp_f, _idf_f, idf_exponent, top_k,
+                            pca_proj_alpha=pca_proj_alpha,
+                            angle_sim_beta=angle_sim_beta,
+                            residual_alpha=residual_alpha,
+                            center_dot_pca=center_dot_pca,
+                            length_norm=length_norm,
+                            length_norm_exp=length_norm_exp,
+                            doc_nspans=doc_nspans,
+                            show_progress=False,
+                        )
+
+                        # Build predicted labels and evaluate
+                        _pred_f: list[list[str]] = []
+                        for _qi_e in range(len(_clefip_qids)):
+                            if _qi_e < len(_top_indices_f) and _top_indices_f[_qi_e]:
+                                _pred_f.append([_clefip_pid_list[pi] for pi in _top_indices_f[_qi_e]])
+                            else:
+                                _pred_f.append([])
+
+                        _true_f = [_clefip_qrels.get(qid, []) for qid in _clefip_qids]
+                        _res_f = _make_clefip_official_metrics(_true_f, _pred_f)
+                        _robustness_results.append((_n_docs_f, _n_passages_f, _res_f))
+                        print(f"   {_n_docs_f:>6} docs ({_n_passages_f:>8,} passages): "
+                              f"recall@100={_res_f.get('recall@100', 0):.4f}  "
+                              f"ndcg@10={_res_f.get('ndcg@10', 0):.4f}  "
+                              f"map={_res_f.get('map', 0):.4f}  "
+                              f"pres_doc@100={_res_f.get('pres_doc@100', 0):.4f}")
+
+                    # Summary table
+                    if _robustness_results:
+                        print(f"\n{'='*90}")
+                        print(f"CLEF-IP Robustness Summary (relevant docs always included, negatives subsampled)")
+                        print(f"{'='*90}")
+                        print(f"{'Docs':>8} {'Passages':>10} {'recall@100':>12} {'ndcg@10':>10} "
+                              f"{'map':>8} {'pres_doc@100':>14} {'magp':>8}")
+                        print(f"{'-'*8} {'-'*10} {'-'*12} {'-'*10} {'-'*8} {'-'*14} {'-'*8}")
+                        for _nd, _np, _r in _robustness_results:
+                            print(f"{_nd:>8} {_np:>10,} "
+                                  f"{_r.get('recall@100', 0):>12.4f} "
+                                  f"{_r.get('ndcg@10', 0):>10.4f} "
+                                  f"{_r.get('map', 0):>8.4f} "
+                                  f"{_r.get('pres_doc@100', 0):>14.4f} "
+                                  f"{_r.get('magp', 0):>8.4f}")
+                        print(f"{'='*90}")
+
             else:
+                task_label = "Abstract -> Abstract" if mode == "abstract2abstract" else "Claim -> All"
+                results, _, retrieved_ids_list = _compute_metrics_for_qids(None)
+
                 print_metric_table(results, f"Sparse Coverage: {task_label}")
-                if save_rankings_claim:
-                    ranking_dict = {str(queries_df.index[i]): retrieved_ids_list[i] for i in range(len(retrieved_ids_list))}
-                    with open(save_rankings_claim, "w") as f:
-                        json.dump(ranking_dict, f, indent=0)
-                    print(f"   Saved claim->all rankings to {save_rankings_claim} ({len(retrieved_ids_list)} queries)")
+                if mode == "abstract2abstract":
+                    _save_rankings(save_rankings_abs, list(queries_df.index), retrieved_ids_list, "abstract->abstract")
+                else:
+                    _save_rankings(save_rankings_claim, list(queries_df.index), retrieved_ids_list, "claim->all")
             
             print(f"\n✅ Task {mode} evaluation completed")
+            
+            # Free large objects before next mode to avoid peak memory overlap
+            del embeddings_by_section, span_to_doc, exclude_cls_span_indices
+            del posting_lists, doc_postings, top_indices, query_sparse
+            import gc; gc.collect()
         
         print(f"\n✅ Sparse Coverage evaluation completed for all available tasks")
 
     ############################################## CLEF-IP 2013 EN (claims-to-passages) ##################################################
-    print("\n" + "=" * 60)
-    print("Running CLEF-IP 2013 EN (claims-to-passages)")
-    print("=" * 60)
-    run_clefip_eval(args)
+    if not (args.model_name == "sparse_coverage" and _clefip_data is not None):
+        # Only run standalone CLEF-IP eval if sparse_coverage didn't already handle it in the mode loop
+        print("\n" + "=" * 60)
+        print("Running CLEF-IP 2013 EN (claims-to-passages)")
+        print("=" * 60)
+        run_clefip_eval(args, save_rankings_path=save_rankings_paths.get("clefip_passage"))
 
 
 ########################################################################################################################################################

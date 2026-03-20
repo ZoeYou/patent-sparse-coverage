@@ -96,6 +96,76 @@ def _load_span_doc_ids(embedding_files, N):
     return doc_ids
 
 
+def _filter_embeddings_by_span_kind(embedding_files, section_embeddings, exclude_cls=False, exclude_doc_mean=False):
+    """
+    Filter embedding rows by span_kind using metadata JSONL.
+
+    For each section .npy, reads the companion _metadata.jsonl and keeps only
+    rows whose 'k' field is NOT in the excluded set.  Returns filtered arrays
+    (loaded into memory, no longer mmap) and the filtered doc_ids list.
+
+    Returns:
+        filtered_embeddings: list of np.ndarray (one per section, content-only rows)
+        filtered_doc_ids: list of str (doc_id per kept row, across all sections)
+    """
+    exclude_kinds = set()
+    if exclude_cls:
+        exclude_kinds.add("cls")
+    if exclude_doc_mean:
+        exclude_kinds.add("doc_mean")
+    if not exclude_kinds:
+        return section_embeddings, None  # nothing to filter
+
+    filtered_embeddings = []
+    filtered_doc_ids = []
+    total_before = 0
+    total_after = 0
+
+    for fp, arr in zip(embedding_files, section_embeddings):
+        meta_path = os.path.splitext(fp)[0] + "_metadata.jsonl"
+        if not os.path.isfile(meta_path):
+            raise FileNotFoundError(
+                f"Metadata file required for --exclude_cls/--exclude_doc_mean but not found: {meta_path}\n"
+                f"Re-run 1create_N_embeddings.py with --save_metadata 1"
+            )
+
+        n_rows = arr.shape[0]
+        total_before += n_rows
+
+        # Read span_kind for every row
+        keep_mask = np.ones(n_rows, dtype=bool)
+        doc_ids_section = []
+        with open(meta_path, "r") as f:
+            for i, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                kind = obj.get("k", "content")
+                doc_id = obj.get("d", obj.get("doc_id", ""))
+                if kind in exclude_kinds:
+                    keep_mask[i] = False
+                doc_ids_section.append(doc_id)
+
+        if len(doc_ids_section) != n_rows:
+            raise ValueError(
+                f"Metadata row count ({len(doc_ids_section)}) != embedding rows ({n_rows}) for {fp}"
+            )
+
+        # Apply mask: copy into memory (no longer mmap)
+        kept_arr = arr[keep_mask]
+        kept_doc_ids = [d for d, m in zip(doc_ids_section, keep_mask) if m]
+        filtered_embeddings.append(kept_arr)
+        filtered_doc_ids.extend(kept_doc_ids)
+        total_after += kept_arr.shape[0]
+        excluded = n_rows - kept_arr.shape[0]
+        print(f"  {os.path.basename(fp)}: {n_rows:,} -> {kept_arr.shape[0]:,} (excluded {excluded:,} {exclude_kinds})")
+
+    print(f"[kcenter] Span filtering: {total_before:,} -> {total_after:,} "
+          f"(removed {total_before - total_after:,} rows with kind in {exclude_kinds})")
+    return filtered_embeddings, filtered_doc_ids
+
+
 def _eligible_indices_proportional(store, ref_size, rng):
     """
     Stratified proportional sampling: sample ref_size indices so each section j
@@ -869,6 +939,12 @@ def main():
     ap.add_argument("--df_top_k", type=int, default=10,
                     help="max_centers_per_span for activation DF diagnostic (matches evaluate.py soft assignment). "
                          "0 = skip activation DF and use Voronoi DF for stop-centers. Default: 10.")
+    ap.add_argument("--exclude_cls", action="store_true", default=False,
+                    help="Exclude [CLS] embedding rows (span_kind='cls') from center construction. "
+                         "Requires metadata JSONL (saved with --save_metadata 1 in 1create_N_embeddings.py).")
+    ap.add_argument("--exclude_doc_mean", action="store_true", default=False,
+                    help="Exclude doc-mean embedding rows (span_kind='doc_mean') from center construction. "
+                         "Requires metadata JSONL (saved with --save_metadata 1 in 1create_N_embeddings.py).")
 
     args = ap.parse_args()
     rng = np.random.default_rng(args.seed)
@@ -916,11 +992,24 @@ def main():
         section_embeddings.append(arr)
         print(f"  Loaded {arr.shape[0]:,} x {arr.shape[1]} from {os.path.basename(fp)}")
 
+    # ── Filter out CLS / doc_mean rows if requested ──
+    if args.exclude_cls or args.exclude_doc_mean:
+        print(f"[kcenter] Filtering: exclude_cls={args.exclude_cls}, exclude_doc_mean={args.exclude_doc_mean}")
+        section_embeddings, filtered_doc_ids = _filter_embeddings_by_span_kind(
+            embedding_files, section_embeddings,
+            exclude_cls=args.exclude_cls, exclude_doc_mean=args.exclude_doc_mean,
+        )
+    else:
+        filtered_doc_ids = None
+
     store = ChunkedEmbeddingStore(section_embeddings)
     N, d = store.N, store.d
     print(f"[kcenter] Total: N={N:,}, d={d} (streaming: no full concatenate)")
 
-    span_doc_ids = _load_span_doc_ids(embedding_files, N)
+    if filtered_doc_ids is not None:
+        span_doc_ids = filtered_doc_ids
+    else:
+        span_doc_ids = _load_span_doc_ids(embedding_files, N)
     if span_doc_ids is None:
         print("[kcenter] No metadata (or mismatch): df diagnostic will be skipped. Use {section}_{unit}_metadata.jsonl for df/posting-list stats.")
 
@@ -1000,13 +1089,13 @@ def main():
             print(f"[kcenter] Data fits in RAM ({data_bytes / 1e9:.1f}GB < {total_ram * 0.50 / 1e9:.1f}GB threshold)")
         print(f"[kcenter] Loading all {N:,} points into RAM (bulk read, no mmap)...")
         t_load = time.time()
-        # Re-read files WITHOUT mmap for fast sequential bulk IO.
-        # mmap on network FS (Lustre/GPFS) triggers per-page faults (4KB each)
-        # = ~5M faults for 20GB → extremely slow.  A single fread() is 100x+ faster.
+        # Read from store's section_embeddings (already filtered & in-memory after
+        # _filter_embeddings_by_span_kind) instead of re-reading raw files, which
+        # would include filtered-out rows (cls/doc_mean) and cause an index mismatch.
         parts = []
-        for fp in embedding_files:
-            print(f"  Reading {os.path.basename(fp)}...", end=" ", flush=True)
-            arr = np.load(fp).astype(np.float32)
+        for j, se in enumerate(store.section_embeddings):
+            print(f"  Reading section {j}...", end=" ", flush=True)
+            arr = np.asarray(se, dtype=np.float32).copy()
             parts.append(arr)
             print(f"{arr.shape[0]:,} x {arr.shape[1]}")
         X_ff = np.concatenate(parts, axis=0)
@@ -1230,6 +1319,12 @@ def main():
         suffix += f"_r{args.r_c_percentile:g}"
     if refine_iters > 0:
         suffix += f"_refine{refine_iters}"
+    if args.exclude_cls and args.exclude_doc_mean:
+        suffix += "_nocls_nomean"
+    elif args.exclude_cls:
+        suffix += "_nocls"
+    elif args.exclude_doc_mean:
+        suffix += "_nomean"
     args.out_dir = build_output_dir(args.out_dir, args.embeddings_dir, suffix=suffix)
     os.makedirs(args.out_dir, exist_ok=True)
 

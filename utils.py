@@ -1952,9 +1952,12 @@ def parse_embeddings_dir(dirname: str) -> dict:
     import os
     basename = os.path.basename(dirname)
     
+    # Strip known trailing pooling suffixes (e.g. _meanpool) so the regex can match
+    clean = re.sub(r'_(meanpool|maxpool)$', '', basename)
+    
     # Pattern: embeddings_{model_name}_{unit}_{cls}_{layer}
     pattern = r'embeddings_(.+?)_(.+?)_(cls|nocls)_(last|second_last)$'
-    match = re.match(pattern, basename)
+    match = re.match(pattern, clean)
     
     if match:
         return {
