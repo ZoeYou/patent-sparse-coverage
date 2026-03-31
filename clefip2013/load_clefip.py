@@ -374,6 +374,151 @@ FULL_CORPUS_DIR = "01_passage_corpus"
 FULL_CORPUS_DIR_EN = "01_passage_corpus_en"  # EN-only filtered corpus cache
 CORPUS_JSONL = "passages.jsonl"
 IDS_TXT = "passage_ids.txt"
+IPC_CACHE_FILE = "doc_id_ipc_cache_v2.json"  # v2: stores both subclasses and subgroups
+
+
+def _normalise_raw_ipc(raw_tag_text: str) -> str:
+    """Normalise a raw IPC tag value to 'SECTION CLASS SUBCLASS GROUP/SUBGROUP' form.
+
+    Strips whitespace and date suffixes from reformed-IPC entries.
+    Returns the normalised code (e.g. 'H04N5/44') or '' on failure.
+    """
+    raw = raw_tag_text.strip().replace(' ', '')
+    if not raw or not raw[0].isalpha() or '/' not in raw:
+        return ''
+    slash = raw.index('/')
+    # After the slash, the subgroup is digits (possibly with leading zeros).
+    # Date suffixes like 20060101AFI... start with 8 digits (YYYYMMDD).
+    after_slash = raw[slash + 1:]
+    # Greedily take digits for subgroup, then check for date suffix:
+    # subgroup part is typically 2-4 digits; date is 8+ digits starting with 19xx/20xx.
+    # Strategy: find the subgroup by matching the shortest valid subgroup before a date-like pattern.
+    m = re.match(r'^(\d{1,6}?)(?:20\d{6}|19\d{6})', after_slash)
+    if m:
+        subgroup = m.group(1)
+    else:
+        # No date suffix; take all leading digits
+        m2 = re.match(r'^(\d+)', after_slash)
+        subgroup = m2.group(1) if m2 else after_slash
+    if not subgroup:
+        return ''
+    return (raw[:slash + 1] + subgroup).upper()
+
+
+def _extract_ipc_codes_from_header(raw_bytes: bytes) -> Tuple[List[str], List[str]]:
+    """Extract unique IPC codes at two levels from XML header bytes.
+
+    Returns (subclasses, subgroups) where:
+      - subclasses: 4-char codes (e.g. 'G10L')
+      - subgroups:  full normalised codes (e.g. 'H04N5/44')
+
+    Handles both old-format (<main-classification>, <further-classification>)
+    and reformed IPC (<classification-ipcr ...>CODE</classification-ipcr>).
+    """
+    subclasses: set = set()
+    subgroups: set = set()
+    chunk = raw_bytes.decode("utf-8", errors="replace")
+    # Old format: <main-classification>CODE</main-classification>
+    for m in re.finditer(
+        r'<(?:main|further)-classification>([^<]+)</(?:main|further)-classification>', chunk
+    ):
+        raw = m.group(1).strip().replace(' ', '')
+        if len(raw) >= 4 and raw[0].isalpha():
+            subclasses.add(raw[:4].upper())
+            norm = _normalise_raw_ipc(m.group(1))
+            if norm:
+                subgroups.add(norm)
+    # Reformed IPC: <classification-ipcr ...>CODE</classification-ipcr>
+    for m in re.finditer(r'<classification-ipcr[^>]*>([A-Z][^<]+)</classification-ipcr>', chunk):
+        raw = m.group(1).strip().replace(' ', '')
+        if len(raw) >= 4 and raw[0].isalpha():
+            subclasses.add(raw[:4].upper())
+            norm = _normalise_raw_ipc(m.group(1))
+            if norm:
+                subgroups.add(norm)
+    return sorted(subclasses), sorted(subgroups)
+
+
+def _extract_ipc_subclasses_from_header(raw_bytes: bytes) -> List[str]:
+    """Extract unique IPC subclass codes (first 4 chars, e.g. 'G10L') from XML header bytes.
+
+    Convenience wrapper — returns only subclass level.
+    """
+    subclasses, _ = _extract_ipc_codes_from_header(raw_bytes)
+    return subclasses
+
+
+def _build_or_load_ipc_index(
+    clefip_root: str,
+    doc_collection_root: str,
+    lang_filter: str = "EN",
+) -> Dict[str, dict]:
+    """Build or load cached doc_id -> {"sc": [subclasses], "sg": [subgroups]} mapping.
+
+    Walks the full 01_extracted collection reading only the first 4 KB of each XML
+    to extract IPC classification tags at two granularity levels.
+    Results are cached to doc_id_ipc_cache_v2.json under clefip_root for reuse.
+    """
+    cache_path = os.path.join(clefip_root, IPC_CACHE_FILE)
+    if os.path.isfile(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                ipc_index = json.load(f)
+            # Auto-detect v1 (list) vs v2 (dict with sc/sg)
+            sample_val = next(iter(ipc_index.values()), None) if ipc_index else None
+            if isinstance(sample_val, list):
+                # v1 legacy format — convert on the fly
+                print(f"  [IPC index] Found v1 cache ({len(ipc_index):,} docs) — will rebuild v2 with subgroups.", flush=True)
+            else:
+                print(f"  [IPC index] Loaded v2 cache: {len(ipc_index):,} docs \u2192 {cache_path}", flush=True)
+                return ipc_index
+        except Exception:
+            pass
+
+    if not os.path.isdir(doc_collection_root):
+        print(f"  [IPC index] Cannot build: {doc_collection_root} not found.", flush=True)
+        return {}
+
+    print(f"  [IPC index] Building v2 from {doc_collection_root} (one-time, reads first 4 KB per XML)...", flush=True)
+    lang_upper = lang_filter.upper() if lang_filter else None
+    ipc_index: Dict[str, dict] = {}
+    n_files = 0
+    n_lang = 0
+    n_with_ipc = 0
+    for root_dir, _dirs, files in os.walk(doc_collection_root):
+        for fn in files:
+            if not fn.endswith('.xml'):
+                continue
+            n_files += 1
+            xml_path = os.path.join(root_dir, fn)
+            try:
+                with open(xml_path, "rb") as fh:
+                    header = fh.read(4096)
+            except Exception:
+                continue
+            if lang_upper:
+                lang_match = re.search(rb'lang="([^"]+)"', header[:512])
+                if not lang_match or lang_match.group(1).decode("utf-8", errors="replace").upper() != lang_upper:
+                    continue
+            n_lang += 1
+            doc_id = fn[:-4]
+            subclasses, subgroups = _extract_ipc_codes_from_header(header)
+            if subclasses or subgroups:
+                ipc_index[doc_id] = {"sc": subclasses, "sg": subgroups}
+                n_with_ipc += 1
+            if n_lang % 100000 == 0:
+                print(f"    ... {n_files:,} files scanned, {n_lang:,} {lang_upper or 'all'}, "
+                      f"{n_with_ipc:,} with IPC", flush=True)
+
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(ipc_index, f)
+        print(f"  [IPC index] Built: {n_with_ipc:,}/{n_lang:,} docs with IPC codes "
+              f"({n_files:,} total files scanned). Saved \u2192 {cache_path}", flush=True)
+    except Exception as e:
+        print(f"  [IPC index] Warning: could not save cache: {e}", flush=True)
+
+    return ipc_index
 
 
 def _filter_qrels_by_doc_lang(
@@ -385,6 +530,7 @@ def _filter_qrels_by_doc_lang(
     """
     Filter qrels_passage_ids to only keep passages whose source document has the given lang.
     Looks up each unique doc_id in tfiles/, tfam-docs/, then the 01 collection (early exit).
+    Results are cached to a JSON file to avoid repeated slow os.walk over the 01 collection.
     """
     # Collect unique doc_ids
     doc_ids_needed: set = set()
@@ -392,25 +538,43 @@ def _filter_qrels_by_doc_lang(
         for pid in pids:
             doc_ids_needed.add(pid.split("::")[0])
 
+    # ---- Try to load cached doc_id → lang mapping ----
+    _cache_path = os.path.join(clefip_root, "doc_id_lang_cache.json")
     doc_id_to_lang: Dict[str, str] = {}
-    remaining = set(doc_ids_needed)
+    if os.path.isfile(_cache_path):
+        try:
+            with open(_cache_path, "r", encoding="utf-8") as _cf:
+                _cached = json.load(_cf)
+            # Check if all needed doc_ids are in the cache
+            if doc_ids_needed.issubset(_cached.keys()):
+                doc_id_to_lang = {did: _cached[did] for did in doc_ids_needed}
+                print(f"  [_filter_qrels_by_doc_lang] Loaded lang cache ({len(doc_ids_needed)} doc_ids) from {_cache_path}", flush=True)
+            else:
+                doc_id_to_lang = _cached
+                print(f"  [_filter_qrels_by_doc_lang] Partial cache hit ({len(set(doc_ids_needed) & set(_cached.keys()))}/{len(doc_ids_needed)} doc_ids)", flush=True)
+        except Exception:
+            pass
 
-    # Fast lookup in tfiles / tfam-docs first
-    for subdir_path in [
-        os.path.join(clefip_root, TOPICS_DIR, TEST_DIR, TFILES_DIR),
-        os.path.join(clefip_root, TOPICS_DIR, TEST_DIR, TFAM_DOCS_DIR),
-    ]:
-        if not os.path.isdir(subdir_path):
-            continue
-        for doc_id in list(remaining):
-            p = os.path.join(subdir_path, doc_id + ".xml")
-            if os.path.isfile(p):
-                lang = _get_lang_from_xml_file(p)
-                doc_id_to_lang[doc_id] = lang or "unknown"
-                remaining.discard(doc_id)
+    remaining = doc_ids_needed - doc_id_to_lang.keys()
+
+    if remaining:
+        # Fast lookup in tfiles / tfam-docs first
+        for subdir_path in [
+            os.path.join(clefip_root, TOPICS_DIR, TEST_DIR, TFILES_DIR),
+            os.path.join(clefip_root, TOPICS_DIR, TEST_DIR, TFAM_DOCS_DIR),
+        ]:
+            if not os.path.isdir(subdir_path):
+                continue
+            for doc_id in list(remaining):
+                p = os.path.join(subdir_path, doc_id + ".xml")
+                if os.path.isfile(p):
+                    lang = _get_lang_from_xml_file(p)
+                    doc_id_to_lang[doc_id] = lang or "unknown"
+                    remaining.discard(doc_id)
 
     # Walk 01 collection for anything not found above (early exit once all resolved)
     if remaining and doc_collection_root and os.path.isdir(doc_collection_root):
+        print(f"  [_filter_qrels_by_doc_lang] Walking 01 collection for {len(remaining)} unresolved doc_ids...", flush=True)
         for root_dir, _dirs, files in os.walk(doc_collection_root):
             for fn in files:
                 if not fn.endswith(".xml"):
@@ -422,6 +586,14 @@ def _filter_qrels_by_doc_lang(
                     remaining.discard(stem)
             if not remaining:
                 break
+
+    # ---- Save cache for future runs ----
+    try:
+        with open(_cache_path, "w", encoding="utf-8") as _cf:
+            json.dump(doc_id_to_lang, _cf)
+        print(f"  [_filter_qrels_by_doc_lang] Saved lang cache ({len(doc_id_to_lang)} entries) → {_cache_path}", flush=True)
+    except Exception:
+        pass
 
     if remaining:
         print(f"  [_filter_qrels_by_doc_lang] {len(remaining)} doc_ids not found; treating as non-{lang_filter}: {remaining}", flush=True)
@@ -563,6 +735,7 @@ def load_clefip_en_for_eval_sampled_corpus(
     rebuild_corpus: bool = False,
     lang_filter: Optional[str] = "EN",
     seed: int = 42,
+    hard_neg_ratio: float = 0.0,
 ) -> Tuple[List[str], List[str], str, str, int, Dict[str, List[str]]]:
     """
     Like load_clefip_en_for_eval_full_corpus but builds a **sampled** corpus.
@@ -583,7 +756,19 @@ def load_clefip_en_for_eval_sampled_corpus(
       -1 = qrels-only: only the exact passages referenced in qrels.
       -2 = qrels-docs: all passages from documents cited in qrels.
 
-    The sampled corpus is cached under 01_passage_corpus_en_sample_<N>docs/.
+    IPC-based hard negative sampling (hard_neg_ratio > 0, only for sample_size > 0):
+      Instead of purely random negative documents, a fraction (hard_neg_ratio) of the
+      sampled negatives are drawn from documents sharing IPC codes with the query patents
+      and/or their cited prior art.  The hard negative quota is split into two tiers:
+        - Subgroup-hard (50% of hard quota): documents sharing the same IPC subgroup
+          (e.g. 'H04N5/44') — very close topical match.
+        - Subclass-hard (50% of hard quota): documents sharing the same IPC subclass
+          (e.g. 'H04N') but NOT the same subgroup — same broad technology area.
+      If one tier has insufficient candidates, its shortfall overflows to the other tier.
+      This makes the retrieval task harder / more realistic by providing a gradient of
+      topical confounders.
+
+    The sampled corpus is cached under 01_passage_corpus_en_sample_<N>docs[_hn<pct>]/.
     Returns (query_ids, query_texts, corpus_jsonl_path, ids_txt_path, num_passages, qrels_passage_ids).
     """
     import random
@@ -617,7 +802,9 @@ def load_clefip_en_for_eval_sampled_corpus(
         elif sample_size == -2:
             subdir = "01_passage_corpus_en_qrels_docs" if (lang_filter_upper == "EN") else "01_passage_corpus_qrels_docs"
         else:
-            subdir = f"01_passage_corpus_en_sample_{sample_size}docs" if (lang_filter_upper == "EN") else f"01_passage_corpus_sample_{sample_size}docs"
+            hn_suffix = f"_hn{int(hard_neg_ratio * 100)}" if hard_neg_ratio > 0 else ""
+            subdir = (f"01_passage_corpus_en_sample_{sample_size}docs{hn_suffix}" if (lang_filter_upper == "EN")
+                      else f"01_passage_corpus_sample_{sample_size}docs{hn_suffix}")
         corpus_dir = os.path.join(clefip_root, subdir)
     os.makedirs(corpus_dir, exist_ok=True)
     corpus_jsonl_path = os.path.join(corpus_dir, CORPUS_JSONL)
@@ -647,9 +834,48 @@ def load_clefip_en_for_eval_sampled_corpus(
         print(f"  Building qrels-docs corpus: all passages from {len(qrels_doc_ids):,} cited documents...", flush=True)
     else:
         n_sample_extra_docs = max(0, sample_size - len(qrels_doc_ids))
+        _hn_label = f", hard_neg_ratio={hard_neg_ratio:.0%}" if hard_neg_ratio > 0 else ""
         print(f"  Building document-sampled corpus: {len(qrels_doc_ids):,} qrels docs (always included) "
-              f"+ up to {n_sample_extra_docs:,} random EN docs "
-              f"(target total: {sample_size:,} docs)...", flush=True)
+              f"+ up to {n_sample_extra_docs:,} negative EN docs "
+              f"(target total: {sample_size:,} docs{_hn_label})...", flush=True)
+
+    # ── IPC-based hard negative setup (only when sampling negatives) ──
+    # Two-tier hard negatives:
+    #   tier-1 "subgroup-hard": shares IPC subgroup (e.g. H04N5/44) — very close topic
+    #   tier-2 "subclass-hard": shares IPC subclass (e.g. H04N) but NOT subgroup — same broad area
+    # The hard_neg_ratio quota is split 50/50 between the two tiers (with fallback).
+    _use_hard_neg = (hard_neg_ratio > 0 and n_sample_extra_docs > 0 and sample_size > 0)
+    ipc_index: Dict[str, dict] = {}
+    target_subclasses: set = set()
+    target_subgroups: set = set()
+    if _use_hard_neg:
+        ipc_index = _build_or_load_ipc_index(
+            clefip_root, doc_collection_root,
+            lang_filter=lang_filter_upper or "EN",
+        )
+        if not ipc_index:
+            print("  [hard neg] IPC index empty — falling back to random sampling.", flush=True)
+            _use_hard_neg = False
+        else:
+            # Target IPC codes at both levels: from query patents (tfiles) + cited docs (qrels)
+            tfiles_dir = os.path.join(clefip_root, TOPICS_DIR, TEST_DIR, TFILES_DIR)
+            if os.path.isdir(tfiles_dir):
+                for fn in os.listdir(tfiles_dir):
+                    if fn.endswith('.xml'):
+                        try:
+                            with open(os.path.join(tfiles_dir, fn), "rb") as _fh:
+                                _sc, _sg = _extract_ipc_codes_from_header(_fh.read(4096))
+                                target_subclasses.update(_sc)
+                                target_subgroups.update(_sg)
+                        except Exception:
+                            pass
+            for did in qrels_doc_ids:
+                entry = ipc_index.get(did, {})
+                target_subclasses.update(entry.get("sc", []))
+                target_subgroups.update(entry.get("sg", []))
+            print(f"  [hard neg] Target IPC subclasses ({len(target_subclasses)}): {sorted(target_subclasses)}", flush=True)
+            print(f"  [hard neg] Target IPC subgroups  ({len(target_subgroups)}): showing first 20: "
+                  f"{sorted(target_subgroups)[:20]}{'...' if len(target_subgroups) > 20 else ''}", flush=True)
 
     # Prefer sampling from EN corpus JSONL if it already exists (fast sequential read).
     # Both qrels-only (n_sample_extra_docs==0) and sampled modes benefit from JSONL:
@@ -669,66 +895,162 @@ def load_clefip_en_for_eval_sampled_corpus(
         selected_doc_ids: set = set(qrels_doc_ids)  # always include qrels docs
 
         if n_sample_extra_docs > 0 and os.path.isfile(en_corpus_ids):
-            # Pass 1: scan passage_ids.txt to discover unique doc_ids and reservoir-sample.
-            # This is much faster than scanning the full 61GB JSONL.
-            print(f"  Pass 1: scanning {en_corpus_ids} to reservoir-sample {n_sample_extra_docs:,} doc_ids...", flush=True)
-            reservoir_docs: list = []  # reservoir of non-qrels doc_ids
-            n_docs_seen = 0
-            prev_did = None
-            with open(en_corpus_ids, "r", encoding="utf-8") as f:
-                for line in f:
-                    pid = line.strip()
-                    if not pid:
-                        continue
-                    did = pid.split("::")[0]
-                    if did == prev_did:
-                        continue  # same doc as previous line, skip
-                    prev_did = did
-                    if did in qrels_doc_ids:
-                        continue  # already included
-                    n_docs_seen += 1
-                    if len(reservoir_docs) < n_sample_extra_docs:
-                        reservoir_docs.append(did)
-                    else:
-                        j = rng.randint(0, n_docs_seen - 1)
-                        if j < n_sample_extra_docs:
-                            reservoir_docs[j] = did
-            selected_doc_ids.update(reservoir_docs)
-            print(f"  Pass 1 done: {n_docs_seen:,} non-qrels docs seen, "
-                  f"sampled {len(reservoir_docs):,} → total {len(selected_doc_ids):,} docs selected.", flush=True)
+            if _use_hard_neg:
+                # ── Two-tier IPC-stratified sampling: subgroup-hard / subclass-hard / easy ──
+                print(f"  Pass 1: scanning {en_corpus_ids} to classify doc_ids by IPC (two-tier)...", flush=True)
+                subgrp_hard_docs: list = []   # shares IPC subgroup with target
+                subcls_hard_docs: list = []   # shares IPC subclass only (not subgroup)
+                easy_docs: list = []
+                prev_did = None
+                with open(en_corpus_ids, "r", encoding="utf-8") as f:
+                    for line in f:
+                        pid = line.strip()
+                        if not pid:
+                            continue
+                        did = pid.split("::")[0]
+                        if did == prev_did:
+                            continue
+                        prev_did = did
+                        if did in qrels_doc_ids:
+                            continue
+                        entry = ipc_index.get(did, {})
+                        doc_sc = set(entry.get("sc", []))
+                        doc_sg = set(entry.get("sg", []))
+                        if doc_sg & target_subgroups:
+                            subgrp_hard_docs.append(did)
+                        elif doc_sc & target_subclasses:
+                            subcls_hard_docs.append(did)
+                        else:
+                            easy_docs.append(did)
+                # Split hard_neg_ratio quota 50/50 between subgroup-hard and subclass-hard
+                n_total_hard = int(hard_neg_ratio * n_sample_extra_docs)
+                n_subgrp_target = min(n_total_hard // 2, len(subgrp_hard_docs))
+                n_subcls_target = min(n_total_hard - n_subgrp_target, len(subcls_hard_docs))
+                # Fallback: if one tier is short, give its remainder to the other
+                if n_subgrp_target < n_total_hard // 2:
+                    n_subcls_target = min(n_total_hard - n_subgrp_target, len(subcls_hard_docs))
+                elif n_subcls_target < n_total_hard - n_subgrp_target:
+                    n_subgrp_target = min(n_total_hard - n_subcls_target, len(subgrp_hard_docs))
+                n_easy_target = min(n_sample_extra_docs - n_subgrp_target - n_subcls_target, len(easy_docs))
+                rng.shuffle(subgrp_hard_docs)
+                rng.shuffle(subcls_hard_docs)
+                rng.shuffle(easy_docs)
+                selected_doc_ids.update(subgrp_hard_docs[:n_subgrp_target])
+                selected_doc_ids.update(subcls_hard_docs[:n_subcls_target])
+                selected_doc_ids.update(easy_docs[:n_easy_target])
+                print(f"  Pass 1 done: {len(subgrp_hard_docs):,} subgrp-hard / "
+                      f"{len(subcls_hard_docs):,} subcls-hard / {len(easy_docs):,} easy candidates. "
+                      f"Sampled {n_subgrp_target:,} subgrp + {n_subcls_target:,} subcls + {n_easy_target:,} easy "
+                      f"→ total {len(selected_doc_ids):,} docs selected.", flush=True)
+            else:
+                # ── Original reservoir sampling (random negatives) ──
+                print(f"  Pass 1: scanning {en_corpus_ids} to reservoir-sample {n_sample_extra_docs:,} doc_ids...", flush=True)
+                reservoir_docs: list = []  # reservoir of non-qrels doc_ids
+                n_docs_seen = 0
+                prev_did = None
+                with open(en_corpus_ids, "r", encoding="utf-8") as f:
+                    for line in f:
+                        pid = line.strip()
+                        if not pid:
+                            continue
+                        did = pid.split("::")[0]
+                        if did == prev_did:
+                            continue  # same doc as previous line, skip
+                        prev_did = did
+                        if did in qrels_doc_ids:
+                            continue  # already included
+                        n_docs_seen += 1
+                        if len(reservoir_docs) < n_sample_extra_docs:
+                            reservoir_docs.append(did)
+                        else:
+                            j = rng.randint(0, n_docs_seen - 1)
+                            if j < n_sample_extra_docs:
+                                reservoir_docs[j] = did
+                selected_doc_ids.update(reservoir_docs)
+                print(f"  Pass 1 done: {n_docs_seen:,} non-qrels docs seen, "
+                      f"sampled {len(reservoir_docs):,} → total {len(selected_doc_ids):,} docs selected.", flush=True)
         elif n_sample_extra_docs > 0:
             # No passage_ids.txt available; fall back to scanning JSONL for doc_ids
-            print(f"  Pass 1: scanning {en_corpus_jsonl} to reservoir-sample doc_ids (no ids.txt cache)...", flush=True)
-            reservoir_docs = []
-            n_docs_seen = 0
-            prev_did = None
-            with open(en_corpus_jsonl, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    # Fast extraction: find "pid" value without full JSON parse
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-                    pid = obj.get("pid", "")
-                    did = pid.split("::")[0]
-                    if did == prev_did:
-                        continue
-                    prev_did = did
-                    if did in qrels_doc_ids:
-                        continue
-                    n_docs_seen += 1
-                    if len(reservoir_docs) < n_sample_extra_docs:
-                        reservoir_docs.append(did)
-                    else:
-                        j = rng.randint(0, n_docs_seen - 1)
-                        if j < n_sample_extra_docs:
-                            reservoir_docs[j] = did
-            selected_doc_ids.update(reservoir_docs)
-            print(f"  Pass 1 done: {n_docs_seen:,} non-qrels docs seen, "
-                  f"sampled {len(reservoir_docs):,} → total {len(selected_doc_ids):,} docs selected.", flush=True)
+            if _use_hard_neg:
+                print(f"  Pass 1: scanning {en_corpus_jsonl} to classify doc_ids by IPC (two-tier, no ids.txt)...", flush=True)
+                subgrp_hard_docs = []
+                subcls_hard_docs = []
+                easy_docs = []
+                prev_did = None
+                with open(en_corpus_jsonl, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except Exception:
+                            continue
+                        pid = obj.get("pid", "")
+                        did = pid.split("::")[0]
+                        if did == prev_did:
+                            continue
+                        prev_did = did
+                        if did in qrels_doc_ids:
+                            continue
+                        entry = ipc_index.get(did, {})
+                        doc_sc = set(entry.get("sc", []))
+                        doc_sg = set(entry.get("sg", []))
+                        if doc_sg & target_subgroups:
+                            subgrp_hard_docs.append(did)
+                        elif doc_sc & target_subclasses:
+                            subcls_hard_docs.append(did)
+                        else:
+                            easy_docs.append(did)
+                n_total_hard = int(hard_neg_ratio * n_sample_extra_docs)
+                n_subgrp_target = min(n_total_hard // 2, len(subgrp_hard_docs))
+                n_subcls_target = min(n_total_hard - n_subgrp_target, len(subcls_hard_docs))
+                if n_subgrp_target < n_total_hard // 2:
+                    n_subcls_target = min(n_total_hard - n_subgrp_target, len(subcls_hard_docs))
+                elif n_subcls_target < n_total_hard - n_subgrp_target:
+                    n_subgrp_target = min(n_total_hard - n_subcls_target, len(subgrp_hard_docs))
+                n_easy_target = min(n_sample_extra_docs - n_subgrp_target - n_subcls_target, len(easy_docs))
+                rng.shuffle(subgrp_hard_docs)
+                rng.shuffle(subcls_hard_docs)
+                rng.shuffle(easy_docs)
+                selected_doc_ids.update(subgrp_hard_docs[:n_subgrp_target])
+                selected_doc_ids.update(subcls_hard_docs[:n_subcls_target])
+                selected_doc_ids.update(easy_docs[:n_easy_target])
+                print(f"  Pass 1 done: {len(subgrp_hard_docs):,} subgrp-hard / "
+                      f"{len(subcls_hard_docs):,} subcls-hard / {len(easy_docs):,} easy. "
+                      f"Sampled {n_subgrp_target:,} + {n_subcls_target:,} + {n_easy_target:,} "
+                      f"→ {len(selected_doc_ids):,} docs.", flush=True)
+            else:
+                print(f"  Pass 1: scanning {en_corpus_jsonl} to reservoir-sample doc_ids (no ids.txt cache)...", flush=True)
+                reservoir_docs = []
+                n_docs_seen = 0
+                prev_did = None
+                with open(en_corpus_jsonl, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except Exception:
+                            continue
+                        pid = obj.get("pid", "")
+                        did = pid.split("::")[0]
+                        if did == prev_did:
+                            continue
+                        prev_did = did
+                        if did in qrels_doc_ids:
+                            continue
+                        n_docs_seen += 1
+                        if len(reservoir_docs) < n_sample_extra_docs:
+                            reservoir_docs.append(did)
+                        else:
+                            j = rng.randint(0, n_docs_seen - 1)
+                            if j < n_sample_extra_docs:
+                                reservoir_docs[j] = did
+                selected_doc_ids.update(reservoir_docs)
+                print(f"  Pass 1 done: {n_docs_seen:,} non-qrels docs seen, "
+                      f"sampled {len(reservoir_docs):,} → total {len(selected_doc_ids):,} docs selected.", flush=True)
 
         # Step 2: Single-pass over JSONL to collect passages from selected docs.
         if sample_size == -2:
@@ -825,10 +1147,54 @@ def load_clefip_en_for_eval_sampled_corpus(
         selected_doc_ids: set = set(qrels_doc_ids)
         if n_sample_extra_docs > 0:
             non_qrels_docs = [d for d in all_en_doc_ids if d not in qrels_doc_ids]
-            rng.shuffle(non_qrels_docs)
-            selected_doc_ids.update(non_qrels_docs[:n_sample_extra_docs])
-            print(f"  Selected {len(selected_doc_ids):,} docs ({len(qrels_doc_ids):,} qrels + "
-                  f"{min(n_sample_extra_docs, len(non_qrels_docs)):,} sampled).", flush=True)
+            if _use_hard_neg:
+                # Two-tier IPC-stratified sampling for XML path
+                _xml_ipc: Dict[str, dict] = {}
+                non_qrels_set = set(non_qrels_docs)
+                for root_dir2, _dirs2, files2 in os.walk(doc_collection_root):
+                    for fn2 in files2:
+                        if fn2.endswith('.xml') and fn2[:-4] in non_qrels_set:
+                            try:
+                                with open(os.path.join(root_dir2, fn2), "rb") as _fh2:
+                                    _sc, _sg = _extract_ipc_codes_from_header(_fh2.read(4096))
+                                    _xml_ipc[fn2[:-4]] = {"sc": _sc, "sg": _sg}
+                            except Exception:
+                                pass
+                subgrp_hard_docs = []
+                subcls_hard_docs = []
+                easy_docs = []
+                for d in non_qrels_docs:
+                    entry = _xml_ipc.get(d, {})
+                    doc_sg = set(entry.get("sg", []))
+                    doc_sc = set(entry.get("sc", []))
+                    if doc_sg & target_subgroups:
+                        subgrp_hard_docs.append(d)
+                    elif doc_sc & target_subclasses:
+                        subcls_hard_docs.append(d)
+                    else:
+                        easy_docs.append(d)
+                n_total_hard = int(hard_neg_ratio * n_sample_extra_docs)
+                n_subgrp_target = min(n_total_hard // 2, len(subgrp_hard_docs))
+                n_subcls_target = min(n_total_hard - n_subgrp_target, len(subcls_hard_docs))
+                if n_subgrp_target < n_total_hard // 2:
+                    n_subcls_target = min(n_total_hard - n_subgrp_target, len(subcls_hard_docs))
+                elif n_subcls_target < n_total_hard - n_subgrp_target:
+                    n_subgrp_target = min(n_total_hard - n_subcls_target, len(subgrp_hard_docs))
+                n_easy_target = min(n_sample_extra_docs - n_subgrp_target - n_subcls_target, len(easy_docs))
+                rng.shuffle(subgrp_hard_docs)
+                rng.shuffle(subcls_hard_docs)
+                rng.shuffle(easy_docs)
+                selected_doc_ids.update(subgrp_hard_docs[:n_subgrp_target])
+                selected_doc_ids.update(subcls_hard_docs[:n_subcls_target])
+                selected_doc_ids.update(easy_docs[:n_easy_target])
+                print(f"  Selected {len(selected_doc_ids):,} docs ({len(qrels_doc_ids):,} qrels + "
+                      f"{n_subgrp_target:,} subgrp-hard + {n_subcls_target:,} subcls-hard + "
+                      f"{n_easy_target:,} easy).", flush=True)
+            else:
+                rng.shuffle(non_qrels_docs)
+                selected_doc_ids.update(non_qrels_docs[:n_sample_extra_docs])
+                print(f"  Selected {len(selected_doc_ids):,} docs ({len(qrels_doc_ids):,} qrels + "
+                      f"{min(n_sample_extra_docs, len(non_qrels_docs)):,} sampled).", flush=True)
         else:
             print("  Qrels-only/qrels-docs mode: no additional docs sampled.", flush=True)
 

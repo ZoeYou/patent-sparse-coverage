@@ -86,6 +86,50 @@ from utils import (
 )
 
 
+def _is_st_checkpoint(path: str) -> bool:
+    """True if *path* is a local directory containing a SentenceTransformer checkpoint (modules.json)."""
+    return os.path.isdir(path) and os.path.isfile(os.path.join(path, "modules.json"))
+
+
+def load_checkpoint_model(checkpoint_path, max_length=512, hf_model_name=None):
+    """
+    Load a sentence transformer checkpoint without dense layers, or load a HuggingFace model.
+    If hf_model_name is provided, loads from HuggingFace; otherwise loads from checkpoint.
+    """
+    from sentence_transformers import SentenceTransformer
+    from sentence_transformers import models
+
+    if hf_model_name:
+        print(f"Loading HuggingFace model: {hf_model_name}")
+        model = SentenceTransformer(hf_model_name)
+        print("Model loaded from HuggingFace Hub!")
+        return model
+    print(f"Loading checkpoint from: {checkpoint_path}")
+    # Load the transformer model
+    transformer = models.Transformer(checkpoint_path, max_seq_length=max_length)
+    # Load pooling config
+    pooling_config_path = os.path.join(checkpoint_path, "1_Pooling", "config.json")
+    if os.path.exists(pooling_config_path):
+        with open(pooling_config_path, 'r') as f:
+            pooling_config = json.load(f)
+        pooling = models.Pooling(
+            transformer.get_word_embedding_dimension(),
+            pooling_mode_cls_token=pooling_config.get('pooling_mode_cls_token', False),
+            pooling_mode_mean_tokens=pooling_config.get('pooling_mode_mean_tokens', True),
+            pooling_mode_max_tokens=pooling_config.get('pooling_mode_max_tokens', False)
+        )
+    else:
+        # Default to mean pooling
+        pooling = models.Pooling(
+            transformer.get_word_embedding_dimension(),
+            pooling_mode_mean_tokens=True
+        )
+    # Create model with only transformer and pooling (no dense layers)
+    model = SentenceTransformer(modules=[transformer, pooling])
+    print("Model loaded successfully (transformer + pooling only)")
+    return model
+
+
 def _auto_batch_size(device, hidden_size: int = 768, min_bs: int = 4, max_bs: int = 256) -> int:
     """Return a safe inference batch size scaled to GPU total memory.
 
@@ -432,6 +476,15 @@ def _get_clefip_dense_encoder(args, model_name: str, device):
         def _encode(texts, batch_size=32):
             return _batch_encode(texts, tokenizer, model, device, _fwd_patentmap, model.config.hidden_size, batch_size)
         return _encode, "PatentMap"
+
+    # SentenceTransformer checkpoint (e.g. ./checkpoint-1142): load without dense layers
+    if _is_st_checkpoint(args.model_name):
+        model = load_checkpoint_model(args.model_name)
+        model.to(device)
+        _ckpt_label = os.path.basename(os.path.normpath(args.model_name))
+        def _encode(texts, batch_size=32):
+            return model.encode(texts, batch_size=batch_size, show_progress_bar=False, convert_to_numpy=True)
+        return _encode, _ckpt_label
 
     # Fallback
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -1692,10 +1745,10 @@ def main():
                        help="Use soft assignment for query spans: search(K) + per-center r_c filter + topK cap (symmetric with doc side). Default.")
     _soft_grp.add_argument("--no_soft_assignment", action="store_true", default=False,
                        help="Force hard assignment for query spans (nearest center only).")
-    parser.add_argument("--soft_assignment_max_centers_per_span", type=int, default=10,
+    parser.add_argument("--soft_assignment_max_centers_per_span", type=int, default=5,
                        help="Cap each span (query or document) to at most this many centers (by similarity) during soft assignment. "
                            "If a span falls in >K centers, keep top-K; if <=K, keep all. "
-                           "Default: 10. Applies to BOTH query-side and document-side soft assignment.")
+                           "Default: 5. Applies to BOTH query-side and document-side soft assignment.")
     parser.add_argument("--query_first_span_weight", type=float, default=1.0,
                        help="Multiply weight of first span per query by this factor. Default: 1.0.")
     parser.add_argument("--idf_exponent", type=float, default=2.0,
@@ -1726,7 +1779,7 @@ def main():
                        help="CLEF-IP data root (02_topics, qrels). Default: ./clefip2013. Use e.g. ./clefip2023 if your full download is there.")
     parser.add_argument("--clefip_rebuild_corpus", action="store_true",
                        help="Force rebuild of the full 01 passage corpus (ignores existing cache). Only applies when using full corpus (default).")
-    parser.add_argument("--clefip_sample_size", type=int, default=25000,
+    parser.add_argument("--clefip_sample_size", type=int, default=50000,
                        help="Controls the CLEF-IP corpus size (document-level sampling for >0): "
                             "0 = full EN corpus (~100M passages, cache under 01_passage_corpus_en/). "
                             "-1 = qrels-only corpus: only the exact passages referenced in qrels (~1.8k unique, "
@@ -1734,7 +1787,7 @@ def main():
                             "-2 = qrels-docs corpus: ALL passages from any document cited in qrels — includes "
                             "abstracts, claims, descriptions of each cited doc (~90 docs; "
                             "cache under 01_passage_corpus_en_qrels_docs/). "
-                            ">0 (default: 25000) = number of DOCUMENTS to sample. All passages from qrels-cited documents are "
+                            ">0 (default: 50000) = number of DOCUMENTS to sample. All passages from qrels-cited documents are "
                             "always included; remaining slots filled by reservoir-sampled EN documents. "
                             "All passages from each selected document are kept (preserves document structure). "
                             "Example: --clefip_sample_size 10000 (~10k docs → ~800k passages at ~80 passages/doc). "
@@ -1742,10 +1795,11 @@ def main():
     parser.add_argument("--clefip_hard_neg_ratio", type=float, default=0.0,
                        help="Fraction of sampled negative documents that should be IPC-based hard negatives "
                             "(0.0 to 1.0, default: 0.0 = pure random). Only applies when --clefip_sample_size > 0. "
-                            "Hard negatives are documents sharing the same IPC subclass (4-char level, e.g. 'G10L') "
-                            "as the query patents or their cited prior art. "
-                            "Example: --clefip_hard_neg_ratio 0.5 means 50%% of negatives are IPC-matched. "
-                            "Requires IPC index (built once from 01_extracted XMLs, cached as doc_id_ipc_cache.json). "
+                            "The hard negative quota is split 50/50 into two tiers: "
+                            "(1) subgroup-hard: shares IPC subgroup (e.g. 'H04N5/44') with query/cited patents; "
+                            "(2) subclass-hard: shares IPC subclass (e.g. 'H04N') but not subgroup. "
+                            "Example: --clefip_hard_neg_ratio 0.5 means 25%% subgroup-hard + 25%% subclass-hard + 50%% random. "
+                            "Requires IPC index v2 (built once from 01_extracted XMLs, cached as doc_id_ipc_cache_v2.json). "
                             "Cache dir includes hard neg ratio to avoid mixing: 01_passage_corpus_en_sample_<N>docs_hn<pct>/.")
     parser.add_argument("--clefip_two_stage_topk_docs", type=int, default=100,
                        help="Number of top documents to keep in Stage 1 of two-stage retrieval (default: 100). "
@@ -1843,6 +1897,15 @@ def main():
         except ImportError:
             print("❌  colbert-ai package not installed. Install with:  pip install colbert-ai")
             sys.exit(1)
+
+########################################################################################################################################################
+########################################################################################################################################################
+    elif _is_st_checkpoint(args.model_name):
+        # Local SentenceTransformer checkpoint (e.g. ./checkpoint-1142)
+        print(f"\n🔍 Loading SentenceTransformer checkpoint: {args.model_name}")
+        model = load_checkpoint_model(args.model_name)
+        model.to(device)
+        print(f"🚀 Checkpoint model ready on {device}")
 
 ########################################################################################################################################################
 ########################################################################################################################################################
