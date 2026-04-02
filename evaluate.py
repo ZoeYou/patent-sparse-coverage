@@ -408,13 +408,27 @@ def _get_clefip_dense_encoder(args, model_name: str, device):
         from adapters import AutoAdapterModel
         tokenizer = AutoTokenizer.from_pretrained(args.model_name)
         model = AutoAdapterModel.from_pretrained(args.model_name)
-        model.load_adapter("allenai/specter2", source="hf", load_as="specter2", set_active=True)
         model.to(device)
+        model.eval()
 
         def _fwd_cls(m, inp):
             return cls_pooling(m(**inp), inp["attention_mask"]).cpu().numpy()
-        def _encode(texts, batch_size=32):
-            return _batch_encode(texts, tokenizer, model, device, _fwd_cls, model.config.hidden_size, batch_size)
+
+        def _encode(texts, batch_size=32, role="document"):
+            """Encode texts with role-specific adapter (query: adhoc_query, document: proximity)."""
+            if role == "query":
+                adapter_hf_id = "allenai/specter2_adhoc_query"
+                adapter_name = "adhoc_query"
+            else:
+                adapter_hf_id = "allenai/specter2"
+                adapter_name = "proximity"
+            model.load_adapter(adapter_hf_id, source="hf",
+                               load_as=adapter_name, set_active=True)
+            model.to(device)
+            embs = _batch_encode(texts, tokenizer, model, device, _fwd_cls,
+                                 model.config.hidden_size, batch_size)
+            model.delete_adapter(adapter_name)
+            return embs
         return _encode, "Specter2"
 
     if model_name in ["mpi-inno-comp/paecter", "anferico/bert-for-patents"]:
@@ -1574,7 +1588,8 @@ def _run_clefip_eval_full_corpus(
             _cache_hit = False
 
     if not _cache_hit:
-        query_emb = encode_fn(query_texts_fmt, batch_size=32) if model_name not in ["datalyes/patembed-large", "patembed-large"] else encode_fn(query_texts_fmt, role="query")
+        _role_models = ["datalyes/patembed-large", "patembed-large", "allenai/specter2_base"]
+        query_emb = encode_fn(query_texts_fmt, role="query") if model_name in _role_models else encode_fn(query_texts_fmt, batch_size=32)
         batch_size = 256
         passage_emb_list = []
         with open(corpus_jsonl_path, "r", encoding="utf-8") as f:
@@ -1585,14 +1600,14 @@ def _run_clefip_eval_full_corpus(
                 batch_texts.append(rec["text"])
                 if len(batch_pids) >= batch_size:
                     _, batch_fmt = _clefip_format_for_model([""], batch_pids, batch_texts, args.model_name)
-                    if model_name in ["datalyes/patembed-large", "patembed-large"]:
+                    if model_name in _role_models:
                         passage_emb_list.append(encode_fn(batch_fmt, role="document"))
                     else:
                         passage_emb_list.append(encode_fn(batch_fmt, batch_size=32))
                     batch_pids, batch_texts = [], []
             if batch_pids:
                 _, batch_fmt = _clefip_format_for_model([""], batch_pids, batch_texts, args.model_name)
-                if model_name in ["datalyes/patembed-large", "patembed-large"]:
+                if model_name in _role_models:
                     passage_emb_list.append(encode_fn(batch_fmt, role="document"))
                 else:
                     passage_emb_list.append(encode_fn(batch_fmt, batch_size=32))
