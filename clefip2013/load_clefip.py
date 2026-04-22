@@ -143,6 +143,142 @@ def _collect_passages_from_root(root: ET.Element) -> List[Tuple[str, str]]:
     return out
 
 
+# ------------------------------------------------------------------ #
+# Dependent-claim ancestor expansion
+# ------------------------------------------------------------------ #
+
+_CLAIM_REF_LIST_RE = re.compile(
+    r"\bclaims?\s+((?:\d+\s*(?:to|through|and|or|,|-|–)\s*)*\d+)",
+    re.IGNORECASE,
+)
+_PRECEDING_CLAIMS_RE = re.compile(
+    r"\b(?:any\s+(?:one\s+)?of\s+the\s+preceding\s+claims?"
+    r"|the\s+preceding\s+claim"
+    r"|each\s+of\s+the\s+preceding\s+claims?"
+    r"|preceding\s+claims?)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_claim_refs(text: str, current_num: int, max_num: int) -> set:
+    """Extract referenced ancestor claim numbers from a claim's natural-language text.
+
+    Recognised patterns (case-insensitive):
+      * ``claim N`` / ``claims N, M`` / ``claims N or M`` / ``claims N and M``
+      * ``claims N to M`` / ``claims N through M`` / ``claims N-M`` (inclusive range)
+      * ``any (one) of the preceding claims`` / ``the preceding claim`` /
+        ``preceding claims`` -> all prior claims
+    Only returns numbers in ``[1, current_num)`` (valid ancestors).
+    """
+    refs: set = set()
+
+    if _PRECEDING_CLAIMS_RE.search(text):
+        refs.update(range(1, current_num))
+
+    for m in _CLAIM_REF_LIST_RE.finditer(text):
+        seg = m.group(1)
+        nums = [int(x) for x in re.findall(r"\d+", seg)]
+        if not nums:
+            continue
+        # Treat "N to M", "N through M", "N-M" as an inclusive range when exactly two numbers.
+        is_range = bool(re.search(r"\b(?:to|through)\b|[-–]", seg)) and len(nums) == 2 and nums[0] < nums[1]
+        if is_range:
+            refs.update(range(nums[0], nums[1] + 1))
+        else:
+            refs.update(nums)
+
+    return {n for n in refs if 1 <= n < current_num and n <= max_num}
+
+
+def _list_sibling_claims(root: ET.Element, target_el: ET.Element) -> Tuple[Optional[int], List[Tuple[int, ET.Element]]]:
+    """Find the ``<claims>`` container of *target_el* and return (target_num, siblings).
+
+    Each sibling is ``(claim_number, claim_element)``; the number is read from the
+    ``num`` attribute when present, else from the 1-based position index.
+    Returns ``(None, [])`` if target_el is not inside a ``<claims>`` container with
+    multiple ``<claim>`` siblings.
+    """
+    for claims_el in [c for c in root if _tag_local(c) == "claims"]:
+        siblings_raw = [c for c in claims_el if _tag_local(c) == "claim"]
+        if target_el not in siblings_raw:
+            continue
+        siblings: List[Tuple[int, ET.Element]] = []
+        for i, child in enumerate(siblings_raw, start=1):
+            raw_num = child.get("num")
+            try:
+                n = int(raw_num) if raw_num is not None else i
+            except (TypeError, ValueError):
+                n = i
+            siblings.append((n, child))
+        target_num = next((n for n, el in siblings if el is target_el), None)
+        return target_num, siblings
+    return None, []
+
+
+def _expand_claim_xpaths_with_ancestors(xml_path: str, xpaths: List[str]) -> Optional[str]:
+    """Resolve claim XPaths and prepend their independent ancestor claims.
+
+    For each XPath pointing to ``…/claims/claim[k]``, this collects the targeted
+    claim and all of its (transitive) ancestor claims by parsing references in
+    the claim text (e.g. "according to claim 1", "any of the preceding claims").
+    The union across all XPaths is returned as a single string with one claim
+    per line, ordered by claim number.
+
+    Falls back to the plain text of each XPath when:
+      * the XPath does not target a per-claim element, or
+      * the document uses the legacy schema where one ``<claim>`` wraps many
+        ``<claim-text>`` siblings (no per-claim splitting possible).
+    """
+    if not os.path.isfile(xml_path) or not xpaths:
+        return None
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+    except Exception:
+        return None
+
+    fallback_parts: List[str] = []
+    needed_by_target: Dict[int, ET.Element] = {}  # target_el id -> sentinel
+    text_by_num: Dict[int, str] = {}
+    needed_nums: set = set()
+
+    for xpath in xpaths:
+        target_el = _xpath_to_element(root, xpath)
+        if target_el is None:
+            continue
+        target_num, siblings = _list_sibling_claims(root, target_el)
+        if target_num is None or len(siblings) <= 1:
+            # Legacy / single-claim schema — keep raw text as-is.
+            t = _text_of_element(target_el)
+            if t:
+                fallback_parts.append(t)
+            continue
+        # Cache per-claim text once per document load.
+        if not text_by_num:
+            for n, el in siblings:
+                text_by_num[n] = _text_of_element(el)
+        max_num = max(n for n, _ in siblings)
+        # BFS: target + transitive ancestors.
+        frontier = [target_num]
+        needed_nums.add(target_num)
+        while frontier:
+            next_frontier: List[int] = []
+            for n in frontier:
+                for ref in _parse_claim_refs(text_by_num.get(n, ""), n, max_num):
+                    if ref not in needed_nums:
+                        needed_nums.add(ref)
+                        next_frontier.append(ref)
+            frontier = next_frontier
+
+    parts: List[str] = []
+    for n in sorted(needed_nums):
+        t = text_by_num.get(n)
+        if t:
+            parts.append(t)
+    parts.extend(fallback_parts)
+    return "\n".join(parts) if parts else None
+
+
 def _parse_test_txt(path: str) -> List[Dict[str, str]]:
     """Parse clef-ip-2013-clms-psg-TEST.txt into list of topic dicts (tid, tfile, tclaims, tfam-docs)."""
     topics = []
@@ -192,8 +328,18 @@ def load_clefip_en_topics(clefip_root: str) -> Tuple[List[str], List[str]]:
         xml_path = os.path.join(tfiles_dir, tfile)
         if not os.path.isfile(xml_path):
             continue
-        texts = []
-        for xpath in tclaims:
+        # Split tclaim XPaths: per-claim XPaths get ancestor expansion (a dependent
+        # claim is rewritten to include the text of all referenced ancestor claims,
+        # transitively, in claim-numbering order). Non-claim XPaths fall back to
+        # plain text extraction. Ancestors are deduped across all tclaims of a topic.
+        claim_xpaths = [x for x in tclaims if "claims/claim" in x]
+        other_xpaths = [x for x in tclaims if "claims/claim" not in x]
+        texts: List[str] = []
+        if claim_xpaths:
+            merged = _expand_claim_xpaths_with_ancestors(xml_path, claim_xpaths)
+            if merged:
+                texts.append(merged)
+        for xpath in other_xpaths:
             text = _get_passage_text_from_xml(xml_path, xpath)
             if text:
                 texts.append(text)

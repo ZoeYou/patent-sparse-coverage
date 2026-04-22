@@ -2132,3 +2132,61 @@ def find_centers(dense_model: str, tokenization_unit: str, include_cls: bool, se
         centers_path = centers_files[0]
         print(f"⚠️  Found {len(centers_files)} centers files, using: {centers_path}")
     return centers_path, centers_dir
+
+
+# ── General-purpose helpers used by evaluate.py ──────────────────────────────
+
+def hash_query_texts(query_texts) -> str:
+    """Stable short hash of the ordered list of query strings.
+
+    Used as a cache key so that changes to query construction (e.g. dependent-claim
+    ancestor expansion in clefip2013/load_clefip.py) invalidate stored query
+    embeddings without requiring an explicit version bump.
+    """
+    import hashlib
+    h = hashlib.sha1()
+    for t in query_texts:
+        h.update(str(t).encode("utf-8", errors="replace"))
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
+
+
+def sparse_to_csr(t):
+    """Convert a torch sparse tensor, dense torch tensor, or numpy array to a scipy CSR matrix."""
+    from scipy.sparse import csr_matrix, coo_matrix
+    if hasattr(t, "is_sparse") and t.is_sparse:
+        t = t.cpu().coalesce()
+        idx = t.indices().numpy()
+        vals = t.values().numpy()
+        return coo_matrix((vals, (idx[0], idx[1])), shape=t.shape).tocsr()
+    arr = t.cpu().numpy() if hasattr(t, "cpu") else np.asarray(t)
+    return csr_matrix(arr)
+
+
+def is_st_checkpoint(path: str) -> bool:
+    """True if *path* is a local directory containing a SentenceTransformer checkpoint (modules.json)."""
+    return os.path.isdir(path) and os.path.isfile(os.path.join(path, "modules.json"))
+
+
+def auto_batch_size(device, hidden_size: int = 768, min_bs: int = 4, max_bs: int = 256) -> int:
+    """Return a safe inference batch size scaled to GPU total memory.
+
+    Calibrated for transformer models at seq_len=512:
+      ~11 GB GPU  → 32, ~16 GB → 64, ~24 GB → 64, ~40 GB → 128, ~80 GB → 256.
+    Hidden-size scaling: larger models get proportionally smaller batches (sqrt scaling).
+    Falls back to 32 on CPU or if GPU info is unavailable.
+    """
+    if not torch.cuda.is_available():
+        return 32
+    try:
+        dev_idx = device.index if (hasattr(device, "index") and device.index is not None) else 0
+        total_gb = torch.cuda.get_device_properties(dev_idx).total_memory / (1024 ** 3)
+        bs_float = 64.0 * (total_gb / 16.0) * (768.0 / max(hidden_size, 1)) ** 0.5
+        p2 = min_bs
+        while p2 * 2 <= int(bs_float):
+            p2 *= 2
+        result = max(min_bs, min(max_bs, p2))
+        print(f"  [auto batch_size] GPU total={total_gb:.1f} GB, hidden={hidden_size} → batch_size={result}", flush=True)
+        return result
+    except Exception:
+        return 32
