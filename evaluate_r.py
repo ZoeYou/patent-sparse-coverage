@@ -76,7 +76,7 @@ class NNIndex:
             if self.faiss_index_type == "IP":
                 # IndexFlatIP: range_search finds points with similarity >= threshold
                 # cosine_distance <= radius  <=>  similarity >= (1 - radius)
-                sim_threshold = 1.0 - radius
+                sim_threshold = np.float32(1.0 - radius)
                 
                 # FAISS IP range_search returns points with score >= threshold
                 lims, D, I = self.index.range_search(X_q, sim_threshold)

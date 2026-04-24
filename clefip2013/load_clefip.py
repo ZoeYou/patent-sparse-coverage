@@ -60,7 +60,7 @@ def _xpath_to_element(root: ET.Element, xpath: str) -> Optional[ET.Element]:
         if not step:
             continue
         # step might be "p[19]" or "claim[1]" or "claim"
-        match = re.match(r"^(\w+)(?:\[(\d+)\])?$", step)
+        match = re.match(r"^([\w-]+)(?:\[(\d+)\])?$", step)
         if not match:
             return None
         tag, idx = match.group(1), match.group(2)
@@ -460,6 +460,7 @@ def load_clefip_passage_corpus(
         print(f"  Indexed {len(doc_collection_index):,} XML files.", flush=True)
     pid_to_text = {}
     skipped_lang = 0
+    skipped_empty = 0
     for doc_id, xpath in order:
         pid = f"{doc_id}::{xpath}"
         xml_path = _resolve_doc_path(doc_id, clefip_root, doc_collection_root, doc_collection_index=doc_collection_index)
@@ -472,8 +473,13 @@ def load_clefip_passage_corpus(
             text = _get_passage_text_from_xml(xml_path, xpath)
             if text:
                 pid_to_text[pid] = text
+            else:
+                skipped_empty += 1
     if lang_filter_upper and skipped_lang:
         print(f"  load_clefip_passage_corpus: skipped {skipped_lang} passages from non-{lang_filter_upper} docs.", flush=True)
+        if skipped_empty:
+            print(f"  load_clefip_passage_corpus: WARNING: {skipped_empty} qrel passages have empty text in XML "
+                    f"→ they are absent from corpus and excluded from qrels (qrel coverage reduced).", flush=True)
     passage_ids = list(pid_to_text.keys())
     passage_texts = [pid_to_text[pid] for pid in passage_ids]
     resolved = set(passage_ids)

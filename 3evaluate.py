@@ -218,12 +218,24 @@ def clefip_passage_evaluation(
     """
     assert len(query_ids) == len(query_embeddings)
     assert len(passage_ids) == len(passage_embeddings)
+    set_seed(42)
     Q = np.array(query_embeddings, dtype=np.float32, copy=True)
     D = np.array(passage_embeddings, dtype=np.float32, copy=True)
     assert Q.shape[1] == D.shape[1]
     faiss.normalize_L2(Q)
     faiss.normalize_L2(D)
     _report_dense_flops(Q, D, "CLEF-IP passage", model_label=model_label)
+    _n_passages_oom = D.shape[0]
+    _oom_threshold = 500_000
+    if _n_passages_oom > _oom_threshold:
+        import warnings as _w
+        _w.warn(
+            f"clefip_passage_evaluation: computing full Q@D.T similarity matrix with "
+            f"{_n_passages_oom:,} passages × {Q.shape[0]} queries × {Q.shape[1]}d "
+            f"≈ {Q.shape[0]*_n_passages_oom*Q.shape[1]*4/1e9:.1f} GB. "
+            f"Consider using FAISS IVF for corpora larger than {_oom_threshold:,} passages.",
+            ResourceWarning, stacklevel=2,
+        )
     sim = Q @ D.T
     passage_scores_list = [
         {passage_ids[j]: float(sim[q_idx, j]) for j in range(sim.shape[1])}
@@ -340,23 +352,29 @@ def _dense_chunk_text(text: str, tokenizer_or_none, max_tokens: int = 512) -> li
             return [text]
         # Split on sentence boundaries (period + whitespace); fall back to whitespace.
         import re as _re2
-        sents = _re2.split(r'(?<=\.)\s+', text)
+        sents = [s for s in _re2.split(r'(?<=\.)\s+', text) if s.strip()]
         if len(sents) <= 1:
-            sents = text.split()
+            sents = [w for w in text.split() if w]
+        # Pre-tokenize each sentence ONCE (avoids re-encoding every growing prefix).
+        sent_lens = [len(tok.encode(s, add_special_tokens=False)) for s in sents]
+        # Special tokens (CLS + SEP) cost 2 tokens in most encoders.
+        _special = 2
         chunks: list[str] = []
-        current = ""
-        for sent in sents:
-            if not sent.strip():
-                continue
-            candidate = (current + " " + sent).strip() if current else sent
-            if len(tok.encode(candidate, add_special_tokens=True)) <= max_tokens:
-                current = candidate
+        current_sents: list[str] = []
+        current_len = _special
+        for sent, slen in zip(sents, sent_lens):
+            # +1 for the space separator between sentences
+            added = slen + (1 if current_sents else 0)
+            if current_len + added <= max_tokens:
+                current_sents.append(sent)
+                current_len += added
             else:
-                if current:
-                    chunks.append(current)
-                current = sent  # single sent may still exceed max; encoder will truncate
-        if current:
-            chunks.append(current)
+                if current_sents:
+                    chunks.append(" ".join(current_sents))
+                current_sents = [sent]
+                current_len = _special + slen
+        if current_sents:
+            chunks.append(" ".join(current_sents))
         return chunks if chunks else [text]
     else:
         # Word-count heuristic: ~350 words per chunk (≈ 450–500 tokens for patent text).
@@ -666,11 +684,11 @@ def _report_bm25_posting_stats(retriever, label: str, query_tokens_list=None):
     if doc_freq is None and hasattr(retriever, "scores") and isinstance(getattr(retriever, "scores", None), dict):
         indptr = retriever.scores.get("indptr")
         if indptr is not None:
-            doc_freq = np.diff(np.asarray(indptr)).astype(np.float64)
+            doc_freq = np.diff(np.asarray(indptr)).astype(np.float32)
     if doc_freq is None:
         print(f"\n📊 BM25 ({label}): inverted index built (posting lengths not exposed by library).")
         return
-    pl_lens = np.asarray(doc_freq).ravel().astype(np.float64)
+    pl_lens = np.asarray(doc_freq).ravel().astype(np.float32)
     n_empty = int(np.sum(pl_lens == 0))
     total_entries = int(np.sum(pl_lens))
     V = len(pl_lens)
@@ -1312,7 +1330,6 @@ def _run_clefip_eval_full_corpus(
         retriever = bm25s.BM25()
         retriever.index(passage_tokens)
         _report_bm25_posting_stats(retriever, "CLEF-IP passage (full corpus)", query_tokens_list=query_tokens)
-        k = 100
         clefip_results, clefip_scores = retriever.retrieve(query_tokens, k=len(passage_ids))
         # Build per-query score dicts from BM25 retrieval results
         passage_scores_list = []

@@ -760,7 +760,7 @@ def farthest_first_traversal_streaming(store, N, d, V, chunk_size=100_000, batch
         batch = store.get_chunk(start, end)
         l2_normalize_inplace(batch)
         sims = batch @ center_row
-        dists = 1.0 - sims
+        dists = (1.0 - sims).astype(np.float32)
         np.minimum(min_dist[start:end], dists, out=min_dist[start:end])
     if V == 1:
         return np.array(center_indices, dtype=np.int64)
@@ -924,6 +924,9 @@ def main():
     ap.add_argument("--df_top_k", type=int, default=10,
                     help="max_centers_per_span for activation DF diagnostic (matches evaluate.py soft assignment). "
                          "0 = skip activation DF and use Voronoi DF for stop-centers. Default: 10.")
+    ap.add_argument("--stop_center_fraction", type=float, default=0.01,
+                    help="Fraction of top centers (by document frequency) to disable for retrieval. "
+                         "Default: 0.01 (top 1%%).")
     ap.add_argument("--exclude_cls", action="store_true", default=False,
                     help="Exclude [CLS] embedding rows (span_kind='cls') from center construction. "
                          "Requires metadata JSONL (saved with --save_metadata 1 in 1create_N_embeddings.py).")
@@ -1224,6 +1227,8 @@ def main():
           f"median={int(np.median(points_per_center))}, max={int(np.max(points_per_center))}")
     if empty_cells > 0:
         print(f"[kcenter] Warning: {empty_cells} centers have 0 assigned points")
+    if empty_cells > 0:
+        print(f"[kcenter] Warning: {empty_cells} centers have 0 assigned points")
 
     # ── DF diagnostic (document frequency per center = posting list length; critical for retrieval) ──
     df_diagnostic = None
@@ -1264,7 +1269,7 @@ def main():
             act_stats = None
 
         # Stop-center rule: top 1% of centers by df (using activation df when available)
-        n_stop = max(1, int(math.ceil(V_actual * 0.01)))
+        n_stop = max(1, int(math.ceil(V_actual * args.stop_center_fraction)))
         ranked = np.argsort(-df_for_stop)
         stop_centers = [int(ranked[i]) for i in range(n_stop)]
         stop_center_threshold = int(df_for_stop[ranked[n_stop - 1]])
@@ -1314,6 +1319,9 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     out_name = f"centers_greedy_V{V_actual}_r{nominal_r:.3f}.npy"
+    # Include min/max r in hash suffix to avoid filename collisions when r distributions differ
+    r_range_hash = hash((min_r, max_r, nominal_r, int(V_actual)))  & 0xFFFFFFFF
+    out_name = f"centers_greedy_V{V_actual}_r{nominal_r:.3f}_r{min_r:.3f}-{max_r:.3f}_{r_range_hash:08x}.npy"
     out_path = os.path.join(args.out_dir, out_name)
     np.save(out_path, centers)
 

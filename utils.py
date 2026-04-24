@@ -103,6 +103,14 @@ def get_encoder_sep_for_model(model_id: str, tokenizer=None) -> str:
     return f" {s} " if s else DEFAULT_SEP
 
 
+def _format_simple_section(scheme: str, marker: str, text: str) -> str:
+    """Shared body for claim/invention formatters: optional [section] prefix."""
+    text = (text or "").strip()
+    if scheme == ENCODER_FORMAT_TITLE_SEP_ONLY:
+        return text
+    return f"[{marker}] {text}".strip()
+
+
 def format_abstract_for_encoder(scheme: str, title: str, abstract: str, sep: str = DEFAULT_SEP) -> str:
     """Format title+abstract for encoder input. sep is the model's separator (see get_encoder_sep_for_model)."""
     title = (title or "").strip()
@@ -114,18 +122,12 @@ def format_abstract_for_encoder(scheme: str, title: str, abstract: str, sep: str
 
 def format_claim_for_encoder(scheme: str, claim: str) -> str:
     """Format claim for encoder input."""
-    claim = (claim or "").strip()
-    if scheme == ENCODER_FORMAT_TITLE_SEP_ONLY:
-        return claim
-    return f"[claim] {claim}".strip()
+    return _format_simple_section(scheme, "claim", claim)
 
 
 def format_invention_for_encoder(scheme: str, invention: str) -> str:
     """Format invention for encoder input."""
-    invention = (invention or "").strip()
-    if scheme == ENCODER_FORMAT_TITLE_SEP_ONLY:
-        return invention
-    return f"[invention] {invention}".strip()
+    return _format_simple_section(scheme, "invention", invention)
 
 
 def get_chunk_sep_marker(scheme: str, sep: str = DEFAULT_SEP) -> str:
@@ -276,6 +278,16 @@ def load_corpus_epo(
             for i in range(min(remainder, len(caps))):
                 caps[i] += 1
             year_caps = {d: int(caps[i]) for i, d in enumerate(subdirs)}
+            # Warn if some years get zero documents due to rounding
+            zero_years = [d for d, c in year_caps.items() if c == 0]
+            if zero_years:
+                import warnings as _w
+                _w.warn(
+                    f"load_corpus_epo: {len(zero_years)} years will be skipped due to rounding "
+                    f"(years: {', '.join(zero_years[:5])}{'...' if len(zero_years) > 5 else ''}). "
+                    f"Consider using a larger max_docs or adjust sampling.",
+                    UserWarning, stacklevel=2,
+                )
     total = 0
     for i, pattern in enumerate(patterns):
         files = list(glob.iglob(pattern))
@@ -459,7 +471,6 @@ def create_contextual_span_embeddings(
     import tempfile as _tmpmod
     _metadata_tmpdir = _tmpmod.mkdtemp(prefix="emb_meta_")
     _metadata_tmpfiles = {s: os.path.join(_metadata_tmpdir, f"{s}_meta.jsonl") for s in ['abstract', 'claim', 'invention']}
-    _metadata_counts = {'abstract': 0, 'claim': 0, 'invention': 0}
 
     def _flush_metadata():
         """Write accumulated metadata to temp files and clear the in-memory list."""
@@ -476,7 +487,6 @@ def create_contextual_span_embeddings(
             if section_buf[s]:
                 with open(_metadata_tmpfiles[s], 'a', encoding='utf-8') as f:
                     f.write('\n'.join(section_buf[s]) + '\n')
-                _metadata_counts[s] += len(section_buf[s])
         all_metadata = []
 
     def _load_flushed_metadata() -> list:
@@ -737,6 +747,8 @@ _REF_GROUP_PAREN = re.compile(rf"\({_REF_TOKEN}(?:\s*[,;]\s*{_REF_TOKEN})*\)")
 _REF_GROUP_BRACKET = re.compile(rf"\[{_REF_TOKEN}(?:\s*[,;]\s*{_REF_TOKEN})*\]")
 # Leading claim numbering at start of a line: "1.", "1)", "1 -", "1:" etc.
 _CLAIM_LEADING_NUM = re.compile(r"(?m)^\s*\d+\s*[\.\)\-:]\s*")
+# Leading run of all-caps tokens (e.g. BACKGROUND OF THE INVENTION); 2+ chars per word.
+_LEADING_CAPS_RE = re.compile(r"^(?:[A-Z][A-Z0-9]{1,}\s*)+")
 
 
 def _normalize_ref_numerals(text: str) -> str:
@@ -1044,15 +1056,20 @@ def process_doc_batch_cached(
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
         batch_embeddings = outputs.last_hidden_state
 
-    # Visible char end per doc
-    char_ends = []
-    for i in range(len(doc_texts)):
-        ce = _visible_char_end_from_offset_mapping(offset_mapping[i], input_ids[i], special_token_ids)
-        char_ends.append(ce)
+    # CPU-side views: ONE GPU sync for input_ids; offset_mapping is already on CPU.
+    # Pre-converted lists are passed to the per-doc helpers below to avoid per-doc sync.
+    input_ids_lists = input_ids.cpu().tolist()                       # list[list[int]]
+    offset_mapping_lists = offset_mapping.tolist()                    # list[list[[int, int]]]
+    input_ids_cpu = input_ids.detach().cpu().numpy()                  # (batch, seq_len)
+    attention_mask_cpu = attention_mask.detach().cpu().numpy()        # (batch, seq_len)
 
-    # CPU-side numpy views for fast iteration (avoids per-token GPU sync)
-    input_ids_cpu = input_ids.detach().cpu().numpy()  # (batch, seq_len)
-    attention_mask_cpu = attention_mask.detach().cpu().numpy()  # (batch, seq_len)
+    # Visible char end per doc (uses precomputed CPU lists; no per-doc GPU sync)
+    char_ends = [
+        _visible_char_end_from_offset_mapping(
+            offset_mapping_lists[i], input_ids_lists[i], special_token_ids,
+        )
+        for i in range(len(doc_texts))
+    ]
 
     # ──────────────────────────────────────────────────────────────────────
     # Phase A: Build a per-batch pooling plan (CPU only). Each entry knows
@@ -1066,8 +1083,8 @@ def process_doc_batch_cached(
         if char_end == 0:
             continue
 
-        offset_map = offset_mapping[i]
-        seq_input_ids = input_ids[i]
+        offset_map = offset_mapping_lists[i]
+        seq_input_ids = input_ids_lists[i]
 
         offsets = _compute_content_offsets(doc_text, section, format_scheme, sep)
 
@@ -1093,7 +1110,6 @@ def process_doc_batch_cached(
             offset_mapping=offset_map,
             input_ids=seq_input_ids,
             special_token_ids=special_token_ids,
-            dedup=False,
         )
 
         seq_len = batch_embeddings.shape[1]
@@ -1144,8 +1160,7 @@ def extract_char_spans_to_token_spans(char_spans: List[Tuple[int, int, str]],
                                      prefix_len: int,
                                      offset_mapping: torch.Tensor,
                                      input_ids: torch.Tensor,
-                                     special_token_ids: set,
-                                     dedup: bool = False) -> List[Tuple[str, int, int]]:
+                                     special_token_ids: set) -> List[Tuple[str, int, int]]:
     """
     Generic char-span -> token-span mapper using tokenizer offset_mapping.
 
@@ -1153,10 +1168,19 @@ def extract_char_spans_to_token_spans(char_spans: List[Tuple[int, int, str]],
     If the ORIGINAL text had a prefix that char_spans are not counting, pass prefix_len to shift.
 
     Returns list of (span_text, start_token_idx, end_token_idx) with end exclusive.
+
+    `offset_mapping` and `input_ids` may be torch tensors or already-materialised lists.
+    Pre-converted lists are preferred when this is called many times in a loop, to avoid
+    repeated per-doc GPU sync.
     """
     spans = []
-    offset_list = offset_mapping.cpu().tolist()
-    input_ids_list = input_ids.cpu().tolist()
+    offset_list = offset_mapping.tolist() if hasattr(offset_mapping, "tolist") else list(offset_mapping)
+    if hasattr(input_ids, "cpu"):
+        input_ids_list = input_ids.cpu().tolist()
+    elif hasattr(input_ids, "tolist"):
+        input_ids_list = input_ids.tolist()
+    else:
+        input_ids_list = list(input_ids)
 
     for span_start_char, span_end_char, span_text in char_spans:
         shifted_start = span_start_char + prefix_len
@@ -1182,19 +1206,20 @@ def extract_char_spans_to_token_spans(char_spans: List[Tuple[int, int, str]],
 
         if token_start is not None and token_end is not None and token_start < token_end:
             spans.append((span_text, token_start, token_end))
+        elif token_start is not None and token_end is None:
+            # token_start was found but no token boundary matched shifted_end.
+            # This happens when the span ends exactly on a token boundary that the loop
+            # skips (special/padding token).  Use token_start+1 as a conservative fallback
+            # so the span is not silently dropped.
+            import logging as _logging
+            _logging.getLogger(__name__).debug(
+                "extract_char_spans_to_token_spans: token_end not found for span %r "
+                "(shifted_start=%d, shifted_end=%d); using token_start+1 as fallback.",
+                span_text, shifted_start, shifted_end,
+            )
+            spans.append((span_text, token_start, token_start + 1))
 
-    if not dedup:
-        return spans
-
-    seen = set()
-    unique = []
-    for span_text, start, end in spans:
-        k = (span_text.lower(), start, end)
-        if k in seen:
-            continue
-        seen.add(k)
-        unique.append((span_text, start, end))
-    return unique
+    return spans
 
 
 def canonicalize_span_text(span_text: str) -> str:
@@ -1262,7 +1287,7 @@ def _strip_leading_uppercase_run(text: str) -> tuple:
         return (text, 0)
     t = text.strip()
     # Require each "word" to have at least 2 chars so we don't strip sentence-initial capital (e.g. "T" from "This")
-    m = re.match(r"^(?:[A-Z][A-Z0-9]{1,}\s*)+", t)
+    m = _LEADING_CAPS_RE.match(t)
     if not m:
         return (t, 0)
     rest = t[m.end():]
@@ -1426,30 +1451,10 @@ def chunk_query_text(
     abstract_part = (parts[1] or "").strip()
     prefix_text = title_part + sep_marker
 
-    # Tokenize without special tokens to get content token counts
-    prefix_enc = tokenizer(
-        prefix_text,
-        add_special_tokens=False,
-        return_tensors=None,
-        return_offsets_mapping=False,
-    )
-    abstract_enc = tokenizer(
-        abstract_part,
-        add_special_tokens=False,
-        return_tensors=None,
-        return_offsets_mapping=False,
-    )
-    prefix_ids = prefix_enc if isinstance(prefix_enc, list) else prefix_enc["input_ids"]
-    abstract_ids = abstract_enc if isinstance(abstract_enc, list) else abstract_enc["input_ids"]
-    if not isinstance(prefix_ids, list):
-        prefix_ids = prefix_ids.tolist()
-    if not isinstance(abstract_ids, list):
-        abstract_ids = abstract_ids.tolist()
-    # Handle batch-of-one from tokenizer
-    if prefix_ids and isinstance(prefix_ids[0], list):
-        prefix_ids = prefix_ids[0]
-    if abstract_ids and isinstance(abstract_ids[0], list):
-        abstract_ids = abstract_ids[0]
+    # Tokenize without special tokens to get content token counts.
+    # tokenizer.encode returns a flat list[int] directly, avoiding dict/tensor unwrapping.
+    prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
+    abstract_ids = tokenizer.encode(abstract_part, add_special_tokens=False)
 
     # Truncate prefix to leave room for abstract in each chunk
     content_max = max_length - 2  # [CLS] and [SEP] added by encoder
@@ -1480,16 +1485,24 @@ def chunk_query_text(
     return out
 
 
-def _visible_char_end_from_offset_mapping(offset_map_1d: torch.Tensor,
-                                         input_ids_1d: torch.Tensor,
+def _visible_char_end_from_offset_mapping(offset_map_1d,
+                                         input_ids_1d,
                                          special_token_ids: set) -> int:
     """
     Given one sequence's offset_mapping [seq_len, 2], return the max visible character end
     among non-special, non-padding tokens. This lets us truncate raw text so spaCy only
     processes what the encoder actually saw (after max_length truncation).
+
+    `offset_map_1d` and `input_ids_1d` may be torch tensors or already-materialised lists.
+    Pre-converted lists are preferred when called many times in a loop.
     """
-    offset_list = offset_map_1d.cpu().tolist()
-    input_ids_list = input_ids_1d.cpu().tolist()
+    offset_list = offset_map_1d.tolist() if hasattr(offset_map_1d, "tolist") else offset_map_1d
+    if hasattr(input_ids_1d, "cpu"):
+        input_ids_list = input_ids_1d.cpu().tolist()
+    elif hasattr(input_ids_1d, "tolist"):
+        input_ids_list = input_ids_1d.tolist()
+    else:
+        input_ids_list = input_ids_1d
 
     max_end = 0
     for (start, end), tid in zip(offset_list, input_ids_list):
@@ -1538,11 +1551,14 @@ def process_doc_batch(doc_texts: List[str],
 
     input_ids = encoding['input_ids'].to(device)
     attention_mask = encoding['attention_mask'].to(device)
-    offset_mapping = encoding['offset_mapping']  # [batch, seq_len, 2]
+    offset_mapping = encoding['offset_mapping']  # [batch, seq_len, 2] (CPU tensor)
 
-    # CPU-side numpy views to avoid per-token GPU sync in tight loops below.
-    input_ids_cpu = input_ids.detach().cpu().numpy()        # (batch, seq_len)
-    attention_mask_cpu = attention_mask.detach().cpu().numpy()  # (batch, seq_len)
+    # CPU-side views used by the per-doc helpers below.
+    # ONE GPU sync for input_ids; offset_mapping is already on CPU.
+    input_ids_cpu = input_ids.detach().cpu().numpy()                  # (batch, seq_len)
+    attention_mask_cpu = attention_mask.detach().cpu().numpy()        # (batch, seq_len)
+    input_ids_lists = input_ids_cpu.tolist()                          # list[list[int]]
+    offset_mapping_lists = offset_mapping.tolist()                    # list[list[[int,int]]]
 
     special_token_ids = set(tokenizer.all_special_ids)
     # Check if [CLS] token exists
@@ -1571,7 +1587,9 @@ def process_doc_batch(doc_texts: List[str],
     # embedding misalignment.
     visible_texts = []
     for i in range(len(doc_texts)):
-        char_end = _visible_char_end_from_offset_mapping(offset_mapping[i], input_ids[i], special_token_ids)
+        char_end = _visible_char_end_from_offset_mapping(
+            offset_mapping_lists[i], input_ids_lists[i], special_token_ids,
+        )
         visible_texts.append(doc_texts[i][:char_end] if char_end > 0 else "")
 
     # Run spaCy only on visible text (encoder-visible window only)
@@ -1612,6 +1630,15 @@ def process_doc_batch(doc_texts: List[str],
             del stacked, doc_idx_t, tok_idx_t
             norms = np.linalg.norm(arr, axis=1, keepdims=True)
             np.divide(arr, norms + 1e-12, out=arr)
+            _nan_mask = ~np.isfinite(arr)
+            if _nan_mask.any():
+                import warnings as _w
+                _w.warn(
+                    f"NaN/Inf in {int(_nan_mask.any(axis=1).sum())}/{arr.shape[0]} encoder tokens "
+                    f"after L2 normalization. Replacing with zeros.",
+                    RuntimeWarning, stacklevel=2,
+                )
+                arr[_nan_mask] = 0.0
             for k, (doc_i, _ti, tok_str, tok_canonical) in enumerate(pool_plan):
                 all_span_embeddings.append(
                     (doc_ids[doc_i], sections[doc_i], doc_texts[doc_i], tok_str, tok_canonical, arr[k])
@@ -1632,8 +1659,8 @@ def process_doc_batch(doc_texts: List[str],
             continue
 
         token_embeddings = batch_embeddings[i]  # [seq_len, hidden_dim]
-        offset_map = offset_mapping[i]          # [seq_len, 2]
-        seq_input_ids = input_ids[i]            # [seq_len]
+        offset_map = offset_mapping_lists[i]    # list[[int, int]] (precomputed)
+        seq_input_ids = input_ids_lists[i]      # list[int] (precomputed)
 
         # Build semantic unit char spans based on spaCy; offsets are relative to vis_text.
         char_spans = []
@@ -1824,7 +1851,6 @@ def process_doc_batch(doc_texts: List[str],
             offset_mapping=offset_map,
             input_ids=seq_input_ids,
             special_token_ids=special_token_ids,
-            dedup=False
         )
 
         for span_text, token_start, token_end in spans:
@@ -1867,6 +1893,15 @@ def process_doc_batch(doc_texts: List[str],
         del stacked
         norms = np.linalg.norm(arr, axis=1, keepdims=True)
         np.divide(arr, norms + 1e-12, out=arr)
+        _nan_mask = ~np.isfinite(arr)
+        if _nan_mask.any():
+            import warnings as _w
+            _w.warn(
+                f"NaN/Inf in {int(_nan_mask.any(axis=1).sum())}/{arr.shape[0]} spacy spans "
+                f"after L2 normalization. Replacing with zeros.",
+                RuntimeWarning, stacklevel=2,
+            )
+            arr[_nan_mask] = 0.0
         for k, (doc_i, _ts, _te, txt, can) in enumerate(pool_plan):
             all_span_embeddings.append(
                 (doc_ids[doc_i], sections[doc_i], doc_texts[doc_i], txt, can, arr[k])
