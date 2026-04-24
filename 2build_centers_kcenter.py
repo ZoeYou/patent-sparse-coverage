@@ -646,33 +646,18 @@ def farthest_first_traversal_gpu(X_ref_np, V, batch_size_ff=1, seed=0, log_every
 
 
 def build_output_dir(base_out_dir: str, embeddings_dir: str, suffix: str = "_kcenter") -> str:
-    """Build output directory, appending suffix (e.g. _kcenter)."""
+    """Build output directory, appending suffix (e.g. _kcenter).
+
+    Embeddings dir layout: {model_name}_{unit}[_fp16]
+    Centers dir layout:    centers_greedy_{model_name}_{unit}{suffix}
+    """
     if base_out_dir not in ("./centers", "centers"):
         return base_out_dir
 
-    normalized_dir = embeddings_dir.rstrip("/")
-    dir_info = parse_embeddings_dir(normalized_dir)
-
-    if dir_info:
-        model_name = dir_info["model_name"]
-        tokenization_unit = dir_info["unit"]
-        cls_suffix = dir_info["cls_suffix"]
-        layer = dir_info.get("layer", "last")
-        return f"centers_greedy_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}{suffix}"
-
-    basename = os.path.basename(normalized_dir)
-    if basename.startswith("embeddings_"):
-        parts = basename.replace("embeddings_", "").split("_")
-        if len(parts) >= 4:
-            cls_pos = next((i for i, p in enumerate(parts) if p in ("cls", "nocls")), None)
-            layer_pos = next((i for i, p in enumerate(parts) if p in ("last", "second_last")), None)
-            if cls_pos is not None and layer_pos is not None and cls_pos < layer_pos:
-                model_name = "_".join(parts[:cls_pos])
-                tokenization_unit = "_".join(parts[cls_pos + 1 : layer_pos])
-                cls_suffix = parts[cls_pos]
-                layer = parts[layer_pos]
-                return f"centers_greedy_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}{suffix}"
-
+    basename = os.path.basename(embeddings_dir.rstrip("/"))
+    # Strip optional _fp16 suffix
+    if basename.endswith("_fp16"):
+        basename = basename[:-len("_fp16")]
     return f"centers_greedy_{basename}{suffix}"
 
 

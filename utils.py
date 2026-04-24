@@ -186,6 +186,56 @@ def _parse_epo_txt_file(file_path: str) -> Optional[dict]:
     return result
 
 
+def auto_batch_size_for_encoder(max_length: int = 512, model=None) -> int:
+    """Estimate a reasonable encoding batch size based on available GPU memory.
+
+    Heuristic (for BERT-class encoders with max_length tokens):
+        usable_mb  = (total_vram - already_allocated) * 0.85
+        per_sample_mb ≈ max_length / 512 * 3   # ~3 MB per sample at 512 tokens (empirical)
+        batch_size = usable_mb / per_sample_mb, clamped to [8, 2048]
+
+    If `model` is passed (and already on the GPU), the model's allocated memory is
+    subtracted from the total before sizing the batch — important for large encoders
+    (≥1B params) where the model itself eats most VRAM.
+
+    Falls back to 64 on CPU or when detection fails.
+    """
+    if not torch.cuda.is_available():
+        print("[auto_batch_size] No GPU detected → default batch_size=64")
+        return 64
+
+    try:
+        dev = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(dev)
+        total_mb = props.total_mem / (1024 ** 2)
+        total_gb = total_mb / 1024
+        gpu_name = props.name
+
+        # Subtract memory currently taken by the model (if loaded on GPU)
+        allocated_mb = torch.cuda.memory_allocated(dev) / (1024 ** 2)
+        free_mb = max(total_mb - allocated_mb, 0.0)
+
+        # Rough per-sample cost scales linearly with sequence length
+        per_sample_mb = (max_length / 512) * 3.0
+        usable_mb = free_mb * 0.85  # leave a little headroom for activations / OS
+        estimated = int(usable_mb / per_sample_mb)
+
+        # Clamp to a sane range
+        estimated = max(8, min(estimated, 2048))
+
+        # Round down to nearest multiple of 8 for kernel friendliness
+        estimated = (estimated // 8) * 8
+
+        print(f"[auto_batch_size] GPU: {gpu_name}, VRAM: {total_gb:.1f} GB, "
+              f"model alloc: {allocated_mb / 1024:.1f} GB, free: {free_mb / 1024:.1f} GB "
+              f"→ batch_size={estimated}")
+        return estimated
+
+    except Exception as e:
+        print(f"[auto_batch_size] Detection failed ({e}) → default batch_size=64")
+        return 64
+
+
 def load_corpus_epo(
     data_dir: str,
     max_docs: Optional[int] = None,
@@ -366,12 +416,9 @@ def create_contextual_span_embeddings(
     max_docs: int = None,
     batch_size: int = 64,
     max_length: int = 512,
-    keep_cls: bool = True,
-    layer: str = "last",
     span_pooling: str = "mean",
     format_scheme: Optional[str] = None,
     sep: Optional[str] = None,
-    keep_doc_mean: bool = False,
     max_section_chars: Optional[int] = None,
     max_spans: Optional[int] = None,
     span_cache: Optional[dict] = None,
@@ -380,7 +427,7 @@ def create_contextual_span_embeddings(
 ) -> Tuple[dict, List[dict]]:
     """
     Create contextual span embeddings for all documents using batch processing.
-    format_scheme and sep keep format coherent with retrieval. keep_doc_mean: one span per section = mean of tokens.
+    format_scheme and sep keep format coherent with retrieval.
     max_section_chars: if set, truncate each section text to this many chars before encoding (bounds spaCy/tokenizer input).
     max_spans: if set, stop after collecting this many spans (early-stop to avoid encoding more than needed).
     span_cache: if provided, use pre-computed spaCy spans (from 0cache_spacy_spans.py) instead of
@@ -470,32 +517,27 @@ def create_contextual_span_embeddings(
         n_unique_docs = len(set(item[0] for item in doc_data))
         print(f"✓ Shuffled {len(doc_data):,} doc-sections (seed=42, {n_unique_docs:,} unique docs)")
 
-    # Helper: cap content spans per (doc, section) pair (evenly-spaced sub-sampling)
+    # Helper: cap content spans per (doc, section) pair (deterministic random sub-sampling)
     def _cap_spans_per_doc_section(batch_results, max_content):
-        """Cap content spans per (doc_id, section); CLS/DOC_MEAN always kept."""
+        """Cap spans per (doc_id, section)."""
         from collections import OrderedDict
         groups = OrderedDict()
         for item in batch_results:
-            _raw = item[3]  # span_text_raw
             key = (item[0], item[1])  # (doc_id, section)
             if key not in groups:
-                groups[key] = {'special': [], 'content': []}
-            is_special = (_raw == "[DOC_MEAN]" or _raw == "[CLS]"
-                          or (isinstance(_raw, str) and _raw.startswith("[") and "CLS" in _raw))
-            if is_special:
-                groups[key]['special'].append(item)
-            else:
-                groups[key]['content'].append(item)
+                groups[key] = []
+            groups[key].append(item)
         capped = []
-        for key, g in groups.items():
-            capped.extend(g['special'])
-            content = g['content']
+        for key, content in groups.items():
             if len(content) <= max_content:
                 capped.extend(content)
             else:
-                # Evenly-spaced sub-sampling: deterministic, good coverage across the section
-                indices = np.linspace(0, len(content) - 1, max_content, dtype=int)
-                capped.extend(content[idx] for idx in indices)
+                # Deterministic random sub-sampling: per-(doc,section) seed for reproducibility,
+                # avoids the first/last bias of evenly-spaced indexing while preserving order.
+                seed = hash(key) & 0xFFFFFFFF
+                rng = np.random.default_rng(seed)
+                indices = np.sort(rng.choice(len(content), size=max_content, replace=False))
+                capped.extend(content[int(idx)] for idx in indices)
         return capped
     
     # Process in batches
@@ -553,10 +595,7 @@ def create_contextual_span_embeddings(
                     tokenizer=tokenizer,
                     device=DEVICE,
                     max_length=max_length,
-                    keep_cls=keep_cls,
-                    layer=layer,
                     span_pooling=span_pooling,
-                    keep_doc_mean=keep_doc_mean,
                 )
             else:
                 batch_results = process_doc_batch(
@@ -568,10 +607,7 @@ def create_contextual_span_embeddings(
                     tokenizer=tokenizer,
                     device=DEVICE,
                     max_length=max_length,
-                    keep_cls=keep_cls,
-                    layer=layer,
                     span_pooling=span_pooling,
-                    keep_doc_mean=keep_doc_mean,
                 )
             
             # Cap content spans per (doc, section) if configured
@@ -584,18 +620,10 @@ def create_contextual_span_embeddings(
                     temp_embeddings_by_section[section].append(span_emb)
                 i = section_idx[section]  # 0-based row index within this section (embedding row index)
                 section_idx[section] += 1
-                # span_kind: retrievable in metadata for filtering (content / cls / doc_mean)
-                if span_text_raw == "[DOC_MEAN]":
-                    span_kind = "doc_mean"
-                elif span_text_raw == "[CLS]" or (isinstance(span_text_raw, str) and span_text_raw.startswith("[") and "CLS" in span_text_raw):
-                    span_kind = "cls"
-                else:
-                    span_kind = "content"
                 all_metadata.append({
                     'doc_id': doc_id,
                     'section': section,
                     'i': i,
-                    'span_kind': span_kind,
                     'sentence': doc_text[:100],  # Keep key name for backwards compatibility (first 100 chars)
                     'unit': unit,
                     'span_text_raw': span_text_raw,  # Original span text
@@ -704,9 +732,25 @@ def _normalize_semicolon(text: str) -> str:
     return re.sub(r"(?<=[^\s]);(?=[^\s])", " ; ", text)
 
 
+_REF_TOKEN = r"(?:\d+[a-zA-Z]?|[ivxlcdmIVXLCDM]+)"  # 10, 10a, II, iii
+_REF_GROUP_PAREN = re.compile(rf"\({_REF_TOKEN}(?:\s*[,;]\s*{_REF_TOKEN})*\)")
+_REF_GROUP_BRACKET = re.compile(rf"\[{_REF_TOKEN}(?:\s*[,;]\s*{_REF_TOKEN})*\]")
+# Leading claim numbering at start of a line: "1.", "1)", "1 -", "1:" etc.
+_CLAIM_LEADING_NUM = re.compile(r"(?m)^\s*\d+\s*[\.\)\-:]\s*")
+
+
 def _normalize_ref_numerals(text: str) -> str:
-    """Remove patent reference numerals like (1), (2), (48, 82), (210; 320; 410)."""
-    t = re.sub(r"\(\d+(?:\s*[,;]\s*\d+)*\)", " ", text)
+    """Remove patent reference numerals.
+
+    Handles, inside () or []:
+      - pure digits: (1), (48, 82), (210; 320; 410), [10]
+      - digit+letter: (10a), (1b, 2c)
+      - roman numerals: (I), (II), (iii)
+    Also strips line-leading claim numbering: "1.", "2)", "3 -", "4:".
+    """
+    t = _REF_GROUP_PAREN.sub(" ", text)
+    t = _REF_GROUP_BRACKET.sub(" ", t)
+    t = _CLAIM_LEADING_NUM.sub("", t)
     return re.sub(r"\s+", " ", t).strip()
 
 
@@ -883,7 +927,9 @@ def load_span_cache(cache_dir: str, unit: str) -> dict:
     """
     Load span cache for one unit type.
 
-    Returns: dict  (doc_id, section, sub_part) → list of (start_char, end_char, span_text)
+    Returns: dict  (doc_id, section, sub_part) → list of [start_char, end_char, span_text]
+    The span list is left as raw JSON-decoded `list[list]` (not retupled) — downstream
+    consumers index by position, so converting to tuples is unnecessary work and adds RAM.
     """
     import gzip
     cache_path = os.path.join(cache_dir, f"{unit}_spans.jsonl.gz")
@@ -893,8 +939,7 @@ def load_span_cache(cache_dir: str, unit: str) -> dict:
     with gzip.open(cache_path, "rt", encoding="utf-8") as f:
         for line in f:
             entry = json.loads(line)
-            key = (entry["d"], entry["s"], entry["p"])
-            cache[key] = [(s, e, t) for s, e, t in entry["sp"]]
+            cache[(entry["d"], entry["s"], entry["p"])] = entry["sp"]
     print(f"Loaded span cache: {len(cache):,} entries from {cache_path}")
     return cache
 
@@ -958,10 +1003,7 @@ def process_doc_batch_cached(
     tokenizer,
     device,
     max_length: int = 512,
-    keep_cls: bool = True,
-    layer: str = "last",
     span_pooling: str = "mean",
-    keep_doc_mean: bool = False,
 ) -> List[Tuple[str, str, str, str, str, np.ndarray]]:
     """
     Phase 2: Encode doc-section texts using pre-cached spaCy spans (no spaCy needed).
@@ -985,9 +1027,8 @@ def process_doc_batch_cached(
 
     special_token_ids = set(tokenizer.all_special_ids)
     cls_token_id = getattr(tokenizer, "cls_token_id", None)
-    filtered_special_token_ids = special_token_ids.copy()
-    if keep_cls and cls_token_id is not None:
-        filtered_special_token_ids.discard(cls_token_id)
+    if cls_token_id is not None:
+        special_token_ids.add(cls_token_id)
 
     # Truncation diagnostics
     truncated_count = 0
@@ -1000,13 +1041,8 @@ def process_doc_batch_cached(
 
     # Encode
     with torch.no_grad():
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-        if layer == "last":
-            batch_embeddings = outputs.last_hidden_state
-        elif layer == "second_last":
-            batch_embeddings = outputs.hidden_states[-2]
-        else:
-            raise ValueError(f"Invalid layer: {layer}")
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        batch_embeddings = outputs.last_hidden_state
 
     # Visible char end per doc
     char_ends = []
@@ -1014,21 +1050,27 @@ def process_doc_batch_cached(
         ce = _visible_char_end_from_offset_mapping(offset_mapping[i], input_ids[i], special_token_ids)
         char_ends.append(ce)
 
-    all_span_embeddings = []
+    # CPU-side numpy views for fast iteration (avoids per-token GPU sync)
+    input_ids_cpu = input_ids.detach().cpu().numpy()  # (batch, seq_len)
+    attention_mask_cpu = attention_mask.detach().cpu().numpy()  # (batch, seq_len)
 
+    # ──────────────────────────────────────────────────────────────────────
+    # Phase A: Build a per-batch pooling plan (CPU only). Each entry knows
+    # which doc, which token slice, and what label/canonical text to attach.
+    # We then perform ALL pooling on GPU and do a SINGLE device→host transfer
+    # for the whole batch (instead of one .cpu() per span).
+    # ──────────────────────────────────────────────────────────────────────
+    pool_plan = []  # list of (doc_i, ts, te, span_text_raw, span_text_canonical)
     for i, (doc_id, section, doc_text) in enumerate(zip(doc_ids, sections, doc_texts)):
         char_end = char_ends[i]
         if char_end == 0:
             continue
 
-        token_embeddings = batch_embeddings[i]
         offset_map = offset_mapping[i]
         seq_input_ids = input_ids[i]
 
-        # Compute content offsets for this section
         offsets = _compute_content_offsets(doc_text, section, format_scheme, sep)
 
-        # Collect cached spans for this doc-section
         adjusted_char_spans = []
         if section == "abstract":
             title_off = offsets.get("title", 0)
@@ -1045,30 +1087,18 @@ def process_doc_batch_cached(
                 if adj_e <= char_end:
                     adjusted_char_spans.append((adj_s, adj_e, t))
 
-        # Map char spans → token spans
         spans = extract_char_spans_to_token_spans(
             char_spans=adjusted_char_spans,
             prefix_len=0,
             offset_mapping=offset_map,
             input_ids=seq_input_ids,
-            special_token_ids=filtered_special_token_ids,
+            special_token_ids=special_token_ids,
             dedup=False,
         )
 
-        # Add [CLS] token embedding
-        if keep_cls and cls_token_id is not None:
-            for tok_idx, tok_id in enumerate(seq_input_ids):
-                if int(tok_id.item()) == cls_token_id:
-                    cls_emb = token_embeddings[tok_idx].cpu().numpy()
-                    cls_emb = cls_emb / (np.linalg.norm(cls_emb) + 1e-12)
-                    cls_text = tokenizer.convert_ids_to_tokens([cls_token_id])[0]
-                    cls_canonical = canonicalize_span_text(cls_text)
-                    all_span_embeddings.append((doc_id, section, doc_text, cls_text, cls_canonical, cls_emb))
-                    break
-
-        # Pool token embeddings per span
+        seq_len = batch_embeddings.shape[1]
         for span_text, token_start, token_end in spans:
-            if token_start >= token_end or token_end > len(token_embeddings):
+            if token_start >= token_end or token_end > seq_len:
                 continue
             if unit == "spacy_sentence":
                 if len(span_text.strip()) < 3:
@@ -1076,36 +1106,35 @@ def process_doc_batch_cached(
             else:
                 if not filter_span_quality(span_text):
                     continue
-
-            if span_pooling == "max":
-                span_emb = token_embeddings[token_start:token_end].max(dim=0)[0]
-            else:
-                span_emb = token_embeddings[token_start:token_end].mean(dim=0)
-            span_emb = span_emb.cpu().numpy()
-            span_emb = span_emb / (np.linalg.norm(span_emb) + 1e-12)
             span_text_canonical = canonicalize_span_text(span_text)
             if not span_text_canonical:
                 continue
-            all_span_embeddings.append((doc_id, section, doc_text, span_text, span_text_canonical, span_emb))
+            pool_plan.append((i, token_start, token_end, span_text, span_text_canonical))
 
-    # Doc mean
-    if keep_doc_mean:
-        for i in range(len(doc_ids)):
-            doc_id, section, doc_text = doc_ids[i], sections[i], doc_texts[i]
-            token_embeddings = batch_embeddings[i]
-            seq_input_ids = input_ids[i]
-            seq_attention = attention_mask[i]
-            embs = []
-            for tok_idx in range(seq_attention.shape[0]):
-                if int(seq_attention[tok_idx].item()) == 0:
-                    continue
-                if int(seq_input_ids[tok_idx].item()) in filtered_special_token_ids:
-                    continue
-                embs.append(token_embeddings[tok_idx].cpu().numpy())
-            if embs:
-                mean_emb = np.mean(embs, axis=0).astype(np.float32)
-                mean_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
-                all_span_embeddings.append((doc_id, section, doc_text, "[DOC_MEAN]", "[DOC_MEAN]", mean_emb))
+    # ──────────────────────────────────────────────────────────────────────
+    # Phase B: pool on GPU, then ONE transfer + vectorized L2 normalize.
+    # ──────────────────────────────────────────────────────────────────────
+    all_span_embeddings = []
+    if pool_plan:
+        pooled_list = []
+        for doc_i, ts, te, _txt, _can in pool_plan:
+            slc = batch_embeddings[doc_i, ts:te]
+            if te - ts == 1:
+                pooled_list.append(slc[0])
+            elif span_pooling == "max":
+                pooled_list.append(slc.max(dim=0)[0])
+            else:
+                pooled_list.append(slc.mean(dim=0))
+        stacked = torch.stack(pooled_list, dim=0)  # (n, hidden)
+        del pooled_list
+        arr = stacked.detach().cpu().numpy().astype(np.float32, copy=False)
+        del stacked
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        np.divide(arr, norms + 1e-12, out=arr)
+        for k, (doc_i, _ts, _te, txt, can) in enumerate(pool_plan):
+            all_span_embeddings.append(
+                (doc_ids[doc_i], sections[doc_i], doc_texts[doc_i], txt, can, arr[k])
+            )
 
     del batch_embeddings, input_ids, attention_mask, offset_mapping, encoding
     return all_span_embeddings
@@ -1479,8 +1508,8 @@ def process_doc_batch(doc_texts: List[str],
                       doc_ids: List[str],
                       sections: List[str],
                       unit: str,
-                      model, tokenizer, device, max_length: int = 512, keep_cls: bool = True, layer: str = "last", span_pooling: str = "mean",
-                      keep_doc_mean: bool = False) -> List[Tuple[str, str, str, str, str, np.ndarray]]:
+                      model, tokenizer, device, max_length: int = 512,
+                      span_pooling: str = "mean") -> List[Tuple[str, str, str, str, str, np.ndarray]]:
     """
     Process a batch of doc-section texts (one encoder pass per doc-section):
     1) Encode doc_texts in batch (max_length parameter, default 512)
@@ -1488,11 +1517,9 @@ def process_doc_batch(doc_texts: List[str],
     3) Run spaCy on truncated text ONLY; extract semantic units (token/sentence/noun_chunk)
     4) Map unit char spans -> token spans via offset_mapping
     5) Pool token embeddings for each unit (mean or max)
-    6) If keep_doc_mean: append one span per doc = mean of all content token embeddings
 
     Args:
         span_pooling: 'mean' or 'max' for aggregating token embeddings within a span.
-        keep_doc_mean: If True, keep one span per doc-section = mean over all content tokens (symmetric with keep_cls).
 
     Returns: List of (doc_id, section, doc_text, span_text_raw, span_text_canonical, span_embedding)
     """
@@ -1513,15 +1540,16 @@ def process_doc_batch(doc_texts: List[str],
     attention_mask = encoding['attention_mask'].to(device)
     offset_mapping = encoding['offset_mapping']  # [batch, seq_len, 2]
 
+    # CPU-side numpy views to avoid per-token GPU sync in tight loops below.
+    input_ids_cpu = input_ids.detach().cpu().numpy()        # (batch, seq_len)
+    attention_mask_cpu = attention_mask.detach().cpu().numpy()  # (batch, seq_len)
+
     special_token_ids = set(tokenizer.all_special_ids)
     # Check if [CLS] token exists
     cls_token_id = tokenizer.cls_token_id if hasattr(tokenizer, 'cls_token_id') and tokenizer.cls_token_id is not None else None
-    # Create filtered special token set based on keep_cls parameter
-    filtered_special_token_ids = special_token_ids.copy()
-    if keep_cls and cls_token_id is not None:
-        # If keep_cls=True, exclude CLS from filtered set (so it's kept in output)
-        filtered_special_token_ids.discard(cls_token_id)
-    # If keep_cls=False, CLS will remain in filtered_special_token_ids (so it's filtered out)
+    # CLS is always treated as a regular special token (filtered out from spans).
+    if cls_token_id is not None:
+        special_token_ids.add(cls_token_id)
 
     # Truncation diagnostics (fast tokenizer only)
     truncated_count = 0
@@ -1534,16 +1562,8 @@ def process_doc_batch(doc_texts: List[str],
 
     # Encode
     with torch.no_grad():
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-        # Select layer: "last" for last layer, "second_last" for second-to-last layer
-        if layer == "last":
-            batch_embeddings = outputs.last_hidden_state  # [batch, seq_len, hidden_dim]
-        elif layer == "second_last":
-            if outputs.hidden_states is None or len(outputs.hidden_states) < 2:
-                raise ValueError("Model does not return hidden_states or has less than 2 layers")
-            batch_embeddings = outputs.hidden_states[-2]  # [batch, seq_len, hidden_dim]
-        else:
-            raise ValueError(f"Invalid layer parameter: {layer}. Must be 'last' or 'second_last'")
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        batch_embeddings = outputs.last_hidden_state  # [batch, seq_len, hidden_dim]
 
     # Compute visible text substrings for spaCy (exactly what encoder saw after max_length truncation).
     # We run spaCy ONLY on visible_texts, so every extracted span is guaranteed to lie within the
@@ -1561,54 +1581,48 @@ def process_doc_batch(doc_texts: List[str],
 
     all_span_embeddings = []
     if unit == "encoder_token":
+        # Build a per-batch pool plan of single-token slices, then do ONE GPU→CPU
+        # transfer + vectorized L2 normalize (vs. one .cpu() per token previously).
+        pool_plan = []  # list of (doc_i, tok_idx, tok_str, tok_canonical)
+        sp_set = special_token_ids
         for i, (doc_id, section, doc_text, vis_text) in enumerate(
             zip(doc_ids, sections, doc_texts, visible_texts)
         ):
             st = (vis_text or "").strip()
             if not st or not re.search(r"[a-zA-Z]", st):
                 continue
-
-            token_embeddings = batch_embeddings[i]   # [seq_len, hidden_dim]
-            seq_input_ids = input_ids[i]             # [seq_len]
-            seq_attention = attention_mask[i]        # [seq_len]
-
-            # Convert all ids -> token strings in one shot
-            token_strs = tokenizer.convert_ids_to_tokens(seq_input_ids.detach().cpu().tolist())
-
-            for tok_idx, (tok_id, tok_str, attn) in enumerate(zip(seq_input_ids, token_strs, seq_attention)):
-                if int(attn.item()) == 0:
+            ids_row = input_ids_cpu[i]
+            attn_row = attention_mask_cpu[i]
+            token_strs = tokenizer.convert_ids_to_tokens(ids_row.tolist())
+            for tok_idx in range(len(ids_row)):
+                if attn_row[tok_idx] == 0:
                     continue
-                # Filter special tokens but keep [CLS] if it exists
-                if int(tok_id.item()) in filtered_special_token_ids:
+                tid = int(ids_row[tok_idx])
+                if tid in sp_set:
                     continue
-
-                tok_emb = token_embeddings[tok_idx]
-                tok_emb = tok_emb.cpu().numpy()
-                tok_emb = tok_emb / (np.linalg.norm(tok_emb) + 1e-12)
-
-                # Canonicalize token string (may become empty for pure punctuation)
+                tok_str = token_strs[tok_idx]
                 tok_canonical = canonicalize_span_text(tok_str)
+                pool_plan.append((i, tok_idx, tok_str, tok_canonical))
 
-                all_span_embeddings.append((doc_id, section, doc_text, tok_str, tok_canonical, tok_emb))
+        if pool_plan:
+            doc_idx_t = torch.as_tensor([p[0] for p in pool_plan], device=device, dtype=torch.long)
+            tok_idx_t = torch.as_tensor([p[1] for p in pool_plan], device=device, dtype=torch.long)
+            stacked = batch_embeddings[doc_idx_t, tok_idx_t]  # (n, hidden)
+            arr = stacked.detach().cpu().numpy().astype(np.float32, copy=False)
+            del stacked, doc_idx_t, tok_idx_t
+            norms = np.linalg.norm(arr, axis=1, keepdims=True)
+            np.divide(arr, norms + 1e-12, out=arr)
+            for k, (doc_i, _ti, tok_str, tok_canonical) in enumerate(pool_plan):
+                all_span_embeddings.append(
+                    (doc_ids[doc_i], sections[doc_i], doc_texts[doc_i], tok_str, tok_canonical, arr[k])
+                )
 
-        if keep_doc_mean:
-            for i in range(len(doc_ids)):
-                doc_id, section, doc_text = doc_ids[i], sections[i], doc_texts[i]
-                token_embeddings = batch_embeddings[i]
-                seq_input_ids = input_ids[i]
-                seq_attention = attention_mask[i]
-                embs = []
-                for tok_idx in range(seq_attention.shape[0]):
-                    if int(seq_attention[tok_idx].item()) == 0:
-                        continue
-                    if int(seq_input_ids[tok_idx].item()) in filtered_special_token_ids:
-                        continue
-                    embs.append(token_embeddings[tok_idx].cpu().numpy())
-                if embs:
-                    mean_emb = np.mean(embs, axis=0).astype(np.float32)
-                    mean_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
-                    all_span_embeddings.append((doc_id, section, doc_text, "[DOC_MEAN]", "[DOC_MEAN]", mean_emb))
         return all_span_embeddings
+
+    # Per-batch pooling plan for the spaCy branch.  Inside the per-doc loop we only
+    # append (doc_idx, ts, te, span_text, span_canonical) entries; the actual GPU pool
+    # + ONE device→host transfer is performed after the loop.
+    pool_plan = []  # list of (doc_i, ts, te, span_text_raw, span_text_canonical)
 
     for i, (doc_id, section, doc_text, vis_text, doc_spacy) in enumerate(
         zip(doc_ids, sections, doc_texts, visible_texts, docs_spacy)
@@ -1809,23 +1823,9 @@ def process_doc_batch(doc_texts: List[str],
             prefix_len=0,
             offset_mapping=offset_map,
             input_ids=seq_input_ids,
-            special_token_ids=filtered_special_token_ids,  # Use filtered set (excludes CLS)
+            special_token_ids=special_token_ids,
             dedup=False
         )
-        
-        # For non-encoder_token modes, also add [CLS] token if keep_cls=True and it exists
-        if keep_cls and cls_token_id is not None and unit != "encoder_token":
-            # Find [CLS] token position (usually at index 0)
-            for tok_idx, tok_id in enumerate(seq_input_ids):
-                if int(tok_id.item()) == cls_token_id:
-                    cls_emb = token_embeddings[tok_idx]
-                    cls_emb = cls_emb.cpu().numpy()
-                    cls_emb = cls_emb / (np.linalg.norm(cls_emb) + 1e-12)
-                    cls_text = tokenizer.convert_ids_to_tokens([cls_token_id])[0]
-                    cls_canonical = canonicalize_span_text(cls_text)
-                    # Add [CLS] embedding directly (it's a single token, no pooling needed)
-                    all_span_embeddings.append((doc_id, section, doc_text, cls_text, cls_canonical, cls_emb))
-                    break
 
         for span_text, token_start, token_end in spans:
             if token_start >= token_end or token_end > len(token_embeddings):
@@ -1842,42 +1842,35 @@ def process_doc_batch(doc_texts: List[str],
                     if not filter_span_quality(span_text):
                         continue
 
-            # IMPORTANT: do not drop tokens; pool over all tokens in the unit span
-            # Pool multiple token embeddings into a single span embedding
-            if span_pooling == "max":
-                span_emb = token_embeddings[token_start:token_end].max(dim=0)[0]  # max returns (values, indices), take values
-            elif span_pooling == "mean":
-                span_emb = token_embeddings[token_start:token_end].mean(dim=0)
-            else:
-                raise ValueError(f"Unknown span_pooling method: {span_pooling}. Must be 'mean' or 'max'")
-
-            span_emb = span_emb.cpu().numpy()
-            span_emb = span_emb / (np.linalg.norm(span_emb) + 1e-12)
-
             span_text_canonical = canonicalize_span_text(span_text)
             # Skip if canonical version is empty (all stopwords/punctuation)
             if not span_text_canonical:
                 continue
+            pool_plan.append((i, token_start, token_end, span_text, span_text_canonical))
 
-            all_span_embeddings.append((doc_id, section, doc_text, span_text, span_text_canonical, span_emb))
-
-    if keep_doc_mean:
-        for i in range(len(doc_ids)):
-            doc_id, section, doc_text = doc_ids[i], sections[i], doc_texts[i]
-            token_embeddings = batch_embeddings[i]
-            seq_input_ids = input_ids[i]
-            seq_attention = attention_mask[i]
-            embs = []
-            for tok_idx in range(seq_attention.shape[0]):
-                if int(seq_attention[tok_idx].item()) == 0:
-                    continue
-                if int(seq_input_ids[tok_idx].item()) in filtered_special_token_ids:
-                    continue
-                embs.append(token_embeddings[tok_idx].cpu().numpy())
-            if embs:
-                mean_emb = np.mean(embs, axis=0).astype(np.float32)
-                mean_emb = mean_emb / (np.linalg.norm(mean_emb) + 1e-12)
-                all_span_embeddings.append((doc_id, section, doc_text, "[DOC_MEAN]", "[DOC_MEAN]", mean_emb))
+    # Flush per-batch pool plan: ONE GPU→CPU transfer + vectorized L2 normalize.
+    if pool_plan:
+        pooled_list = []
+        for doc_i, ts, te, _txt, _can in pool_plan:
+            slc = batch_embeddings[doc_i, ts:te]
+            if te - ts == 1:
+                pooled_list.append(slc[0])
+            elif span_pooling == "max":
+                pooled_list.append(slc.max(dim=0)[0])
+            elif span_pooling == "mean":
+                pooled_list.append(slc.mean(dim=0))
+            else:
+                raise ValueError(f"Unknown span_pooling method: {span_pooling}. Must be 'mean' or 'max'")
+        stacked = torch.stack(pooled_list, dim=0)  # (n, hidden)
+        del pooled_list
+        arr = stacked.detach().cpu().numpy().astype(np.float32, copy=False)
+        del stacked
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        np.divide(arr, norms + 1e-12, out=arr)
+        for k, (doc_i, _ts, _te, txt, can) in enumerate(pool_plan):
+            all_span_embeddings.append(
+                (doc_ids[doc_i], sections[doc_i], doc_texts[doc_i], txt, can, arr[k])
+            )
 
     # Clean up intermediate tensors and variables to free memory
     del batch_embeddings
@@ -1942,30 +1935,27 @@ def parse_embedding_filename(filename: str) -> dict:
 def parse_embeddings_dir(dirname: str) -> dict:
     """
     Parse embeddings directory name from 1create_N_embeddings.py output.
-    
-    Expected format: embeddings_{model_name}_{unit}_{cls}_{layer}
-    
-    Example: embeddings_bert-for-patents_spacy_token_cls_last
-    
-    Returns dict with keys: model_name, unit, cls_suffix, layer, or None if parsing fails.
+
+    Expected format: {model_name}_{unit}[_fp16]
+
+    Example: bert-for-patents_spacy_token, paecter_encoder_token_fp16
+
+    Returns dict with keys: model_name, unit, or None if parsing fails.
+    unit is one of: spacy_token, spacy_sentence, noun_chunk, encoder_token.
     """
     import os
     basename = os.path.basename(dirname)
-    
-    # Strip known trailing pooling suffixes (e.g. _meanpool) so the regex can match
-    clean = re.sub(r'_(meanpool|maxpool)$', '', basename)
-    
-    # Pattern: embeddings_{model_name}_{unit}_{cls}_{layer}
-    pattern = r'embeddings_(.+?)_(.+?)_(cls|nocls)_(last|second_last)$'
-    match = re.match(pattern, clean)
-    
-    if match:
-        return {
-            'model_name': match.group(1),  # e.g., bert-for-patents
-            'unit': match.group(2),  # e.g., spacy_token, spacy_sentence
-            'cls_suffix': match.group(3),  # cls or nocls
-            'layer': match.group(4)  # last or second_last
-        }
+
+    # Strip optional trailing _fp16 suffix
+    clean = basename[:-len("_fp16")] if basename.endswith("_fp16") else basename
+
+    known_units = ["spacy_token", "spacy_sentence", "noun_chunk", "encoder_token"]
+    for unit in known_units:
+        suffix = "_" + unit
+        if clean.endswith(suffix):
+            model_name = clean[:-len(suffix)]
+            if model_name:
+                return {"model_name": model_name, "unit": unit}
     return None
 
 
@@ -2085,8 +2075,8 @@ def cls_pooling(model_output, attention_mask):
 
 
 
-def find_centers(dense_model: str, tokenization_unit: str, include_cls: bool, search_dir: str = ".",
-                 layer: str = "last", centers_suffix: str = "") -> tuple:
+def find_centers(dense_model: str, tokenization_unit: str, search_dir: str = ".",
+                 centers_suffix: str = "") -> tuple:
     """
     Find centers directory and .npy file for sparse_coverage eval.
     Centers are task-agnostic (shared across abstract2abstract and claim2all).
@@ -2094,28 +2084,16 @@ def find_centers(dense_model: str, tokenization_unit: str, include_cls: bool, se
     """
     import glob
     model_name = dense_model.strip("/").split("/")[-1].replace("/", "_").replace("\\", "_")
-    cls_suffix = "cls" if include_cls else "nocls"
-    expected_dir_pattern = f"centers_greedy_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}{centers_suffix}"
+    expected_dir_pattern = f"centers_greedy_{model_name}_{tokenization_unit}{centers_suffix}"
     search_pattern = os.path.join(search_dir, expected_dir_pattern)
     matching_dirs = glob.glob(search_pattern)
     if not matching_dirs:
         matching_dirs = glob.glob(os.path.join(search_dir, "**", expected_dir_pattern), recursive=True)
     if not matching_dirs:
-        # Backward compat: try legacy pattern with mode prefix
-        for legacy_mode in ["abstract2abstract", "claim2all"]:
-            legacy_pattern = f"centers_greedy_{legacy_mode}_{model_name}_{tokenization_unit}_{cls_suffix}_{layer}{centers_suffix}"
-            matching_dirs = glob.glob(os.path.join(search_dir, legacy_pattern))
-            if not matching_dirs:
-                matching_dirs = glob.glob(os.path.join(search_dir, "**", legacy_pattern), recursive=True)
-            if matching_dirs:
-                print(f"⚠️  Using legacy mode-specific centers: {matching_dirs[0]}")
-                break
-    if not matching_dirs:
         raise FileNotFoundError(
             f"Could not find centers directory matching: {expected_dir_pattern}\n"
             f"Searched in: {os.path.abspath(search_dir)}\n"
-            f"  dense_model={dense_model}\n  tokenization_unit={tokenization_unit}\n"
-            f"  include_cls={include_cls}\n  layer={layer}"
+            f"  dense_model={dense_model}\n  tokenization_unit={tokenization_unit}"
         )
     centers_dir = matching_dirs[0]
     if len(matching_dirs) > 1:

@@ -1997,11 +1997,6 @@ def main():
     parser.add_argument("--exclude_cls_spans", action="store_true", default=False,
                        help="Exclude spans whose text is literally 'cls' or '[CLS]' from index and query (for sparse_coverage). "
                             "Use to compare best config with vs without CLS spans. Document posting lists and query encoding skip these spans.")
-    parser.add_argument("--layer", type=str, default="last",
-                       choices=["last", "second_last"],
-                       help="Which layer to use for embeddings (for sparse_coverage). "
-                            "Options: 'last' (default) or 'second_last'. "
-                            "This must match the layer used when building centers.")
 
     # Document side:
     parser.add_argument("--document_assignment", type=str, default="soft", choices=["hard", "soft"],
@@ -2155,16 +2150,12 @@ def main():
             raise ValueError("--dense_model is required for sparse_coverage")
         if args.tokenization_unit is None:
             raise ValueError("--tokenization_unit is required for sparse_coverage")
-        
-        # Eval assumes centers were built with CLS (build script controls that); only evaluation-time options here
-        include_cls = True
+
         print(f"   Dense model: {args.dense_model}")
         print(f"   Tokenization unit: {args.tokenization_unit}")
-        print(f"   Exclude CLS spans (index+query): {getattr(args, 'exclude_cls_spans', False)}")
         _qmc = getattr(args, 'query_max_chunks', -1)
         _qmc_str = 'off (truncate at 512)' if _qmc == 0 else (f'unlimited' if _qmc < 0 else f'cap={_qmc} chunks')
         print(f"   Query chunking: {_qmc_str}")
-        print(f"   Layer: {getattr(args, 'layer', 'last')}")
         print(f"   Length norm: {getattr(args, 'length_norm', 'none')}" + (f" (exponent={getattr(args, 'length_norm_exponent', 0.5)})" if getattr(args, 'length_norm', 'none') == 'sqrt_centers' else ""))
         
         # Import span encoding functions from utils module
@@ -2214,7 +2205,6 @@ def main():
             tokenizer=tokenizer,
             device=device,
             max_length=512,
-            keep_cls=include_cls,
             span_pooling="mean",
         )
         
@@ -2296,8 +2286,6 @@ def main():
                         doc_texts=sec_texts[b_start:b_end],
                         doc_ids=sec_ids[b_start:b_end],
                         sections=sec_sections[b_start:b_end],
-                        keep_doc_mean=False,
-                        layer=getattr(args, "layer", "last"),
                     )
                     for doc_id, _sec, _dtxt, span_raw, span_canon, emb in results:
                         section_embs.append(emb)
@@ -2317,8 +2305,7 @@ def main():
         
         def _doc_cache_dir(mode: str) -> str:
             model_clean = args.dense_model.strip("/").split("/")[-1].replace("/", "_").replace("\\", "_")
-            layer = getattr(args, "layer", "last")
-            return os.path.join(args.temp_dir, f"sparse_doc_{model_clean}_{args.tokenization_unit}_{layer}_{mode}")
+            return os.path.join(args.temp_dir, f"sparse_doc_{model_clean}_{args.tokenization_unit}_{mode}")
         
         def _save_doc_cache(
             cache_dir: str,
@@ -2757,8 +2744,6 @@ def main():
                             doc_texts=sec_texts[b_start:b_end],
                             doc_ids=sec_ids[b_start:b_end],
                             sections=sec_sections[b_start:b_end],
-                            keep_doc_mean=False,
-                            layer=getattr(args, "layer", "last"),
                         )
                         for doc_id, _sec, _dtxt, span_raw, span_canon, emb in results:
                             raw_f.write(emb.astype(np.float32).tobytes())
@@ -2829,22 +2814,18 @@ def main():
             centers_path, _centers_dir = find_centers(
                 dense_model=args.dense_model,
                 tokenization_unit=args.tokenization_unit,
-                include_cls=include_cls,
                 search_dir=".",
-                layer=getattr(args, 'layer', 'last'),
                 centers_suffix=getattr(args, 'centers_suffix', ''),
             )
             print(f"✅ Found centers: {centers_path}")
         except FileNotFoundError:
-            layer = getattr(args, 'layer', 'last')
             raise FileNotFoundError(
                 f"Doc embeddings have been cached, but could not find centers:\n"
                 f"  dense_model={args.dense_model}\n"
                 f"  tokenization_unit={args.tokenization_unit}\n"
-                f"  (eval assumes centers built with CLS; layer={layer})\n"
                 f"Searched in: {os.path.abspath('.')} (recursive)\n"
-                f"Expected pattern: centers_greedy_{{model}}_{{unit}}_{{cls}}_{{layer}}\n"
-                f"Please ensure centers were built with matching parameters, or use --layer last if you have centers built with 'last' layer."
+                f"Expected pattern: centers_greedy_{{model}}_{{unit}}\n"
+                f"Please ensure centers were built with matching parameters."
             )
         
         available_modes = ["clefip_passage"] if _clefip_data is not None else []

@@ -25,7 +25,7 @@ Usage:
     python 1create_N_embeddings.py --span_cache_dir ./span_cache ...
 """
 
-from typing import Literal
+from typing import Literal  # noqa: F401  (kept for downstream type imports)
 
 
 import os
@@ -67,8 +67,8 @@ def main():
                     help="Batch size for nlp.pipe(). Larger is faster if memory allows. Default: 512.")
     ap.add_argument("--spacy_n_process", type=int, default=1,
                     help="Number of processes for nlp.pipe() (multi-CPU). Default: 1. Try 4 or 8 on a many-core node.")
-    ap.add_argument("--units", type=str, nargs="+", default=list[Literal['spacy_token', 'spacy_sentence', 'noun_chunk']](UNITS),
-                    choices=list[Literal['spacy_token', 'spacy_sentence', 'noun_chunk']](UNITS),
+    ap.add_argument("--units", type=str, nargs="+", default=list(UNITS),
+                    choices=list(UNITS),
                     help="Which unit types to cache. Default: all three.")
     ap.add_argument("--save_corpus_to", type=str, default=None,
                     help="When loading from EPO, save the loaded corpus to DIR/content/documents.json so future runs can use DATA_DIR=DIR for fast load. Ignored when using cached corpus.")
@@ -155,26 +155,19 @@ def main():
     t_prep_elapsed = time.time() - t_prep_start
     print(f"  Prepare time: {t_prep_elapsed:.1f}s")
 
-    # Run spaCy on all texts (once)
+    # Stream spaCy + extract spans in a single pass (avoids materializing all Doc objects).
+    # For 300K docs × 3 sections ≈ 900K Docs, holding them all in RAM can hit tens of GB.
     n_process = max(1, int(getattr(args, "spacy_n_process", 1)))
-    print(f"\nRunning spaCy (batch_size={args.spacy_batch_size}, n_process={n_process})...")
-    texts_only = [item[3] for item in text_items]
-    t0 = time.time()
-    pipe_kw = {"batch_size": args.spacy_batch_size}
+    print(f"\nRunning spaCy + extracting spans (batch_size={args.spacy_batch_size}, n_process={n_process})...")
+    pipe_kw = {"batch_size": args.spacy_batch_size, "as_tuples": True}
     if n_process > 1:
         pipe_kw["n_process"] = n_process
-    spacy_docs = list(nlp.pipe(texts_only, **pipe_kw))
-    t_spacy = time.time() - t0
-    print(f"✓ spaCy done in {t_spacy:.1f}s ({len(texts_only) / max(t_spacy, 0.01):.0f} texts/s)")
-    del texts_only
 
-    # Extract spans for all units in a single pass (one loop over 1M items instead of three)
-    print(f"\n{'='*60}")
-    print("Extracting spans for all units (single pass)...")
-    t0 = time.time()
     entries_by_unit = {u: [] for u in args.units}
-    for idx, (doc_id, section, sub_part, text) in enumerate(tqdm(text_items, desc="  extract")):
-        doc_spacy = spacy_docs[idx]
+    t0 = time.time()
+    gen = nlp.pipe(((item[3], idx) for idx, item in enumerate(text_items)), **pipe_kw)
+    for doc_spacy, idx in tqdm(gen, total=len(text_items), desc="  spacy+extract"):
+        doc_id, section, sub_part, _ = text_items[idx]
         is_title = (sub_part == "title")
         is_body = (sub_part == "body" and section == "abstract")
         for unit in args.units:
@@ -189,8 +182,9 @@ def main():
                 "p": sub_part,
                 "sp": char_spans,
             })
+        # doc_spacy goes out of scope on next iteration → eligible for GC
     t_extract = time.time() - t0
-    print(f"  Extract time: {t_extract:.1f}s")
+    print(f"✓ spaCy + extract done in {t_extract:.1f}s ({len(text_items) / max(t_extract, 0.01):.0f} texts/s)")
     for unit in args.units:
         total_spans = sum(len(e["sp"]) for e in entries_by_unit[unit])
         print(f"  {unit}: {total_spans:,} spans")

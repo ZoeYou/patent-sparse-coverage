@@ -1,7 +1,6 @@
 """
 Create contextual span embeddings for patent documents.
 
-Default mode: claim2all (uses all three sections: title+abstract, claim, invention).
 Input format is model-dependent (see utils.get_encoder_format_scheme, get_encoder_sep_for_model):
 - section_tokens: abstract = "title {sep} [abstract] {abstract}", claim = "[claim] {claim}", invention = "[invention] {invention}"
 - title_sep_only: abstract = "title {sep} {abstract}", claim/invention = plain text (no section tokens)
@@ -15,8 +14,9 @@ Unit types (only these are supported):
 - spacy_token: one embedding per spaCy token, with noun_chunks merged into one embedding per chunk; tokens inside a noun_chunk are not output separately.
 - spacy_sentence: one embedding per sentence.
 - noun_chunk: only noun-chunk spans (one embedding per noun phrase); tokens not in any noun_chunk are not included.
+- encoder_token: one embedding per tokenizer subword token (no spaCy, no filtering, no merging).
 
-Output directory name includes: model name, unit, keep_cls, layer, and optionally _meanpool when keep_doc_mean=1.
+Output directory name includes: model name and unit.
 
 Storage: embeddings are saved as .npy (uncompressed) for fast I/O and memmap-friendly loading in center-building;
 metadata as .jsonl. For compression use system-level tools (e.g. zstd) or chunked files.
@@ -32,8 +32,8 @@ EPO epo_en: If data_dir does not contain content/documents.json, the script trie
   to sample documents (proportional per year); --epo_sample_seed for reproducibility.
 
 Usage:
-    python 1create_N_embeddings.py --layer last
-    python 1create_N_embeddings.py --unit noun_chunk --keep_doc_mean 1
+    python 1create_N_embeddings.py
+    python 1create_N_embeddings.py --unit noun_chunk
     python 1create_N_embeddings.py --data_dir /path/to/EPO/epo_en --save_metadata 0  # centers only
 """
 
@@ -51,6 +51,7 @@ from utils import (
     load_corpus_epo,
     create_contextual_span_embeddings,
     load_span_cache,
+    auto_batch_size_for_encoder,
     DEVICE,
 )
 
@@ -58,51 +59,9 @@ from utils import (
 SECTIONS = ("abstract", "claim", "invention")
 
 
-def auto_batch_size(model_path: str, max_length: int = 512) -> int:
-    """Estimate a reasonable encoding batch size based on available GPU memory.
-
-    Heuristic (for BERT-class encoders with max_length tokens):
-        usable_gb = total_vram * 0.70          # leave headroom for model weights + OS
-        per_sample_mb ≈ max_length / 512 * 3   # ~3 MB per sample at 512 tokens (empirical)
-        batch_size = usable_gb * 1024 / per_sample_mb, clamped to [8, 2048]
-
-    Falls back to 64 on CPU or when detection fails.
-    """
-    import torch
-
-    if not torch.cuda.is_available():
-        print("[auto_batch_size] No GPU detected → default batch_size=64")
-        return 64
-
-    try:
-        dev = torch.cuda.current_device()
-        props = torch.cuda.get_device_properties(dev)
-        total_mb = props.total_mem / (1024 ** 2)
-        total_gb = total_mb / 1024
-        gpu_name = props.name
-
-        # Rough per-sample cost scales linearly with sequence length
-        per_sample_mb = (max_length / 512) * 3.0
-        usable_mb = total_mb * 0.70  # 70 % usable after model weights + overhead
-        estimated = int(usable_mb / per_sample_mb)
-
-        # Clamp to a sane range
-        estimated = max(8, min(estimated, 2048))
-
-        # Round down to nearest power-of-two-friendly number (multiple of 8)
-        estimated = (estimated // 8) * 8
-
-        print(f"[auto_batch_size] GPU: {gpu_name}, VRAM: {total_gb:.1f} GB → batch_size={estimated}")
-        return estimated
-
-    except Exception as e:
-        print(f"[auto_batch_size] Detection failed ({e}) → default batch_size=64")
-        return 64
-
-
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="./downstream/perf200/",
+    parser.add_argument("--data_dir", type=str, default=os.path.expanduser("~/scratch/data/EPO/epo_en"),
                        help="Directory containing the corpus (content/documents.json)")
 
     parser.add_argument("--model_path", type=str, default="ZoeYou/PatentMap-V0-SecPair-Claim",
@@ -118,11 +77,11 @@ def main():
     parser.add_argument("--max_docs", type=int, default=None,
                        help="Maximum number of documents to process (for testing / EPO sampling)")
     parser.add_argument("--epo_year_min", type=int, default=None,
-                       help="[EPO only] Minimum year (inclusive), e.g. 2000. Only year subdirs >= this are loaded.")
+                       help="Minimum year (inclusive), e.g. 2000. Only year subdirs >= this are loaded.")
     parser.add_argument("--epo_year_max", type=int, default=None,
-                       help="[EPO only] Maximum year (inclusive), e.g. 2020. Only year subdirs <= this are loaded.")
+                       help="Maximum year (inclusive), e.g. 2020. Only year subdirs <= this are loaded.")
     parser.add_argument("--epo_sample_seed", type=int, default=None,
-                       help="[EPO only] Random seed when sampling to max_docs (proportional per year). For reproducibility.")
+                       help="Random seed when sampling to max_docs (proportional per year). For reproducibility.")
     parser.add_argument("--max_spans", type=int, default=5000000,
                        help="Maximum number of spans (embeddings) to extract")
     parser.add_argument("--shuffle_doc_sections", type=int, default=1, choices=[0, 1],
@@ -130,7 +89,7 @@ def main():
                             "Ensures early-stop covers documents from all years/sources uniformly, "
                             "instead of only the first N documents in insertion order.")
     parser.add_argument("--max_spans_per_doc_section", type=int, default=None,
-                       help="Max content spans (excl. CLS/DOC_MEAN) to keep per (doc, section) pair. "
+                       help="Max content spans to keep per (doc, section) pair. "
                             "None = no cap (default). Post-truncation actual content spans: "
                             "abstract ~6, claim ~48, invention ~42. "
                             "Recommended: 25 for spacy_token (27%% doc coverage vs 16%% uncapped), "
@@ -143,18 +102,17 @@ def main():
                        help="Save metadata (0=no, 1=yes). Default: 0. Use 1 when this output will be used as the document corpus in evaluate "
                             "(--embeddings_dir), so span->doc_id aggregation can be built. Saved AFTER sampling.")
     parser.add_argument("--unit", type=str, default="spacy_token",
-                       choices=["spacy_token", "spacy_sentence", "noun_chunk"],
+                       choices=["spacy_token", "spacy_sentence", "noun_chunk", "encoder_token"],
                        help="Semantic unit: spacy_token (tokens + merged noun_chunks), "
                             "spacy_sentence (one per sentence), "
-                            "noun_chunk (only noun-chunk spans, no standalone tokens).")
-    parser.add_argument("--keep_cls", type=int, default=1, choices=[0, 1],
-                       help="Whether to keep [CLS] token in output (1=yes, 0=no). Default: 1.")
-    parser.add_argument("--keep_doc_mean", type=int, default=1, choices=[0, 1],
-                       help="If 1, keep one extra span per doc-section = mean of all token embeddings (sequence-level vector). Default: 1. Both cls and doc_mean are then in metadata as span_kind.")
-    parser.add_argument("--layer", type=str, default="last", choices=["last", "second_last"],
-                       help="Which layer to use for embeddings: 'last' (default) for last layer, 'second_last' for second-to-last layer")
+                            "noun_chunk (only noun-chunk spans, no standalone tokens), "
+                            "encoder_token (one embedding per tokenizer subword token, no spaCy).")
+
+    parser.add_argument("--output_root", type=str, default="./embeddings",
+                       help="Parent directory under which each run creates its own subdirectory. Default: ./embeddings")
     parser.add_argument("--output_dir", type=str, default=None,
-                       help="Output directory for embeddings. If not specified, will be auto-generated based on model and parameters.")
+                       help="Full output directory for embeddings. If set, overrides --output_root. "
+                            "If not specified, auto-generated as {output_root}/{model_name}_{unit}[_fp16].")
     parser.add_argument("--span_cache_dir", type=str, default=None,
                        help="Directory with pre-computed spaCy spans (from 0cache_spacy_spans.py). "
                             "When set, spaCy is NOT loaded or run; spans come from the cache. "
@@ -170,15 +128,22 @@ def main():
                        help="If 1 (default), disable lemmatizer for speed (attribute_ruler is kept for POS tags / noun_chunks). Set 0 to keep full pipeline.")
     args = parser.parse_args()
 
-    # ── Resolve batch_size (auto-detect when not explicitly provided) ──
-    if args.batch_size is None:
-        args.batch_size = auto_batch_size(args.model_path, args.max_length)
-    else:
+    # batch_size resolution is deferred until AFTER the model is moved to GPU,
+    # so auto_batch_size_for_encoder() can subtract the model's actual VRAM footprint.
+    if args.batch_size is not None:
         print(f"[batch_size] Using user-specified batch_size={args.batch_size}")
 
     # Load span cache if provided (Phase 2: skip spaCy entirely)
+    # encoder_token does NOT use spaCy spans (uses tokenizer subwords directly), so
+    # span_cache is irrelevant and the cached path (process_doc_batch_cached) has no
+    # encoder_token branch — force the runtime path even if --span_cache_dir was passed.
     span_cache = None
-    if args.span_cache_dir:
+    if args.unit == "encoder_token":
+        if args.span_cache_dir:
+            print(f"Unit=encoder_token: ignoring --span_cache_dir (not applicable). spaCy not loaded.")
+        else:
+            print("Unit=encoder_token: spaCy not needed, skipping load.")
+    elif args.span_cache_dir:
         print(f"Loading span cache from {args.span_cache_dir} (unit={args.unit})...")
         span_cache = load_span_cache(args.span_cache_dir, args.unit)
         print(f"✓ Span cache loaded: {len(span_cache):,} entries — spaCy will NOT be loaded")
@@ -211,20 +176,15 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     model = AutoModel.from_pretrained(args.model_path, trust_remote_code=True)
     
-    # Build output directory name with all key parameters
-    keep_cls = bool(args.keep_cls)
-    cls_suffix = "cls" if keep_cls else "nocls"
-    layer_suffix = args.layer
+    # Build output directory name
     unit_suffix = args.unit  # spacy_token, spacy_sentence, noun_chunk
-    keep_doc_mean = bool(args.keep_doc_mean)
 
     if args.output_dir is None:
-        # Format: embeddings_{model_name}_{unit}_{cls}_{layer}[_meanpool][_fp16]
-        output_dir = f"./embeddings_{model_name}_{unit_suffix}_{cls_suffix}_{layer_suffix}"
-        if keep_doc_mean:
-            output_dir += "_meanpool"
+        # Format: {output_root}/{model_name}_{unit}[_fp16]
+        subdir = f"{model_name}_{unit_suffix}"
         if args.embed_dtype == "float16":
-            output_dir += "_fp16"
+            subdir += "_fp16"
+        output_dir = os.path.join(args.output_root, subdir)
     else:
         output_dir = args.output_dir
 
@@ -248,10 +208,8 @@ def main():
     print(f"Device: {DEVICE}")
     print(f"Model: {args.model_path}")
     print(f"Unit: {args.unit}")
-    print(f"Layer: {args.layer}")
-    print(f"Batch size: {args.batch_size}, Max length: {args.max_length}, Max section chars: {args.max_section_chars}")
-    print(f"Keep [CLS]: {keep_cls}")
-    print(f"Keep doc mean: {keep_doc_mean}")
+    print(f"Batch size: {args.batch_size if args.batch_size is not None else 'auto (resolved after model load)'}, "
+          f"Max length: {args.max_length}, Max section chars: {args.max_section_chars}")
     print(f"Shuffle doc-sections: {bool(args.shuffle_doc_sections)}")
     print(f"Max spans/doc-section: {args.max_spans_per_doc_section or 'unlimited'}")
     print(f"Span cache: {args.span_cache_dir or 'none (spaCy at runtime)'}")
@@ -267,6 +225,10 @@ def main():
 
     model.to(DEVICE)
     model.eval()
+
+    # Resolve batch_size now that the model is on GPU (auto = total - model footprint).
+    if args.batch_size is None:
+        args.batch_size = auto_batch_size_for_encoder(args.max_length, model=model)
 
     # Load corpus
     print("\n[2/4] Loading corpus...")
@@ -299,8 +261,7 @@ def main():
     embeddings_by_section, metadata = create_contextual_span_embeddings(
         documents, model, tokenizer, unit=args.unit,
         max_docs=args.max_docs, batch_size=args.batch_size, max_length=args.max_length,
-        keep_cls=keep_cls, layer=args.layer, format_scheme=format_scheme, sep=sep,
-        keep_doc_mean=keep_doc_mean,
+        format_scheme=format_scheme, sep=sep,
         max_section_chars=args.max_section_chars,
         max_spans=args.max_spans,
         span_cache=span_cache,
@@ -310,7 +271,8 @@ def main():
     
     # Free corpus and span cache — no longer needed, reclaim potentially 20+ GB
     del documents
-    del span_cache
+    if span_cache is not None:
+        del span_cache
     import gc; gc.collect()
     
     # Separate metadata by section for sampling and saving.
@@ -359,31 +321,31 @@ def main():
         # Sample per section
         sampled_embeddings_by_section = {}
         sampled_metadata_by_section = {}
-        
+
+        # Use a local RNG so we don't pollute the global numpy RNG state
+        sampling_rng = np.random.default_rng(42)
         for section in SECTIONS:
             if embeddings_by_section[section] is None or len(embeddings_by_section[section]) == 0:
                 sampled_embeddings_by_section[section] = None
                 sampled_metadata_by_section[section] = []
                 continue
-            
+
             section_embeddings = embeddings_by_section[section]
             section_metadata = metadata_by_section[section]
             section_budget = section_budgets.get(section, 0)
-            
+
             if len(section_embeddings) <= section_budget:
                 # No sampling needed
                 sampled_embeddings_by_section[section] = section_embeddings
                 sampled_metadata_by_section[section] = section_metadata
                 continue
-            
+
             print(f"\nSampling {section_budget:,} spans from {len(section_embeddings):,} in section '{section}'...")
-            # Random sampling without replacement
-            np.random.seed(42)  # For reproducibility
-            indices = np.random.choice(len(section_embeddings), size=section_budget, replace=False)
-            indices = np.sort(indices)  # Sort to maintain some locality
-            
-            # Select embeddings and metadata
-            sampled_embeddings_by_section[section] = section_embeddings[indices].copy()
+            indices = sampling_rng.choice(len(section_embeddings), size=section_budget, replace=False)
+            indices.sort()  # maintain some locality
+
+            # Fancy indexing already produces a fresh array; no extra .copy() needed.
+            sampled_embeddings_by_section[section] = section_embeddings[indices]
             sampled_metadata_by_section[section] = [section_metadata[i] for i in indices]
             del indices
             print(f"✓ Sampled {len(sampled_embeddings_by_section[section]):,} spans for section '{section}'")
@@ -420,8 +382,11 @@ def main():
 
         section_embeddings = embeddings_by_section[section]
         section_metadata = metadata_by_section.get(section, [])
-        # Cast to storage dtype (float16 halves size with minimal retrieval impact)
-        to_save = section_embeddings.astype(save_dtype, copy=True)
+        # Cast to storage dtype only if needed (avoid wasting RAM on a redundant copy).
+        if section_embeddings.dtype == save_dtype:
+            to_save = section_embeddings
+        else:
+            to_save = section_embeddings.astype(save_dtype, copy=False)
 
         # Estimate file size
         dtype_size = to_save.itemsize
@@ -454,7 +419,6 @@ def main():
                         'd': meta['doc_id'],
                         's': meta['section'],
                         'i': meta.get('i', -1),  # 0-based row index within section (embedding row index)
-                        'k': meta.get('span_kind', 'content'),  # content | cls | doc_mean (retrievable for filtering)
                         'r': meta['span_text_raw'],
                         'u': meta.get('unit', '')
                     }
@@ -473,26 +437,23 @@ def main():
             emb = embeddings_by_section[section]
             print(f"  - {section}: {len(emb):,} spans, shape {emb.shape}, mean={emb.mean():.4f}, std={emb.std():.4f}")
     
-    # Show sample spans: 2–3 content spans per section (skip cls/doc_mean so we see real spaCy output)
+    # Show sample spans: 2–3 content spans per section
     print(f"\n  Sample spans (raw, content only):")
     shown_per_section = {s: 0 for s in SECTIONS}
     max_per_section = 3
     for meta in metadata:
         if all(shown_per_section[s] >= max_per_section for s in SECTIONS):
             break
-        if meta.get("span_kind") in ("cls", "doc_mean"):
-            continue
         sec = meta.get("section")
         if sec not in shown_per_section or shown_per_section[sec] >= max_per_section:
             continue
         raw = (meta.get("span_text_raw") or "")[:50]
         print(f"    - [{sec}] {raw}")
         shown_per_section[sec] += 1
-    # No content spans in metadata despite having embeddings => pipeline bug (e.g. only cls/doc_mean)
+    # No content spans in metadata despite having embeddings => pipeline bug
     if total_spans > 0 and sum(shown_per_section.values()) == 0:
         raise RuntimeError(
-            "No content spans in metadata although total_spans > 0. "
-            "All spans are cls/doc_mean or metadata is misaligned (pipeline bug)."
+            "No content spans in metadata although total_spans > 0 (pipeline bug)."
         )
 
     print(f"=" * 80)
