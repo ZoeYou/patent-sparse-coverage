@@ -3,16 +3,15 @@ Create contextual span embeddings for patent documents.
 
 Input format is model-dependent (see utils.get_encoder_format_scheme, get_encoder_sep_for_model):
 - section_tokens: abstract = "title {sep} [abstract] {abstract}", claim = "[claim] {claim}", invention = "[invention] {invention}"
-- title_sep_only: abstract = "title {sep} {abstract}", claim/invention = plain text (no section tokens)
+- no_section_markers: abstract = "title {sep} {abstract}", claim/invention = plain text (no section tokens)
 
 For each section:
 - Step 1: Encode full text with model
-- Step 2: Extract spans based on unit type (spacy_token, spacy_sentence, or noun_chunk)
+- Step 2: Extract spans based on unit type (spacy_token, noun_chunk, or encoder_token)
 - Step 3: Pool token embeddings for each span (mean or max)
 
 Unit types (only these are supported):
 - spacy_token: one embedding per spaCy token, with noun_chunks merged into one embedding per chunk; tokens inside a noun_chunk are not output separately.
-- spacy_sentence: one embedding per sentence.
 - noun_chunk: only noun-chunk spans (one embedding per noun phrase); tokens not in any noun_chunk are not included.
 - encoder_token: one embedding per tokenizer subword token (no spaCy, no filtering, no merging).
 
@@ -84,6 +83,13 @@ def main():
                        help="Random seed when sampling to max_docs (proportional per year). For reproducibility.")
     parser.add_argument("--max_spans", type=int, default=5000000,
                        help="Maximum number of spans (embeddings) to extract")
+    parser.add_argument("--section_balance", type=str, default="equal_spans",
+                       choices=["natural", "equal_spans"],
+                       help="How to allocate the per-section span budget when total spans exceed --max_spans. "
+                            "'natural' = proportional to section size (legacy: abstract under-represented because "
+                            "abstract sections are short). 'equal_spans' (default) = equal budget per non-empty "
+                            "section, capped at section size; leftover from sections smaller than the equal share "
+                            "is redistributed proportionally to remaining sections.")
     parser.add_argument("--shuffle_doc_sections", type=int, default=1, choices=[0, 1],
                        help="Shuffle doc-sections before batch processing (1=yes, 0=no). Default: 1. "
                             "Ensures early-stop covers documents from all years/sources uniformly, "
@@ -93,7 +99,7 @@ def main():
                             "None = no cap (default). Post-truncation actual content spans: "
                             "abstract ~6, claim ~48, invention ~42. "
                             "Recommended: 25 for spacy_token (27%% doc coverage vs 16%% uncapped), "
-                            "15 for noun_chunk, not needed for spacy_sentence. "
+                            "15 for noun_chunk, not needed for encoder_token. "
                             "Evenly-spaced sub-sampling is used when capping (deterministic).")
 
     parser.add_argument("--embed_dtype", type=str, default="float32", choices=["float32", "float16"],
@@ -102,9 +108,8 @@ def main():
                        help="Save metadata (0=no, 1=yes). Default: 0. Use 1 when this output will be used as the document corpus in evaluate "
                             "(--embeddings_dir), so span->doc_id aggregation can be built. Saved AFTER sampling.")
     parser.add_argument("--unit", type=str, default="spacy_token",
-                       choices=["spacy_token", "spacy_sentence", "noun_chunk", "encoder_token"],
+                       choices=["spacy_token", "noun_chunk", "encoder_token"],
                        help="Semantic unit: spacy_token (tokens + merged noun_chunks), "
-                            "spacy_sentence (one per sentence), "
                             "noun_chunk (only noun-chunk spans, no standalone tokens), "
                             "encoder_token (one embedding per tokenizer subword token, no spaCy).")
 
@@ -177,7 +182,7 @@ def main():
     model = AutoModel.from_pretrained(args.model_path, trust_remote_code=True)
     
     # Build output directory name
-    unit_suffix = args.unit  # spacy_token, spacy_sentence, noun_chunk
+    unit_suffix = args.unit  # spacy_token, noun_chunk, encoder_token
 
     if args.output_dir is None:
         # Format: {output_root}/{model_name}_{unit}[_fp16]
@@ -211,12 +216,13 @@ def main():
     print(f"Batch size: {args.batch_size if args.batch_size is not None else 'auto (resolved after model load)'}, "
           f"Max length: {args.max_length}, Max section chars: {args.max_section_chars}")
     print(f"Shuffle doc-sections: {bool(args.shuffle_doc_sections)}")
+    print(f"Section balance: {args.section_balance}")
     print(f"Max spans/doc-section: {args.max_spans_per_doc_section or 'unlimited'}")
     print(f"Span cache: {args.span_cache_dir or 'none (spaCy at runtime)'}")
     print(f"Output directory: {output_dir}")
     print(f"=" * 80)
     
-    # Ensure section tokens are in vocabulary (for section_tokens format; no-op for title_sep_only if model has no section tokens)
+    # Ensure section tokens are in vocabulary (for section_tokens format; no-op for no_section_markers if model has no section tokens)
     ensure_section_tokens(tokenizer, model)
 
     format_scheme = get_encoder_format_scheme(args.model_path)
@@ -290,32 +296,64 @@ def main():
     if total_spans > args.max_spans:
         print(f"\n{'='*80}")
         print(f"Sampling {args.max_spans:,} spans from {total_spans:,} total spans (across all sections)")
-        print(f"Strategy: random sampling (proportional per section)")
-        
-        # Calculate per-section sampling budget (proportional to section size)
+        print(f"Strategy: random sampling ({args.section_balance} per section)")
+
         section_sizes = {s: len(emb) if emb is not None else 0 for s, emb in embeddings_by_section.items()}
-        total_size = sum(section_sizes.values())
-        
-        # Allocate budget proportionally, but ensure at least some from each non-empty section
-        section_budgets = {}
-        remaining_budget = args.max_spans
-        for section in SECTIONS:
-            if section_sizes[section] > 0:
-                # Proportional allocation
-                budget = max(1, int(args.max_spans * section_sizes[section] / total_size))
-                section_budgets[section] = min(budget, section_sizes[section])
-                remaining_budget -= section_budgets[section]
-        
-        # Distribute remaining budget to largest sections
-        if remaining_budget > 0:
-            sorted_sections = sorted(section_budgets.items(), key=lambda x: section_sizes[x[0]], reverse=True)
-            for section, _ in sorted_sections:
-                if remaining_budget <= 0:
+        nonempty = [s for s in SECTIONS if section_sizes[s] > 0]
+        section_budgets = {s: 0 for s in SECTIONS}
+
+        if args.section_balance == "equal_spans" and nonempty:
+            # Equal budget per non-empty section. If a section has fewer spans than the equal
+            # share, take all of it and redistribute the leftover proportionally to the rest
+            # (iterate to a fixed point so no section is over its size).
+            remaining_budget = min(args.max_spans, sum(section_sizes.values()))
+            saturated = set()
+            active = list(nonempty)
+            while active and remaining_budget > 0:
+                share = remaining_budget // len(active)
+                if share == 0:
+                    # Hand out the last few one-by-one to active sections that still have room
+                    for s in active:
+                        if remaining_budget <= 0:
+                            break
+                        if section_budgets[s] < section_sizes[s]:
+                            section_budgets[s] += 1
+                            remaining_budget -= 1
                     break
-                additional = min(remaining_budget, section_sizes[section] - section_budgets[section])
-                section_budgets[section] += additional
-                remaining_budget -= additional
-        
+                newly_saturated = []
+                for s in active:
+                    room = section_sizes[s] - section_budgets[s]
+                    take = min(share, room)
+                    section_budgets[s] += take
+                    remaining_budget -= take
+                    if section_budgets[s] >= section_sizes[s]:
+                        newly_saturated.append(s)
+                if not newly_saturated:
+                    break
+                for s in newly_saturated:
+                    saturated.add(s)
+                    active.remove(s)
+        else:
+            # 'natural': proportional to section size (legacy behavior)
+            total_size = sum(section_sizes.values())
+            remaining_budget = args.max_spans
+            for section in SECTIONS:
+                if section_sizes[section] > 0:
+                    budget = max(1, int(args.max_spans * section_sizes[section] / total_size))
+                    section_budgets[section] = min(budget, section_sizes[section])
+                    remaining_budget -= section_budgets[section]
+            if remaining_budget > 0:
+                sorted_sections = sorted(
+                    [(s, section_sizes[s]) for s in SECTIONS if section_sizes[s] > 0],
+                    key=lambda x: x[1], reverse=True,
+                )
+                for section, _ in sorted_sections:
+                    if remaining_budget <= 0:
+                        break
+                    additional = min(remaining_budget, section_sizes[section] - section_budgets[section])
+                    section_budgets[section] += additional
+                    remaining_budget -= additional
+
         print(f"Per-section budgets: {section_budgets}")
         
         # Sample per section

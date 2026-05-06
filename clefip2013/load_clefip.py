@@ -116,6 +116,18 @@ def _tag_local(el: ET.Element) -> str:
     return el.tag.split("}")[-1] if "}" in el.tag else el.tag
 
 
+def _get_title_from_root(root: ET.Element, lang: str = "EN") -> str:
+    """Return the invention-title text for the given language, or empty string if not found."""
+    lang_upper = lang.upper()
+    for el in root.iter():
+        if _tag_local(el) == "invention-title":
+            if (el.get("lang") or "").upper() == lang_upper:
+                text = _text_of_element(el)
+                if text:
+                    return text
+    return ""
+
+
 def _collect_passages_from_root(root: ET.Element) -> List[Tuple[str, str]]:
     """
     Yield (xpath, text) for each passage in patent-document root.
@@ -798,11 +810,12 @@ def build_full_passage_corpus_from_01(
                 if lang_filter_upper and _get_root_lang(root) != lang_filter_upper:
                     num_skipped_lang += 1
                     continue
+                title = _get_title_from_root(root)
                 for xpath, text in _collect_passages_from_root(root):
                     if not text:
                         continue
                     pid = f"{doc_id}::{xpath}"
-                    jf.write(json.dumps({"pid": pid, "text": text}, ensure_ascii=False) + "\n")
+                    jf.write(json.dumps({"pid": pid, "text": text, "title": title}, ensure_ascii=False) + "\n")
                     idf.write(pid + "\n")
                     num_passages += 1
                 num_docs += 1
@@ -1271,6 +1284,7 @@ def load_clefip_en_for_eval_sampled_corpus(
         print(f"  EN corpus cache not found; streaming from XMLs...", flush=True)
         # First pass: collect qrels passages (need their text) and discover all doc_ids
         qrels_pid_to_text: Dict[str, str] = {}
+        doc_id_to_title: Dict[str, str] = {}  # title per doc for JSONL output
         needed_doc_ids = {pid.split("::")[0] for pid in qrels_pids}
 
         # For doc-level sampling, we need to know all doc_ids first, then sample, then collect
@@ -1289,6 +1303,7 @@ def load_clefip_en_for_eval_sampled_corpus(
                     continue
                 all_en_doc_ids.append(stem)
                 if stem in needed_doc_ids:
+                    doc_id_to_title[stem] = _get_title_from_root(root_el)
                     for xpath, text in _collect_passages_from_root(root_el):
                         pid = f"{stem}::{xpath}"
                         if pid in qrels_pids and text:
@@ -1366,6 +1381,7 @@ def load_clefip_en_for_eval_sampled_corpus(
                         root_el = tree.getroot()
                     except Exception:
                         continue
+                    doc_id_to_title[stem] = _get_title_from_root(root_el)
                     for xpath, text in _collect_passages_from_root(root_el):
                         pid = f"{stem}::{xpath}"
                         if pid not in qrels_pids and text:
@@ -1375,10 +1391,12 @@ def load_clefip_en_for_eval_sampled_corpus(
             for pid in sorted(qrels_pids):
                 text = qrels_pid_to_text.get(pid)
                 if text:
-                    jf.write(json.dumps({"pid": pid, "text": text}, ensure_ascii=False) + "\n")
+                    title = doc_id_to_title.get(pid.split("::")[0], "")
+                    jf.write(json.dumps({"pid": pid, "text": text, "title": title}, ensure_ascii=False) + "\n")
                     idf.write(pid + "\n")
             for pid, text in selected_doc_passages:
-                jf.write(json.dumps({"pid": pid, "text": text}, ensure_ascii=False) + "\n")
+                title = doc_id_to_title.get(pid.split("::")[0], "")
+                jf.write(json.dumps({"pid": pid, "text": text, "title": title}, ensure_ascii=False) + "\n")
                 idf.write(pid + "\n")
 
     with open(ids_txt_path, "r", encoding="utf-8") as f:

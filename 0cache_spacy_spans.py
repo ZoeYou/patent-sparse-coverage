@@ -45,7 +45,7 @@ from utils import (
 )
 
 SECTIONS = ("abstract", "claim", "invention")
-UNITS = ("spacy_token", "spacy_sentence", "noun_chunk")
+UNITS = ("spacy_token", "noun_chunk")
 
 
 def main():
@@ -131,9 +131,13 @@ def main():
         print(f"Truncated to {len(documents):,} documents")
 
     # Build list of (doc_id, section, sub_part, normalized_truncated_text)
+    # Titles are NOT sent to spaCy: a patent title is already a single semantic unit;
+    # we emit it directly as a single-span cache entry per requested unit, which both
+    # avoids spaCy fragmentation noise (e.g. "[SEP]" -> "SEP" leaks) and saves compute.
     print("\nPreparing texts for spaCy...")
     t_prep_start = time.time()
-    text_items = []
+    text_items = []        # items sent to spaCy
+    title_items = []       # (doc_id, title_text) — handled without spaCy
     max_c = args.max_visible_chars
     for doc_id, doc in documents.items():
         title = normalize_text_for_pipeline((doc.get("title", "") or "").strip())
@@ -143,7 +147,7 @@ def main():
 
         if abstract or title:
             if title:
-                text_items.append((doc_id, "abstract", "title", title[:max_c]))
+                title_items.append((doc_id, title[:max_c]))
             if abstract:
                 text_items.append((doc_id, "abstract", "body", abstract[:max_c]))
         if claim:
@@ -151,7 +155,7 @@ def main():
         if invention:
             text_items.append((doc_id, "invention", "body", invention[:max_c]))
 
-    print(f"Total text items: {len(text_items):,}")
+    print(f"Total text items: {len(text_items):,} (spaCy) + {len(title_items):,} titles (direct)")
     t_prep_elapsed = time.time() - t_prep_start
     print(f"  Prepare time: {t_prep_elapsed:.1f}s")
 
@@ -164,16 +168,31 @@ def main():
         pipe_kw["n_process"] = n_process
 
     entries_by_unit = {u: [] for u in args.units}
+
+    # Emit title entries directly (no spaCy); the whole title becomes one span per unit.
+    for doc_id, title_text in title_items:
+        title_text_stripped = title_text.strip()
+        leading_ws = len(title_text) - len(title_text.lstrip())
+        if not title_text_stripped:
+            continue
+        title_span = [(leading_ws, leading_ws + len(title_text_stripped), title_text_stripped)]
+        for unit in args.units:
+            entries_by_unit[unit].append({
+                "d": doc_id,
+                "s": "abstract",
+                "p": "title",
+                "sp": title_span,
+            })
+
     t0 = time.time()
     gen = nlp.pipe(((item[3], idx) for idx, item in enumerate(text_items)), **pipe_kw)
     for doc_spacy, idx in tqdm(gen, total=len(text_items), desc="  spacy+extract"):
         doc_id, section, sub_part, _ = text_items[idx]
-        is_title = (sub_part == "title")
         is_body = (sub_part == "body" and section == "abstract")
         for unit in args.units:
             char_spans = extract_char_spans_from_spacy(
                 doc_spacy, section, unit,
-                is_abstract_title=is_title,
+                is_abstract_title=False,
                 is_abstract_body=is_body,
             )
             entries_by_unit[unit].append({

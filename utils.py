@@ -5,6 +5,7 @@ Utility functions for patent document processing.
 import json
 import os
 import re
+import html
 from typing import List, Tuple, Optional
 import torch
 import numpy as np
@@ -58,14 +59,15 @@ def ensure_section_tokens(tokenizer, model):
 # -----------------------------------------------------------------------------
 # Encoder input format by model (single source of truth for embeddings + query)
 # -----------------------------------------------------------------------------
-ENCODER_FORMAT_SECTION_TOKENS = "section_tokens"   # title SEP [abstract] abstract, [claim] claim, [invention] invention
-ENCODER_FORMAT_TITLE_SEP_ONLY = "title_sep_only"   # title SEP abstract (no section tokens)
+ENCODER_FORMAT_SECTION_TOKENS = "section_tokens"           # title SEP [abstract] abstract, [claim] claim, [invention] invention
+ENCODER_FORMAT_NO_SECTION_MARKERS = "no_section_markers"   # title SEP abstract; claim/invention as plain text (no [section] markers)
 
 DEFAULT_SEP = " [SEP] "  # fallback when tokenizer not available
 
 
-# Models that use title + sep + text only (no [abstract]/[claim]/[invention]). Aligned with evaluate.py dense retrieval.
-_TITLE_SEP_ONLY_MODEL_IDS = (
+# Models that use plain text without [abstract]/[claim]/[invention] markers.
+# Aligned with evaluate.py dense retrieval. Abstracts still get "title <sep> abstract".
+_NO_SECTION_MARKER_MODEL_IDS = (
     "allenai/specter2_base",
     "patentbert",
     "mpi-inno-comp/paecter",
@@ -83,9 +85,9 @@ def get_encoder_format_scheme(model_id: str) -> str:
     if not model_id:
         return ENCODER_FORMAT_SECTION_TOKENS
     mid = (model_id or "").strip().lower().replace("\\", "/")
-    for candidate in _TITLE_SEP_ONLY_MODEL_IDS:
+    for candidate in _NO_SECTION_MARKER_MODEL_IDS:
         if candidate.lower() in mid or mid.endswith(candidate.lower().split("/")[-1]):
-            return ENCODER_FORMAT_TITLE_SEP_ONLY
+            return ENCODER_FORMAT_NO_SECTION_MARKERS
     return ENCODER_FORMAT_SECTION_TOKENS
 
 
@@ -106,7 +108,7 @@ def get_encoder_sep_for_model(model_id: str, tokenizer=None) -> str:
 def _format_simple_section(scheme: str, marker: str, text: str) -> str:
     """Shared body for claim/invention formatters: optional [section] prefix."""
     text = (text or "").strip()
-    if scheme == ENCODER_FORMAT_TITLE_SEP_ONLY:
+    if scheme == ENCODER_FORMAT_NO_SECTION_MARKERS:
         return text
     return f"[{marker}] {text}".strip()
 
@@ -115,7 +117,7 @@ def format_abstract_for_encoder(scheme: str, title: str, abstract: str, sep: str
     """Format title+abstract for encoder input. sep is the model's separator (see get_encoder_sep_for_model)."""
     title = (title or "").strip()
     abstract = (abstract or "").strip()
-    if scheme == ENCODER_FORMAT_TITLE_SEP_ONLY:
+    if scheme == ENCODER_FORMAT_NO_SECTION_MARKERS:
         return f"{title}{sep}{abstract}".strip() if (title or abstract) else ""
     return f"{title}{sep}[abstract] {abstract}".strip()
 
@@ -132,17 +134,18 @@ def format_invention_for_encoder(scheme: str, invention: str) -> str:
 
 def get_chunk_sep_marker(scheme: str, sep: str = DEFAULT_SEP) -> str:
     """Separator used to split title vs abstract when chunking. Must match format_abstract_for_encoder."""
-    if scheme == ENCODER_FORMAT_TITLE_SEP_ONLY:
+    if scheme == ENCODER_FORMAT_NO_SECTION_MARKERS:
         return sep
     return sep + "[abstract] "
 
 
 def remove_escape_and_decode(text: str) -> str:
-    """Clean escape sequences from text."""
+    """Clean escape sequences and decode HTML entities from text."""
     if not text:
         return ""
     text = re.sub(r'\\[^nrtbfav"\'\\]', '', text)
-    return text.replace('\/', '/').replace('\"', '"').replace(" -->", "")
+    text = text.replace('\/', '/').replace('\"', '"').replace(" -->", "")
+    return _decode_html_entities(text)
 
 
 
@@ -188,54 +191,72 @@ def _parse_epo_txt_file(file_path: str) -> Optional[dict]:
     return result
 
 
-def auto_batch_size_for_encoder(max_length: int = 512, model=None) -> int:
-    """Estimate a reasonable encoding batch size based on available GPU memory.
+def auto_batch_size(
+    max_length: int = 512,
+    hidden_size: int = 768,
+    model=None,
+    device=None,
+    min_bs: int = 4,
+    max_bs: int = 2048,
+) -> int:
+    """Estimate a safe encoding batch size based on available GPU memory.
 
-    Heuristic (for BERT-class encoders with max_length tokens):
-        usable_mb  = (total_vram - already_allocated) * 0.85
-        per_sample_mb ≈ max_length / 512 * 3   # ~3 MB per sample at 512 tokens (empirical)
-        batch_size = usable_mb / per_sample_mb, clamped to [8, 2048]
+    Heuristic for BERT-class transformers:
+        per_sample_mb ≈ (max_length/512) * (hidden_size/768)^0.5 * 3 MB
+        usable_mb     = free_vram * 0.85
+        batch_size    = largest power-of-2 ≤ usable_mb / per_sample_mb
 
-    If `model` is passed (and already on the GPU), the model's allocated memory is
-    subtracted from the total before sizing the batch — important for large encoders
-    (≥1B params) where the model itself eats most VRAM.
+    ``free_vram`` is total minus already-allocated (accounting for model weights when
+    the model is already on GPU).  Falls back to 32 on CPU or on error.
 
-    Falls back to 64 on CPU or when detection fails.
+    Args:
+        max_length:  encoder sequence length (scales per-sample cost linearly).
+        hidden_size: model hidden size (scales per-sample cost as sqrt).
+        model:       if passed and on GPU, its allocated VRAM is subtracted from total.
+        device:      torch.device to query; defaults to current CUDA device.
+        min_bs:      minimum returned batch size.
+        max_bs:      maximum returned batch size.
     """
     if not torch.cuda.is_available():
-        print("[auto_batch_size] No GPU detected → default batch_size=64")
-        return 64
+        print("[auto_batch_size] No GPU detected → default batch_size=32")
+        return 32
 
     try:
-        dev = torch.cuda.current_device()
-        props = torch.cuda.get_device_properties(dev)
-        total_mb = props.total_mem / (1024 ** 2)
+        if device is not None:
+            dev_idx = device.index if (hasattr(device, "index") and device.index is not None) else 0
+        else:
+            dev_idx = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(dev_idx)
+        total_mb = props.total_memory / (1024 ** 2)
         total_gb = total_mb / 1024
         gpu_name = props.name
 
-        # Subtract memory currently taken by the model (if loaded on GPU)
-        allocated_mb = torch.cuda.memory_allocated(dev) / (1024 ** 2)
+        allocated_mb = torch.cuda.memory_allocated(dev_idx) / (1024 ** 2)
         free_mb = max(total_mb - allocated_mb, 0.0)
 
-        # Rough per-sample cost scales linearly with sequence length
-        per_sample_mb = (max_length / 512) * 3.0
-        usable_mb = free_mb * 0.85  # leave a little headroom for activations / OS
+        per_sample_mb = (max_length / 512) * (hidden_size / 768) ** 0.5 * 3.0
+        usable_mb = free_mb * 0.85
         estimated = int(usable_mb / per_sample_mb)
 
-        # Clamp to a sane range
-        estimated = max(8, min(estimated, 2048))
+        # Round down to nearest power of 2
+        p2 = min_bs
+        while p2 * 2 <= estimated:
+            p2 *= 2
+        result = max(min_bs, min(max_bs, p2))
 
-        # Round down to nearest multiple of 8 for kernel friendliness
-        estimated = (estimated // 8) * 8
-
-        print(f"[auto_batch_size] GPU: {gpu_name}, VRAM: {total_gb:.1f} GB, "
-              f"model alloc: {allocated_mb / 1024:.1f} GB, free: {free_mb / 1024:.1f} GB "
-              f"→ batch_size={estimated}")
-        return estimated
+        print(f"[auto_batch_size] GPU: {gpu_name}, total={total_gb:.1f} GB, "
+              f"alloc={allocated_mb / 1024:.1f} GB, free={free_mb / 1024:.1f} GB "
+              f"→ batch_size={result}")
+        return result
 
     except Exception as e:
-        print(f"[auto_batch_size] Detection failed ({e}) → default batch_size=64")
-        return 64
+        print(f"[auto_batch_size] Detection failed ({e}) → default batch_size=32")
+        return 32
+
+
+def auto_batch_size_for_encoder(max_length: int = 512, model=None) -> int:
+    """Alias for auto_batch_size; kept for backward compatibility."""
+    return auto_batch_size(max_length=max_length, model=model)
 
 
 def load_corpus_epo(
@@ -766,9 +787,36 @@ def _normalize_ref_numerals(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+def _decode_html_entities(text: str) -> str:
+    """Decode HTML entities, including common double-escaped forms (e.g. &amp;amp;)."""
+    if not text:
+        return ""
+    once = html.unescape(text)
+    twice = html.unescape(once)
+    return twice
+
+
+def _remove_zero_width_chars(text: str) -> str:
+    """Remove zero-width characters (U+200B, U+200C, U+200D, U+FEFF).
+    
+    These often appear from PDF/OCR extraction and can break word segmentation.
+    - U+200B: zero-width space
+    - U+200C: zero-width non-joiner
+    - U+200D: zero-width joiner
+    - U+FEFF: zero-width no-break space (BOM)
+    """
+    if not text:
+        return ""
+    return re.sub(r'[\u200b\u200c\u200d\ufeff]', '', text)
+
+
 def normalize_text_for_pipeline(text: str) -> str:
-    """Apply all model-independent text normalization (semicolons + ref numerals)."""
-    return _normalize_ref_numerals(_normalize_semicolon(text))
+    """Apply model-independent normalization (HTML entity decode + zero-width chars + semicolons + ref numerals)."""
+    if not text:
+        return ""
+    t = _remove_zero_width_chars(text)
+    t = _decode_html_entities(t)
+    return _normalize_ref_numerals(_normalize_semicolon(t))
 
 
 # ---------------------------------------------------------------------------
@@ -792,7 +840,7 @@ def extract_char_spans_from_spacy(
     Args:
         doc_spacy: spaCy Doc object
         section: "abstract", "claim", or "invention"
-        unit: "spacy_token", "spacy_sentence", or "noun_chunk"
+        unit: "spacy_token" or "noun_chunk"
         is_abstract_title: True when processing the title portion of an abstract
         is_abstract_body: True when processing the body portion of an abstract
 
@@ -800,6 +848,16 @@ def extract_char_spans_from_spacy(
         List of (start_char, end_char, span_text) tuples.
     """
     char_spans: List[Tuple[int, int, str]] = []
+
+    # Title shortcut: a patent title is already a single semantic unit.
+    # Skip spaCy splitting (which can leak "SEP"/"abstract" fragments and over-segment
+    # short titles) and emit the whole title as one span for every unit type.
+    if is_abstract_title:
+        title_text = (doc_spacy.text or "").strip()
+        if not title_text:
+            return char_spans
+        leading_ws = len(doc_spacy.text) - len(doc_spacy.text.lstrip())
+        return [(leading_ws, leading_ws + len(title_text), title_text)]
 
     if unit == "spacy_token":
         # Noun chunks merged, standalone tokens kept if they pass quality filter
@@ -813,11 +871,18 @@ def extract_char_spans_from_spacy(
                 if skip_in_t > 0:
                     leading_ws = len(chunk.text) - len(chunk.text.lstrip())
                     chunk_start = chunk_start + leading_ws + skip_in_t
+            # Trim unbalanced parens (e.g. '(AVS' -> 'AVS') and adjust offsets accordingly
+            chunk_text, n_left, n_right = _trim_unbalanced_parens(chunk_text)
+            chunk_start += n_left
+            chunk_end -= n_right
             if not chunk_text or len(chunk_text) < 2 or _is_likely_formula_variable(chunk_text):
                 continue
             noun_chunk_spans.append((chunk_start, chunk_end, chunk_text))
 
-        char_spans.extend(noun_chunk_spans)
+        # char_spans tracked as (start, end, text, is_standalone_token) so the
+        # final quality filter can use the lenient single-word rule for standalone
+        # tokens (e.g. 'comprising', 'having') without overriding the inline check.
+        char_spans = [(s, e, t, False) for s, e, t in noun_chunk_spans]
 
         for tok in doc_spacy:
             if tok.is_space:
@@ -827,74 +892,8 @@ def extract_char_spans_from_spacy(
             token_in_chunk = any(
                 cs <= tok_start and tok_end <= ce for cs, ce, _ in noun_chunk_spans
             )
-            if not token_in_chunk and filter_span_quality(tok.text, standalone_token=True):
-                char_spans.append((tok_start, tok_end, tok.text))
-
-    elif unit == "spacy_sentence":
-        if is_abstract_title:
-            # Title part: simple sentence extraction
-            for sent in doc_spacy.sents:
-                t = sent.text.strip()
-                if not t or len(t) < 3:
-                    continue
-                if re.match(r"^\[.*\]\s*$", t) or re.match(r"^\[.*\]\s*\[.*\]\s*$", t):
-                    continue
-                char_spans.append((sent.start_char, sent.end_char, t))
-        elif is_abstract_body:
-            # Abstract body: simple sentences + trailing drop
-            sents_list = []
-            for sent in doc_spacy.sents:
-                t = sent.text.strip()
-                if not t or len(t) < 3:
-                    continue
-                if re.match(r"^\[.*\]\s*$", t) or re.match(r"^\[.*\]\s*\[.*\]\s*$", t):
-                    continue
-                sents_list.append((sent.start_char, sent.end_char, t))
-            if len(sents_list) > 1 and _should_drop_trailing_sentence(sents_list[-1][2]):
-                sents_list = sents_list[:-1]
-            char_spans.extend(sents_list)
-        elif section == "claim":
-            sents_list = list(doc_spacy.sents)
-            merged = []
-            j = 0
-            while j < len(sents_list):
-                t = sents_list[j].text.strip()
-                if re.match(r"^\d+\.\s*$", t) and j + 1 < len(sents_list):
-                    merged.append((
-                        sents_list[j].start_char,
-                        sents_list[j + 1].end_char,
-                        sents_list[j].text + " " + sents_list[j + 1].text.strip(),
-                    ))
-                    j += 2
-                else:
-                    if t and len(t) >= 3 and not re.match(r"^\[.*\]\s*$", t) and not re.match(r"^\[.*\]\s*\[.*\]\s*$", t):
-                        merged.append((sents_list[j].start_char, sents_list[j].end_char, t))
-                    j += 1
-            if len(merged) > 1 and _should_drop_trailing_sentence(merged[-1][2]):
-                merged = merged[:-1]
-            for start, end, t in merged:
-                if t:
-                    char_spans.append((start, end, t))
-        else:
-            # invention / other: strip leading all-caps headers, trailing drop
-            sents_list = []
-            for s in doc_spacy.sents:
-                t = s.text.strip()
-                if not t or len(t) < 3:
-                    continue
-                if re.match(r"^\[.*\]\s*$", t) or re.match(r"^\[.*\]\s*\[.*\]\s*$", t):
-                    continue
-                stripped, skip_in_t = _strip_leading_uppercase_run(t)
-                if not stripped or len(stripped) < 3:
-                    continue
-                leading_ws = len(s.text) - len(s.text.lstrip())
-                new_start = s.start_char + leading_ws + skip_in_t
-                sents_list.append((new_start, s.end_char, stripped))
-            if len(sents_list) > 1 and _should_drop_trailing_sentence(sents_list[-1][2]):
-                sents_list = sents_list[:-1]
-            for start, end, t in sents_list:
-                if t:
-                    char_spans.append((start, end, t))
+            if not token_in_chunk and filter_span_quality(tok.text, standalone_token=True, section=section):
+                char_spans.append((tok_start, tok_end, tok.text, True))
 
     elif unit == "noun_chunk":
         for chunk in doc_spacy.noun_chunks:
@@ -905,13 +904,36 @@ def extract_char_spans_from_spacy(
                 if skip_in_t > 0:
                     leading_ws = len(chunk.text) - len(chunk.text.lstrip())
                     start_c = chunk.start_char + leading_ws + skip_in_t
+            # Trim unbalanced parens (e.g. '(AVS' -> 'AVS') and adjust offsets accordingly
+            t, n_left, n_right = _trim_unbalanced_parens(t)
+            start_c += n_left
+            end_c -= n_right
             if not t or _is_likely_formula_variable(t):
                 continue
-            char_spans.append((start_c, end_c, t))
+            char_spans.append((start_c, end_c, t, False))
     else:
         raise ValueError(f"Unknown unit: {unit}")
 
-    return char_spans
+    # For invention/background text, drop any span that lies inside a sentence
+    # flagged as prior-art / citation prose (e.g. "Japanese Patent Application Nos. ...").
+    citation_ranges: List[Tuple[int, int]] = []
+    if section == "invention":
+        citation_ranges = _citation_sentence_ranges(doc_spacy)
+
+    def _in_citation_sentence(start_c: int, end_c: int) -> bool:
+        for cs, ce in citation_ranges:
+            if start_c >= cs and end_c <= ce:
+                return True
+        return False
+
+    filtered_char_spans: List[Tuple[int, int, str]] = []
+    for start_c, end_c, span_text, is_standalone in char_spans:
+        if citation_ranges and _in_citation_sentence(start_c, end_c):
+            continue
+        if filter_span_quality(span_text, section=section, standalone_token=is_standalone):
+            filtered_char_spans.append((start_c, end_c, span_text))
+
+    return filtered_char_spans
 
 
 # ---------------------------------------------------------------------------
@@ -989,7 +1011,7 @@ def _compute_content_offsets(
         else:
             body_offset = sep_pos + len(sep)
     else:
-        # title_sep_only: title{sep}body  — find end of sep region
+        # no_section_markers: title{sep}body  — find end of sep region
         sep_end = sep_pos + len(sep.strip())
         # advance past any whitespace after the stripped sep
         while sep_end < len(normalized_formatted) and normalized_formatted[sep_end] == " ":
@@ -1116,12 +1138,8 @@ def process_doc_batch_cached(
         for span_text, token_start, token_end in spans:
             if token_start >= token_end or token_end > seq_len:
                 continue
-            if unit == "spacy_sentence":
-                if len(span_text.strip()) < 3:
-                    continue
-            else:
-                if not filter_span_quality(span_text):
-                    continue
+            if not filter_span_quality(span_text, section=section):
+                continue
             span_text_canonical = canonicalize_span_text(span_text)
             if not span_text_canonical:
                 continue
@@ -1263,6 +1281,36 @@ def _strip_claim_number_prefix(text: str, section: str) -> str:
     return re.sub(r"^\d+\.\s*", "", text.strip()).strip()
 
 
+def _trim_unbalanced_parens(text: str) -> Tuple[str, int, int]:
+    """
+    Strip unbalanced leading '(' and trailing ')' from a span.
+
+    Returns (trimmed_text, n_left_stripped, n_right_stripped) so that callers
+    can adjust char offsets:  new_start = old_start + n_left_stripped,
+                              new_end   = old_end   - n_right_stripped.
+
+    Examples:
+        '(AVS'        -> ('AVS', 1, 0)
+        'foo)'        -> ('foo', 0, 1)
+        '(AVS)'       -> ('(AVS)', 0, 0)        # balanced — keep
+        '(AVS) bar'   -> ('(AVS) bar', 0, 0)
+        '(foo (bar)'  -> ('foo (bar)', 1, 0)    # one extra '(' at start
+    """
+    if not text:
+        return (text, 0, 0)
+    s = text
+    left = right = 0
+    # Strip unbalanced leading '('
+    while s.startswith("(") and s.count("(") > s.count(")"):
+        s = s[1:]
+        left += 1
+    # Strip unbalanced trailing ')'
+    while s.endswith(")") and s.count(")") > s.count("("):
+        s = s[:-1]
+        right += 1
+    return (s, left, right)
+
+
 def _should_drop_trailing_sentence(text: str) -> bool:
     """True if the last sentence should be dropped: too short or likely truncated (no sentence-ending punctuation)."""
     if not text or not text.strip():
@@ -1316,6 +1364,11 @@ def _is_section_marker_or_header(span_text: str) -> bool:
     header_words = {"field", "related", "art", "invention", "description", "background", "prior", "technical"}
     if len(s.split()) == 1 and s.lower() in header_words:
         return True
+    # Bare model-special-token names leaked from "[SEP]" / "[CLS]" / "[abstract]" etc.
+    # being split by spaCy into "[", "SEP", "]" — the alpha piece becomes a noun_chunk/token.
+    special_token_words = {"sep", "cls", "pad", "mask", "unk", "abstract", "claim"}
+    if len(s.split()) == 1 and s.lower() in special_token_words:
+        return True
     return False
 
 
@@ -1331,7 +1384,79 @@ def _is_likely_formula_variable(text: str) -> bool:
     return False
 
 
-def filter_span_quality(span_text: str, *, standalone_token: bool = False) -> bool:
+def _looks_like_bibliographic_reference_span(span_text: str, *, standalone_token: bool = False) -> bool:
+    """Heuristic filter for author/journal citation fragments in invention text."""
+    s = (span_text or "").strip()
+    if not s:
+        return False
+
+    span_lower = s.lower()
+    if re.search(r"\bet\s+al\.?\b", span_lower):
+        return True
+
+    # Author-name patterns like "M. Hashimoto", "R.B. Sykes", or "Kamiya et al.".
+    if re.search(r"\b(?:[A-Z]\.){1,3}\s*[A-Z][a-z]+(?:[- ][A-Z][a-z]+)?\b", s):
+        return True
+    if re.search(r"\b[A-Z][a-z]+(?:[- ][A-Z][a-z]+)?\s+et\s+al\.?\b", s):
+        return True
+
+    has_year = bool(re.search(r"\((?:19|20)\d{2}\)", s))
+    has_volume_pages = bool(re.search(r"\b\d+\s*:\s*\d+\b", s))
+    has_journal_marker = bool(re.search(
+        r"\b(?:j\.|amer\.|chem\.|soc\.|proc\.|trans\.|nature|science|lancet|jama|ieee|acm)\b",
+        span_lower,
+    ))
+    if (has_year and has_volume_pages) or (has_journal_marker and (has_year or has_volume_pages)):
+        return True
+
+    if standalone_token and re.fullmatch(r"(?:J\.|Amer\.|Chem\.?|Soc\.?|Proc\.?|Trans\.?)", s):
+        return True
+
+    return False
+
+
+# Sentence-level citation patterns for invention/background text. When any of
+# these matches anywhere in a sentence we drop ALL spans from that sentence —
+# the surrounding prose is almost always weakly related prior-art listing.
+_CITATION_SENTENCE_PATTERNS = [
+    re.compile(r"\bpatent\s+application(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bpatent\s+no\.?\b", re.IGNORECASE),
+    re.compile(r"\bpatent\s+publication(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bpublished\s+(?:patent|application)\b", re.IGNORECASE),
+    re.compile(r"\bcopyright\s+notice\b", re.IGNORECASE),
+    re.compile(r"\bcopyright\s+owner\b", re.IGNORECASE),
+    re.compile(r"\ball\s+copyright\s+rights?\b", re.IGNORECASE),
+    re.compile(r"\bportion\s+of\s+(?:this|the)\s+patent\s+document\b", re.IGNORECASE),
+    re.compile(r"\bno\s+objection\s+to\s+the\s+facsimile\s+reproduction\b", re.IGNORECASE),
+    re.compile(r"\b37\s*cfr\s*[§\u00a7]?\s*1\.71\b", re.IGNORECASE),
+    re.compile(r"\bet\s+al\.?\b", re.IGNORECASE),
+    re.compile(r"\b\d{1,2},\d{3},\d{3}\b"),
+    re.compile(
+        r"\b(?:j\.|amer\.|chem\.|soc\.|proc\.|trans\.|nature|science|lancet|jama|ieee|acm)\b",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _citation_sentence_ranges(doc_spacy) -> List[Tuple[int, int]]:
+    """Char ranges of sentences in doc_spacy that look like prior-art / citation prose."""
+    ranges: List[Tuple[int, int]] = []
+    try:
+        sents = list(doc_spacy.sents)
+    except Exception:
+        return ranges
+    for sent in sents:
+        s = sent.text
+        if not s.strip():
+            continue
+        for pat in _CITATION_SENTENCE_PATTERNS:
+            if pat.search(s):
+                ranges.append((sent.start_char, sent.end_char))
+                break
+    return ranges
+
+
+def filter_span_quality(span_text: str, *, standalone_token: bool = False, section: Optional[str] = None) -> bool:
     """
     Filter out low-quality spans (patent templates, stopwords, etc.).
     Returns True if span should be kept, False if should be filtered out.
@@ -1390,7 +1515,50 @@ def filter_span_quality(span_text: str, *, standalone_token: bool = False) -> bo
     # 5) Only digits, punctuation, or units
     if re.match(r'^[\d\s\-.,;:()%°/]+$', span_text):
         return False
-    
+
+    # 5b) Patent citation / inventor-list noise (commonly mashed together by PDF/XML
+    # extraction in Background sections, e.g. "InventorPatent No.Vining5,782,762Johnson").
+    # Reject any span containing a US-patent-number pattern (\d,\d{3},\d{3} or 7+ digits)
+    # or an explicit "Patent No." marker.
+    if re.search(r"\d{1,2},\d{3},\d{3}", span_text):
+        return False
+    if re.search(r"\b\d{7,}\b", span_text):
+        return False
+    if re.search(r"patent\s*no\.?", span_lower):
+        return False
+    # International/national publication IDs, e.g. "WO 2012/046516 A1", "EP 1234567 B1",
+    # "US 2018/0123456 A1", "CN 110123456 A".
+    if re.search(
+        r"\b(?:WO|EP|US|CN|JP|KR|DE|FR|GB|PCT)\s*"
+        r"(?:\d{4}/\d{4,8}|\d{6,12}(?:/\d{1,4})?)"
+        r"(?:\s*[A-Z]\d?)?\b",
+        span_text,
+        flags=re.IGNORECASE,
+    ):
+        return False
+
+    # 5c) Figure/caption fragments are not semantic content spans.
+    if re.match(r"^(?:figure|fig\.?)(?:\s+[A-Za-z0-9][A-Za-z0-9.-]*)+$", s, flags=re.IGNORECASE):
+        return False
+
+    # 5d) Invention/background sections often contain bibliographic references
+    # (author lists, journal abbreviations, volume:page(year)); keep them out of spans.
+    if section == "invention" and _looks_like_bibliographic_reference_span(
+        span_text, standalone_token=standalone_token,
+    ):
+        return False
+
+    # 5e) Document structure markers and literature database references.
+    # - "section A", "section B", "section Ch": document chapter labels (not content)
+    # - "Week XXXXXX Derwent Publications": patent literature database citations
+    # - "Derwent", "Espacenet", "Patent Central": known literature database markers
+    if re.match(r"^section\s+[A-Z][A-Za-z]*(?:\s|$)", span_text, flags=re.IGNORECASE):
+        return False
+    if re.search(r"\b(derwent|espacenet|patent\s+central|world\s+patents)\b", span_lower):
+        return False
+    if re.search(r"\bweek\s+\d{4,8}\b", span_lower):
+        return False
+
     # 6) Patent template phrases (common boilerplate)
     patent_templates = [
         'at least one', 'plurality of', 'the present invention', 
@@ -1592,10 +1760,39 @@ def process_doc_batch(doc_texts: List[str],
         )
         visible_texts.append(doc_texts[i][:char_end] if char_end > 0 else "")
 
+    # For abstract section: title is treated as a single span (no spaCy on it).
+    # Mask the "title + sep + [abstract] " prefix in the spaCy-input text with spaces so
+    # spaCy still produces offsets relative to vis_text, but ignores SEP/marker fragments.
+    sep_str = get_encoder_sep_for_model("", tokenizer).strip()
+    title_span_per_doc: dict = {}
+    visible_texts_for_spacy = list(visible_texts)
+    if unit != "encoder_token" and sep_str:
+        for i, (sec, vt) in enumerate(zip(sections, visible_texts)):
+            if sec != "abstract" or not vt:
+                continue
+            sep_pos = vt.find(sep_str)
+            if sep_pos <= 0:
+                continue
+            title_chunk_raw = vt[:sep_pos]
+            title_chunk = title_chunk_raw.strip()
+            if not title_chunk:
+                continue
+            lws = len(title_chunk_raw) - len(title_chunk_raw.lstrip())
+            title_span_per_doc[i] = (lws, lws + len(title_chunk), title_chunk)
+            # Mask everything up to (and including) the [abstract] marker if present;
+            # otherwise mask up to end of separator.
+            mask_end = sep_pos + len(sep_str)
+            tail = vt[mask_end:]
+            stripped_tail = tail.lstrip()
+            ws_after_sep = len(tail) - len(stripped_tail)
+            if stripped_tail.startswith("[abstract]"):
+                mask_end += ws_after_sep + len("[abstract]")
+            visible_texts_for_spacy[i] = (" " * mask_end) + vt[mask_end:]
+
     # Run spaCy only on visible text (encoder-visible window only)
     docs_spacy = None
     if unit != "encoder_token":
-        docs_spacy = list(NLP.pipe(visible_texts, batch_size=SPACY_PIPE_BATCH_SIZE))
+        docs_spacy = list(NLP.pipe(visible_texts_for_spacy, batch_size=SPACY_PIPE_BATCH_SIZE))
 
     all_span_embeddings = []
     if unit == "encoder_token":
@@ -1619,7 +1816,15 @@ def process_doc_batch(doc_texts: List[str],
                 if tid in sp_set:
                     continue
                 tok_str = token_strs[tok_idx]
+                # Minimal filter: drop pure-punctuation / whitespace pieces only.
+                # encoder_token is a subword-level unit; further word-level filtering
+                # (stopwords, generic heads, length>=3) would damage subword coverage.
+                tok_core = tok_str.replace("##", "").replace("▁", "").replace("Ġ", "").strip()
+                if not tok_core or not re.search(r"[A-Za-z0-9]", tok_core):
+                    continue
                 tok_canonical = canonicalize_span_text(tok_str)
+                if not tok_canonical:
+                    tok_canonical = tok_core.lower()
                 pool_plan.append((i, tok_idx, tok_str, tok_canonical))
 
         if pool_plan:
@@ -1696,140 +1901,8 @@ def process_doc_batch(doc_texts: List[str],
                     chunk_start <= tok_start and tok_end <= chunk_end
                     for chunk_start, chunk_end, _ in noun_chunk_spans
                 )
-                if not token_in_chunk and filter_span_quality(tok.text, standalone_token=True):
+                if not token_in_chunk and filter_span_quality(tok.text, standalone_token=True, section=section):
                     char_spans.append((tok_start, tok_end, tok.text))
-        elif unit == "spacy_sentence":
-            # For abstract section, split by model's separator first (e.g. [SEP], </s>), then process title and abstract separately
-            sep_str = get_encoder_sep_for_model("", tokenizer)
-            if section == "abstract" and sep_str.strip() and sep_str in vis_text:
-                sep_pos = vis_text.find(sep_str)
-                if sep_pos >= 0:
-                    # Extract title part (before separator)
-                    title_part_raw = vis_text[:sep_pos]
-                    title_part = title_part_raw.strip()
-                    
-                    # Extract abstract part (after separator, keep [abstract] token if present)
-                    after_sep = vis_text[sep_pos + len(sep_str):]
-                    abstract_part = after_sep.strip()
-                    abstract_content_start = sep_pos + len(sep_str)
-                    # Skip leading whitespace
-                    leading_ws_len = len(after_sep) - len(after_sep.lstrip())
-                    abstract_content_start += leading_ws_len
-                    
-                    sentences_found = False
-                    
-                    # Process title part
-                    if title_part:
-                        title_doc = NLP(title_part)
-                        # Calculate offset: find where title content actually starts in vis_text
-                        title_text_start_in_vis = len(title_part_raw) - len(title_part.lstrip())
-                        
-                        for sent in title_doc.sents:
-                            t = sent.text.strip()
-                            if not t or len(t) < 3:
-                                continue
-                            # Skip special token patterns
-                            if re.match(r'^\[.*\]\s*$', t) or re.match(r'^\[.*\]\s*\[.*\]\s*$', t):
-                                continue
-                            # Adjust offset: sent.start_char is relative to title_part, add title_text_start_in_vis
-                            sent_start = title_text_start_in_vis + sent.start_char
-                            sent_end = title_text_start_in_vis + sent.end_char
-                            char_spans.append((sent_start, sent_end, t))
-                            sentences_found = True
-                    
-                    # Process abstract part (includes [abstract] token if present); drop short trailing sentence if truncated
-                    if abstract_part:
-                        abstract_doc = NLP(abstract_part)
-                        abs_sents = []
-                        for sent in abstract_doc.sents:
-                            t = sent.text.strip()
-                            if not t:
-                                continue
-                            if len(t) < 3 and t != "[abstract]":
-                                continue
-                            if t != "[abstract]" and (re.match(r'^\[.*\]\s*$', t) or re.match(r'^\[.*\]\s*\[.*\]\s*$', t)):
-                                continue
-                            abs_sents.append((abstract_content_start + sent.start_char, abstract_content_start + sent.end_char, t))
-                        if len(abs_sents) > 1 and abs_sents[-1][2]:
-                            if _should_drop_trailing_sentence(abs_sents[-1][2]):
-                                abs_sents = abs_sents[:-1]
-                        for sent_start, sent_end, t in abs_sents:
-                            char_spans.append((sent_start, sent_end, t))
-                            sentences_found = True
-                else:
-                    # Fallback: if separator not found, collect sents and drop short trailing
-                    sentences_found = False
-                    sents_list = [
-                        (s.start_char, s.end_char, s.text.strip())
-                        for s in doc_spacy.sents
-                        if s.text.strip() and len(s.text.strip()) >= 3
-                        and not re.match(r"^\[.*\]\s*$", s.text.strip())
-                        and not re.match(r"^\[.*\]\s*\[.*\]\s*$", s.text.strip())
-                    ]
-                    if len(sents_list) > 1 and sents_list[-1][2]:
-                        if _should_drop_trailing_sentence(sents_list[-1][2]):
-                            sents_list = sents_list[:-1]
-                    for start, end, t in sents_list:
-                        char_spans.append((start, end, t))
-                        sentences_found = True
-            else:
-                # For non-abstract: claim gets number-merge + trailing drop; invention just normal sents + optional trailing drop
-                sentences_found = False
-                if section == "claim":
-                    # Claim only: collect sents, merge "1.", "2." with next sentence, drop short trailing
-                    sents_list = list(doc_spacy.sents)
-                    merged = []
-                    j = 0
-                    while j < len(sents_list):
-                        t = sents_list[j].text.strip()
-                        if re.match(r"^\d+\.\s*$", t) and j + 1 < len(sents_list):
-                            merged.append((
-                                sents_list[j].start_char,
-                                sents_list[j + 1].end_char,
-                                sents_list[j].text + " " + sents_list[j + 1].text.strip()
-                            ))
-                            j += 2
-                        else:
-                            if t and len(t) >= 3 and not re.match(r"^\[.*\]\s*$", t) and not re.match(r"^\[.*\]\s*\[.*\]\s*$", t):
-                                merged.append((sents_list[j].start_char, sents_list[j].end_char, t))
-                            j += 1
-                    if len(merged) > 1 and merged[-1][2]:
-                        if _should_drop_trailing_sentence(merged[-1][2]):
-                            merged = merged[:-1]
-                    for start, end, t in merged:
-                        if t:
-                            char_spans.append((start, end, t))
-                            sentences_found = True
-                else:
-                    # Invention (and any other non-abstract): sentence iteration, strip leading all-caps header, drop short trailing
-                    sents_list = []
-                    for s in doc_spacy.sents:
-                        t = s.text.strip()
-                        if not t or len(t) < 3:
-                            continue
-                        if re.match(r"^\[.*\]\s*$", t) or re.match(r"^\[.*\]\s*\[.*\]\s*$", t):
-                            continue
-                        # Strip leading all-caps run (e.g. "BACKGROUND OF THE INVENTION ") so only content remains
-                        stripped, skip_in_t = _strip_leading_uppercase_run(t)
-                        if not stripped or len(stripped) < 3:
-                            continue
-                        leading_ws = len(s.text) - len(s.text.lstrip())
-                        new_start = s.start_char + leading_ws + skip_in_t
-                        sents_list.append((new_start, s.end_char, stripped))
-                    if len(sents_list) > 1 and sents_list[-1][2]:
-                        if _should_drop_trailing_sentence(sents_list[-1][2]):
-                            sents_list = sents_list[:-1]
-                    for start, end, t in sents_list:
-                        if t:
-                            char_spans.append((start, end, t))
-                            sentences_found = True
-            
-            # Debug: if no sentences found but vis_text exists, it might be too short or only special tokens
-            # This is expected for some documents where truncation leaves only special tokens
-            if not sentences_found and vis_text and len(vis_text.strip()) > 0:
-                # vis_text exists but no sentences found - this is okay, we'll just have CLS token
-                pass
-
         elif unit == "noun_chunk":
             for chunk in doc_spacy.noun_chunks:
                 t = _strip_claim_number_prefix(chunk.text.strip(), section).strip()
@@ -1845,6 +1918,20 @@ def process_doc_batch(doc_texts: List[str],
         else:
             raise ValueError(f"Unknown unit: {unit}")
 
+        # For invention text, drop spans inside prior-art / citation sentences.
+        if section == "invention" and char_spans:
+            citation_ranges = _citation_sentence_ranges(doc_spacy)
+            if citation_ranges:
+                char_spans = [
+                    (cs, ce, t) for (cs, ce, t) in char_spans
+                    if not any(rs <= cs and ce <= re_ for (rs, re_) in citation_ranges)
+                ]
+
+        # Inject title span (single span for the whole abstract title) before mapping to tokens.
+        # Title is intentionally not produced by spaCy (see masking above).
+        if i in title_span_per_doc:
+            char_spans.insert(0, title_span_per_doc[i])
+
         spans = extract_char_spans_to_token_spans(
             char_spans=char_spans,
             prefix_len=0,
@@ -1858,15 +1945,10 @@ def process_doc_batch(doc_texts: List[str],
                 continue
 
             # Quality filtering: applied before appending → filtered spans never get embeddings (not just display).
-            # For spacy_sentence, we're more lenient - only filter if span is clearly invalid.
             if unit != "encoder_token":
-                if unit == "spacy_sentence":
-                    if len(span_text.strip()) < 3:
-                        continue
-                else:
-                    # spacy_token / noun_chunk: filter_span_quality drops section markers, header words, etc.
-                    if not filter_span_quality(span_text):
-                        continue
+                # spacy_token / noun_chunk: filter_span_quality drops section markers, header words, etc.
+                if not filter_span_quality(span_text, section=section):
+                    continue
 
             span_text_canonical = canonicalize_span_text(span_text)
             # Skip if canonical version is empty (all stopwords/punctuation)
@@ -1976,7 +2058,7 @@ def parse_embeddings_dir(dirname: str) -> dict:
     Example: bert-for-patents_spacy_token, paecter_encoder_token_fp16
 
     Returns dict with keys: model_name, unit, or None if parsing fails.
-    unit is one of: spacy_token, spacy_sentence, noun_chunk, encoder_token.
+    unit is one of: spacy_token, noun_chunk, encoder_token.
     """
     import os
     basename = os.path.basename(dirname)
@@ -1984,7 +2066,7 @@ def parse_embeddings_dir(dirname: str) -> dict:
     # Strip optional trailing _fp16 suffix
     clean = basename[:-len("_fp16")] if basename.endswith("_fp16") else basename
 
-    known_units = ["spacy_token", "spacy_sentence", "noun_chunk", "encoder_token"]
+    known_units = ["spacy_token", "noun_chunk", "encoder_token"]
     for unit in known_units:
         suffix = "_" + unit
         if clean.endswith(suffix):
@@ -2180,26 +2262,3 @@ def is_st_checkpoint(path: str) -> bool:
     """True if *path* is a local directory containing a SentenceTransformer checkpoint (modules.json)."""
     return os.path.isdir(path) and os.path.isfile(os.path.join(path, "modules.json"))
 
-
-def auto_batch_size(device, hidden_size: int = 768, min_bs: int = 4, max_bs: int = 256) -> int:
-    """Return a safe inference batch size scaled to GPU total memory.
-
-    Calibrated for transformer models at seq_len=512:
-      ~11 GB GPU  → 32, ~16 GB → 64, ~24 GB → 64, ~40 GB → 128, ~80 GB → 256.
-    Hidden-size scaling: larger models get proportionally smaller batches (sqrt scaling).
-    Falls back to 32 on CPU or if GPU info is unavailable.
-    """
-    if not torch.cuda.is_available():
-        return 32
-    try:
-        dev_idx = device.index if (hasattr(device, "index") and device.index is not None) else 0
-        total_gb = torch.cuda.get_device_properties(dev_idx).total_memory / (1024 ** 3)
-        bs_float = 64.0 * (total_gb / 16.0) * (768.0 / max(hidden_size, 1)) ** 0.5
-        p2 = min_bs
-        while p2 * 2 <= int(bs_float):
-            p2 *= 2
-        result = max(min_bs, min(max_bs, p2))
-        print(f"  [auto batch_size] GPU total={total_gb:.1f} GB, hidden={hidden_size} → batch_size={result}", flush=True)
-        return result
-    except Exception:
-        return 32
