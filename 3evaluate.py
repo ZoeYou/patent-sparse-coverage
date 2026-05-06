@@ -152,10 +152,12 @@ def _clefip_two_stage_rerank(
         topk_docs:              number of top documents to keep after Stage 1 (default 100).
 
     Returns:
-        (reranked_list, doc_ranking_list):
-          reranked_list:    per-query list of passage_ids (all passages from top-K docs, sorted by score).
-          doc_ranking_list: per-query list of doc_ids from Stage 1 dedup (up to topk_docs unique docs,
-                            in order of first passage occurrence). Used for document-level metrics.
+        (reranked_list, doc_ranking_list, full_doc_ranking_list):
+          reranked_list:         per-query list of passage_ids (all passages from top-K docs, sorted by score).
+          doc_ranking_list:      per-query list of doc_ids from Stage 1 dedup, truncated to topk_docs.
+                                 Used for @k document metrics (PRES@100, recall@100, NDCG@10).
+          full_doc_ranking_list: per-query list of doc_ids from Stage 1 dedup, NOT truncated
+                                 (all docs touched by any scored passage). Used for untruncated map_doc.
     """
     # Pre-build passage_id -> doc_id mapping and doc_id -> set(passage_ids)
     pid_to_doc = {}
@@ -167,20 +169,21 @@ def _clefip_two_stage_rerank(
 
     reranked_list = []
     doc_ranking_list = []
+    full_doc_ranking_list = []
     for q_idx in range(len(passage_scores_list)):
         scores = passage_scores_list[q_idx]
 
-        # Stage 1: rank passages by score desc, derive document ranking (first-occurrence dedup)
+        # Stage 1: rank passages by score desc, derive full document ranking (first-occurrence dedup)
         ranked_pids = sorted(scores.keys(), key=lambda pid: scores[pid], reverse=True)
         seen_docs = set()
-        top_docs = []
+        full_docs = []
         for pid in ranked_pids:
             doc_id = pid_to_doc.get(pid, pid.split("::", 1)[0] if "::" in pid else pid)
             if doc_id not in seen_docs:
                 seen_docs.add(doc_id)
-                top_docs.append(doc_id)
-                if len(top_docs) >= topk_docs:
-                    break
+                full_docs.append(doc_id)
+        full_doc_ranking_list.append(full_docs)
+        top_docs = full_docs[:topk_docs]
         doc_ranking_list.append(top_docs)
 
         # Stage 2: collect ALL passages from those top-K documents, re-rank by score
@@ -192,7 +195,7 @@ def _clefip_two_stage_rerank(
         scored_candidates.sort(key=lambda x: -x[1])
         reranked_list.append([pid for pid, _ in scored_candidates])
 
-    return reranked_list, doc_ranking_list
+    return reranked_list, doc_ranking_list, full_doc_ranking_list
 
 
 def clefip_passage_evaluation(
@@ -209,7 +212,7 @@ def clefip_passage_evaluation(
     Evaluate CLEF-IP claims-to-passages: rank passages per query and compute metrics.
     qrels_passage_ids: dict topic_id -> list of relevant passage_ids (subset of passage_ids).
     Official CLEF-IP metrics: document-level PRES@100 (pres_doc@100), passage-level MAgP (magp),
-    plus recall@k, NDCG@k, MRR, MAP, pres@100 (passage-level).
+    plus passage-level recall@100 / NDCG@10 and document-level recall@100 / NDCG@10 / MAP.
 
     Two-stage retrieval is always applied:
       Stage 1: passage rank → document dedup → top-K documents.
@@ -240,7 +243,7 @@ def clefip_passage_evaluation(
         {passage_ids[j]: float(sim[q_idx, j]) for j in range(sim.shape[1])}
         for q_idx in range(len(query_ids))
     ]
-    predicted_labels_list, doc_ranking_list = _clefip_two_stage_rerank(
+    predicted_labels_list, doc_ranking_list, full_doc_ranking_list = _clefip_two_stage_rerank(
         passage_ids, passage_scores_list, topk_docs=topk_docs,
     )
     print(f"  🔄 Two-stage retrieval: top-{topk_docs} docs → re-ranked passages per query")
@@ -249,6 +252,7 @@ def clefip_passage_evaluation(
         "Passage retrieval",
         two_stage=True, topk_docs=topk_docs,
         doc_ranking_list=doc_ranking_list,
+        full_doc_ranking_list=full_doc_ranking_list,
     )
     return results
 
@@ -863,6 +867,7 @@ def _make_clefip_official_metrics(
     true_labels_list: list,
     predicted_labels_list: list,
     doc_ranking_list: list,
+    full_doc_ranking_list: list = None,
 ) -> dict:
     """
     CLEF-IP metrics: passage-level + document-level.
@@ -876,17 +881,17 @@ def _make_clefip_official_metrics(
       - pres_doc@100   — official CLEF-IP document PRES.
       - recall_doc@100 — document recall.
       - ndcg_doc@10    — top-of-list document ranking quality.
-      - map_doc        — document-level MAP.
+      - map_doc        — untruncated document-level MAP (uses full_doc_ranking_list).
 
-    *doc_ranking_list* is the Stage-1 document ranking from two-stage retrieval and
-    is required: all callers compute it via _clefip_two_stage_rerank.
+    *doc_ranking_list* (truncated to topk_docs) drives the @k document metrics.
+    *full_doc_ranking_list* (untruncated Stage-1 dedup ranking) drives untruncated map_doc;
+    if not provided, falls back to doc_ranking_list (yielding truncated MAP).
     """
     # Passage-level
-    _passage_k = max((len(p) for p in predicted_labels_list), default=100)
     metrics = {
         "recall@100": mean_recall_at_k(true_labels_list, predicted_labels_list, k=100),
         "ndcg@10": mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=10),
-        "magp": _clefip_mean_agp_passage(true_labels_list, predicted_labels_list, k=_passage_k),
+        "magp": _clefip_mean_agp_passage(true_labels_list, predicted_labels_list, k=None),
     }
     # Document-level
     true_doc_ids_list = [
@@ -896,7 +901,8 @@ def _make_clefip_official_metrics(
     metrics["pres_doc@100"] = mean_pres_at_k(true_doc_ids_list, doc_ranking_list, k=100, N_max=100)
     metrics["recall_doc@100"] = mean_recall_at_k(true_doc_ids_list, doc_ranking_list, k=100)
     metrics["ndcg_doc@10"] = mean_ndcg_at_k(true_doc_ids_list, doc_ranking_list, k=10)
-    metrics["map_doc"] = mean_average_precision(true_doc_ids_list, doc_ranking_list, k=100)
+    _map_ranking = full_doc_ranking_list if full_doc_ranking_list is not None else doc_ranking_list
+    metrics["map_doc"] = mean_average_precision(true_doc_ids_list, _map_ranking, k=None)
     return metrics
 
 
@@ -910,16 +916,18 @@ def _evaluate_and_print_clefip(
     topk_docs: int = 100,
     header_extra: str = "",
     doc_ranking_list: list,
+    full_doc_ranking_list: list = None,
 ) -> dict:
     """Evaluate CLEF-IP passage retrieval: compute metrics and print results.
 
-    *doc_ranking_list* is the Stage-1 document ranking from two-stage retrieval,
-    used directly for document-level metrics.
+    *doc_ranking_list* is the Stage-1 truncated document ranking (used for @k metrics).
+    *full_doc_ranking_list* is the untruncated Stage-1 ranking (used for untruncated map_doc).
     """
     true_labels_list = [qrels.get(qid, []) for qid in query_ids]
     results = _make_clefip_official_metrics(
         true_labels_list, predicted_labels_list,
         doc_ranking_list=doc_ranking_list,
+        full_doc_ranking_list=full_doc_ranking_list,
     )
     label_suffix = f" (two-stage top-{topk_docs} docs)" if two_stage else ""
     print_subsection_header(f"CLEF-IP 2013 EN claims-to-passages{header_extra}{label_suffix}")
@@ -1369,7 +1377,7 @@ def _dense_passage_eval(args, query_ids, query_texts, passage_ids, corpus_jsonl_
             query_texts_fmt, passage_ids, passage_emb, _q_encode_fn, dense_tokenizer,
             query_max_chunks=qmc, batch_size=32,
         )
-        predicted_labels_list, doc_ranking_list = _clefip_two_stage_rerank(
+        predicted_labels_list, doc_ranking_list, full_doc_ranking_list = _clefip_two_stage_rerank(
             passage_ids, passage_scores_list, topk_docs=topk_docs,
         )
         print(f"  🔄 Two-stage retrieval: top-{topk_docs} docs → re-ranked passages per query")
@@ -1378,6 +1386,7 @@ def _dense_passage_eval(args, query_ids, query_texts, passage_ids, corpus_jsonl_
             "Dense Chunk+MaxSim passage retrieval",
             two_stage=True, topk_docs=topk_docs,
             doc_ranking_list=doc_ranking_list,
+            full_doc_ranking_list=full_doc_ranking_list,
         )
     else:
         clefip_passage_evaluation(
@@ -1429,7 +1438,7 @@ def _run_clefip_eval_full_corpus(
                             qrels_passage_ids, topk_docs, device, model_name)
         return
 
-    predicted_labels_list, doc_ranking_list = _clefip_two_stage_rerank(
+    predicted_labels_list, doc_ranking_list, full_doc_ranking_list = _clefip_two_stage_rerank(
         passage_ids, passage_scores_list, topk_docs=topk_docs,
     )
     print(f"  🔄 Two-stage retrieval: top-{topk_docs} docs → re-ranked passages per query")
@@ -1438,6 +1447,7 @@ def _run_clefip_eval_full_corpus(
         label,
         two_stage=True, topk_docs=topk_docs, header_extra=header_extra,
         doc_ranking_list=doc_ranking_list,
+        full_doc_ranking_list=full_doc_ranking_list,
     )
 
 
@@ -1711,12 +1721,10 @@ def run_sparse_coverage(args):
         else:
             spacy_name = f"en_core_web_{args.spacy_model}"
         disable = ["ner", "textcat", "lemmatizer"]
-        nlp = spacy.load(spacy_name, disable=disable)
-        nlp.max_length = 1_000_000
-        utils.NLP = nlp
+        utils.NLP = spacy.load(spacy_name, disable=disable)
+        utils.NLP.max_length = 1_000_000
         print(f"   SpaCy model: {spacy_name}")
     else:
-        nlp = None
         utils.NLP = None
 
     # Load dense encoder model
@@ -1847,7 +1855,6 @@ def run_sparse_coverage(args):
 
         chunks: list[str] = []
         current_chunk = ""
-        current_tokens = 0
         for sent in sents:
             if not sent.strip():
                 continue
@@ -1855,13 +1862,11 @@ def run_sparse_coverage(args):
             n = len(tokenizer.encode(candidate, add_special_tokens=True))
             if n <= max_tokens:
                 current_chunk = candidate
-                current_tokens = n
             else:
                 if current_chunk:
                     chunks.append(current_chunk)
                 # Start new chunk with this sentence
                 current_chunk = sent
-                current_tokens = len(tokenizer.encode(sent, add_special_tokens=True))
                 # If a single sentence exceeds max_tokens, it will be truncated
                 # by the encoder anyway — just keep it as one chunk.
         if current_chunk:
@@ -1910,7 +1915,7 @@ def run_sparse_coverage(args):
                 sections=sections_list[batch_start:batch_end],
             )
 
-            for doc_id, _section, _doc_text, _span_text_raw, _span_text_canonical, span_emb in batch_results:
+            for doc_id, _, _, _span_text_raw, _span_text_canonical, span_emb in batch_results:
                 if query_exclude_cls:
                     t = (_span_text_canonical or "").strip().lower()
                     r = (_span_text_raw or "").strip()
@@ -2183,7 +2188,7 @@ def run_sparse_coverage(args):
                         doc_ids=sec_ids[b_start:b_end],
                         sections=sec_sections[b_start:b_end],
                     )
-                    for doc_id, _sec, _dtxt, span_raw, span_canon, emb in results:
+                    for doc_id, _, _, span_raw, span_canon, emb in results:
                         raw_f.write(emb.astype(np.float32).tobytes())
                         span_count += 1
                         is_cls = (span_canon or "").strip().lower() == "cls" or (span_raw or "").strip() == "[CLS]"
@@ -2258,7 +2263,7 @@ def run_sparse_coverage(args):
     print(f"   Search directory: {os.path.abspath('.')}")
 
     try:
-        centers_path, _centers_dir = find_centers(
+        centers_path, _ = find_centers(
             dense_model=args.dense_model,
             tokenization_unit=args.tokenization_unit,
             search_dir=".",
@@ -2326,15 +2331,11 @@ def run_sparse_coverage(args):
         query_section = "claim"
 
         # ---- Obtain doc-side embeddings + span_to_doc mapping ----
-        # Priority: 1) cached runtime embeddings, 2) encode at runtime
-        # For cached case, we use LAZY loading: metadata + shapes only,
-        # actual embeddings loaded one section at a time during posting-list build.
+        # Cache-first path: load metadata + shapes, and mmap each section on demand.
         exclude_cls_spans = getattr(args, "exclude_cls_spans", False)
-        embeddings_by_section: dict[str, np.ndarray] = {}
         span_to_doc: dict[int, str] = {}
         exclude_cls_span_indices: set[int] = set()
         total_loaded = 0
-        _lazy_cache_dir = None  # type: str | None  # set when using lazy loading path
 
         cache_dir = _doc_cache_dir(mode)
         _runtime_sentinel = os.path.join(cache_dir, "format_title_in_abstract.txt")
@@ -2349,7 +2350,6 @@ def run_sparse_coverage(args):
                 n = _get_section_shape(cache_dir, sec)
                 section_shapes[sec] = n
                 total_loaded += n
-            _lazy_cache_dir = cache_dir
             print(f"   Loaded metadata ({len(span_to_doc):,} spans) from cache (lazy mode — arrays loaded per-section)")
             for sec in doc_sections:
                 print(f"   {sec}: {section_shapes[sec]:,} spans")
@@ -2360,9 +2360,7 @@ def run_sparse_coverage(args):
                 doc_sections, cache_dir=cache_dir, batch_size=32,
                 passage_titles_list=_clefip_data.get("passage_titles"),
             )
-            # Use lazy path for the just-written cache
             span_to_doc, exclude_cls_span_indices = _load_doc_cache_meta(cache_dir)
-            _lazy_cache_dir = cache_dir
 
         if exclude_cls_spans:
             print(f"   Excluding {len(exclude_cls_span_indices):,} CLS spans")
@@ -2402,11 +2400,7 @@ def run_sparse_coverage(args):
             posting_lists = [[] for _ in range(V)]
             span_offset = 0
             for section_name in doc_sections:
-                # Lazy load: load one section at a time to avoid holding all in memory
-                if _lazy_cache_dir is not None:
-                    _raw = _load_section_emb(_lazy_cache_dir, section_name)
-                else:
-                    _raw = embeddings_by_section[section_name]
+                _raw = _load_section_emb(cache_dir, section_name)
                 if _raw.shape[0] == 0:
                     continue
                 if _raw.shape[1] != d:
@@ -2461,11 +2455,7 @@ def run_sparse_coverage(args):
             posting_lists = [[] for _ in range(V)]
             span_offset = 0
             for section_name in doc_sections:
-                # Lazy load: load one section at a time to avoid holding all in memory
-                if _lazy_cache_dir is not None:
-                    _raw = _load_section_emb(_lazy_cache_dir, section_name)
-                else:
-                    _raw = embeddings_by_section[section_name]
+                _raw = _load_section_emb(cache_dir, section_name)
                 if _raw.shape[0] == 0:
                     span_offset += 0
                     continue
@@ -2480,7 +2470,6 @@ def run_sparse_coverage(args):
                     b_end = min(b_start + batch_size, sec_emb_n.shape[0])
                     batch = sec_emb_n[b_start:b_end]
                     D_batch, I_batch = center_index.search(batch, K_search)
-                    n_batch = batch.shape[0]
 
                     # --- Vectorized filtering ---
                     # 1. Clamp negative center IDs to 0 (will be masked out)
@@ -2642,7 +2631,6 @@ def run_sparse_coverage(args):
         if q_opts:
             print(f"   Query opts: {', '.join(q_opts)}")
         print(f"🔍 Retrieving documents...")
-        top_k = 100
         _retrieval_top_k = len(_clefip_data["passage_ids"])
         _result = _score_queries_against_postings(
             query_sparse, doc_postings, idf, idf_exponent, _retrieval_top_k,
@@ -2651,10 +2639,10 @@ def run_sparse_coverage(args):
             doc_nspans=doc_nspans,
             return_scores=True,
         )
-        top_indices, _sparse_score_dicts = _result
+        _, _sparse_score_dicts = _result
 
         if mode == "clefip_passage":
-            # CLEF-IP passage-level evaluation: retrieve passage_ids, use CLEF-IP official metrics
+            # CLEF-IP evaluation: retrieve passage_ids, use CLEF-IP official metrics
             _clefip_pid_list = _clefip_data["passage_ids"]
             _clefip_qids = _clefip_data["query_ids"]
             _clefip_qrels = _clefip_data["qrels_passage_ids"]
@@ -2670,7 +2658,7 @@ def run_sparse_coverage(args):
                 else:
                     pscores = {}
                 all_passage_scores_list.append(pscores)
-            predicted_labels_list, doc_ranking_list = _clefip_two_stage_rerank(
+            predicted_labels_list, doc_ranking_list, full_doc_ranking_list = _clefip_two_stage_rerank(
                 _clefip_pid_list, all_passage_scores_list,
                 topk_docs=topk_docs,
             )
@@ -2681,6 +2669,7 @@ def run_sparse_coverage(args):
                 "Sparse Coverage (CLEF-IP)",
                 two_stage=True, topk_docs=topk_docs,
                 doc_ranking_list=doc_ranking_list,
+                full_doc_ranking_list=full_doc_ranking_list,
             )
 
             # ---- CLEF-IP Robustness Test: varying negative pool sizes ----
@@ -2694,7 +2683,7 @@ def run_sparse_coverage(args):
 
                 # Relevant doc_ids (must always be included)
                 _rel_doc_ids = set()
-                for _qid_r, _rel_pids in _clefip_qrels.items():
+                for _rel_pids in _clefip_qrels.values():
                     for _rpid in _rel_pids:
                         _rel_doc_ids.add(_clefip_passage_id_to_doc_id(_rpid))
                 _neg_doc_ids_sorted = sorted([d for d in _all_doc_ids_sorted if d not in _rel_doc_ids])
@@ -2754,7 +2743,7 @@ def run_sparse_coverage(args):
                         show_progress=False,
                         return_scores=True,
                     )
-                    _top_indices_f, _sparse_score_dicts_f = _result_f
+                    _, _sparse_score_dicts_f = _result_f
 
                     # Build per-query passage score dicts for two-stage reranking
                     _allowed_pid_list = [pid for pi, pid in enumerate(_clefip_pid_list) if pi in _allowed_pidx]
@@ -2766,13 +2755,14 @@ def run_sparse_coverage(args):
                         else:
                             _pscores_f = {}
                         _passage_scores_f.append(_pscores_f)
-                    _pred_f, _doc_ranking_f = _clefip_two_stage_rerank(
+                    _pred_f, _doc_ranking_f, _full_doc_ranking_f = _clefip_two_stage_rerank(
                         _allowed_pid_list, _passage_scores_f, topk_docs=topk_docs,
                     )
 
                     _true_f = [_clefip_qrels.get(qid, []) for qid in _clefip_qids]
                     _res_f = _make_clefip_official_metrics(_true_f, _pred_f,
-                                                          doc_ranking_list=_doc_ranking_f)
+                                                          doc_ranking_list=_doc_ranking_f,
+                                                          full_doc_ranking_list=_full_doc_ranking_f)
                     _robustness_results.append((_n_docs_f, _n_passages_f, _res_f))
                     print(f"   {_n_docs_f:>6} docs ({_n_passages_f:>8,} passages): "
                           f"recall@100={_res_f.get('recall@100', 0):.4f}  "
@@ -2802,8 +2792,8 @@ def run_sparse_coverage(args):
         print(f"\n✅ Task {mode} evaluation completed")
 
         # Free large objects before next mode to avoid peak memory overlap
-        del embeddings_by_section, span_to_doc, exclude_cls_span_indices
-        del posting_lists, doc_postings, top_indices, query_sparse
+        del span_to_doc, exclude_cls_span_indices
+        del posting_lists, doc_postings, query_sparse
         gc.collect()
 
     print(f"\n✅ Sparse Coverage evaluation completed for all available tasks")
