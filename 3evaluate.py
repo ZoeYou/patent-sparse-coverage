@@ -16,8 +16,15 @@ import sys
 import re
 import gc
 import json
+import time
+import hashlib
 import argparse
 import logging
+import contextlib
+try:
+    import fcntl  # POSIX only; used for cross-process flock on the centers_search cache
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None
 from collections import defaultdict
 from typing import Optional
 
@@ -57,6 +64,7 @@ try:
         mean_ndcg_at_k,
         mean_average_precision,
         mean_pres_at_k,
+        mean_mrr_at_k,
     )
     print("Successfully imported patenteval.utils")
 except ImportError as e:
@@ -78,11 +86,9 @@ from utils import (
     mean_pooling,
     cls_pooling,
     get_encoder_format_scheme,
-    get_encoder_sep_for_model,
     format_abstract_for_encoder,
     format_claim_for_encoder,
     format_invention_for_encoder,
-    collect_doc_texts,
     find_centers,
     hash_query_texts as _hash_query_texts,
     sparse_to_csr as _sparse_to_csr,
@@ -212,7 +218,7 @@ def clefip_passage_evaluation(
     Evaluate CLEF-IP claims-to-passages: rank passages per query and compute metrics.
     qrels_passage_ids: dict topic_id -> list of relevant passage_ids (subset of passage_ids).
     Official CLEF-IP metrics: document-level PRES@100 (pres_doc@100), passage-level MAgP (magp),
-    plus passage-level recall@100 / NDCG@10 and document-level recall@100 / NDCG@10 / MAP.
+    plus passage-level recall_passage@1000 and document-level recall@100 / NDCG@10 / MAP.
 
     Two-stage retrieval is always applied:
       Stage 1: passage rank → document dedup → top-K documents.
@@ -872,16 +878,16 @@ def _make_clefip_official_metrics(
     """
     CLEF-IP metrics: passage-level + document-level.
 
-    Passage-level (3):
-      - magp        — MAP(D), official CLEF-IP hierarchical per-document AP (Piroi et al. 2012).
-      - recall@100  — standard passage recall.
-      - ndcg@10     — top-of-list ranking quality.
+        Passage-level (2):
+            - magp                 — MAP(D), official CLEF-IP hierarchical per-document AP (Piroi et al. 2012).
+            - recall_passage@1000  — passage recall at depth 1000.
 
-    Document-level (4):
+    Document-level (5):
       - pres_doc@100   — official CLEF-IP document PRES.
       - recall_doc@100 — document recall.
       - ndcg_doc@10    — top-of-list document ranking quality.
       - map_doc        — untruncated document-level MAP (uses full_doc_ranking_list).
+      - mrr_doc        — untruncated document-level MRR (rank of first relevant doc).
 
     *doc_ranking_list* (truncated to topk_docs) drives the @k document metrics.
     *full_doc_ranking_list* (untruncated Stage-1 dedup ranking) drives untruncated map_doc;
@@ -889,8 +895,7 @@ def _make_clefip_official_metrics(
     """
     # Passage-level
     metrics = {
-        "recall@100": mean_recall_at_k(true_labels_list, predicted_labels_list, k=100),
-        "ndcg@10": mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=10),
+        "recall_passage@1000": mean_recall_at_k(true_labels_list, predicted_labels_list, k=1000),
         "magp": _clefip_mean_agp_passage(true_labels_list, predicted_labels_list, k=None),
     }
     # Document-level
@@ -903,6 +908,8 @@ def _make_clefip_official_metrics(
     metrics["ndcg_doc@10"] = mean_ndcg_at_k(true_doc_ids_list, doc_ranking_list, k=10)
     _map_ranking = full_doc_ranking_list if full_doc_ranking_list is not None else doc_ranking_list
     metrics["map_doc"] = mean_average_precision(true_doc_ids_list, _map_ranking, k=None)
+    _mrr_k = max((len(r) for r in _map_ranking), default=1) or 1
+    metrics["mrr_doc"] = mean_mrr_at_k(true_doc_ids_list, _map_ranking, k=_mrr_k)
     return metrics
 
 
@@ -1103,7 +1110,7 @@ def _splade_passage_scores(args, query_ids, query_texts, passage_ids, corpus_jso
     if not cache_hit:
         from sentence_transformers import SparseEncoder
         splade_model = SparseEncoder(actual_model_name)
-        encode_bs = _auto_batch_size(device=device, hidden_size=768)
+        encode_bs = _auto_batch_size(device=device, hidden_size=768, vocab_size=30522)
 
         if Q is None:
             if _use_chunk:
@@ -1168,11 +1175,9 @@ def _colbert_passage_scores(args, query_ids, query_texts, passage_ids, corpus_js
         return None
 
     _model_clean, _sample_tag, _sample_sz = _clefip_cache_id(args)
-    _ncells = getattr(args, "colbert_ncells", 0) or 0
     _kmeans = getattr(args, "colbert_kmeans_niters", 4)
-    _nc_str = f"_nc{_ncells}" if _ncells > 0 else ""
     _ki_str = f"_ki{_kmeans}" if _kmeans != 20 else ""
-    _index_name = f"{_model_clean}_s{_sample_tag}_nbits2{_nc_str}{_ki_str}"
+    _index_name = f"{_model_clean}_s{_sample_tag}_nbits2{_ki_str}"
 
     plaid_root = os.path.join("temp", "clefip_colbert_plaid")
     experiment = "clefip"
@@ -1199,11 +1204,10 @@ def _colbert_passage_scores(args, query_ids, query_texts, passage_ids, corpus_js
         print(f"   This encodes all {len(passage_ids):,} passages with ColBERTv2 + residual compression (nbits=2).")
         with Run().context(RunConfig(nranks=1, experiment=experiment)):
             q_maxlen = getattr(args, "colbert_query_maxlen", 512)
-            kw = dict(nbits=2, doc_maxlen=512, query_maxlen=q_maxlen, root=plaid_root, kmeans_niters=_kmeans)
-            if _ncells > 0:
-                kw["ncells"] = _ncells
+            kw = dict(nbits=2, doc_maxlen=512, query_maxlen=q_maxlen, root=plaid_root, kmeans_niters=_kmeans)            # Note: ncells in ColBERTConfig is a search-time probe parameter, not a build parameter.
+            # The number of k-means centroids is auto-computed by ColBERT from corpus size.
             cfg = _ColBERTConfig(**kw)
-            print(f"   PLAID config: ncells={'auto' if _ncells == 0 else _ncells}, kmeans_niters={_kmeans}")
+            print(f"   PLAID config: kmeans_niters={_kmeans} (centroids auto-computed from corpus size)")
             indexer = _ColBERTIndexer(checkpoint="colbert-ir/colbertv2.0", config=cfg)
             indexer.index(name=_index_name, collection=collection_tsv, overwrite="reuse")
         print(f"  ✅ PLAID index built: {index_path}")
@@ -1222,11 +1226,20 @@ def _colbert_passage_scores(args, query_ids, query_texts, passage_ids, corpus_js
 
     passage_scores_list = []
     with Run().context(RunConfig(nranks=1, experiment=experiment)):
-        cfg = _ColBERTConfig(root=plaid_root, query_maxlen=getattr(args, "colbert_query_maxlen", 512))
+        _ncells_search = getattr(args, "colbert_ncells_search", 4) or 4
+        _search_qmaxlen = getattr(args, "colbert_search_query_maxlen", 192) or 192
+        _cs_threshold = getattr(args, "colbert_centroid_score_threshold", 0.5)
+        _ndocs = getattr(args, "colbert_ndocs", 1024) or 1024
+        cfg = _ColBERTConfig(root=plaid_root, query_maxlen=_search_qmaxlen,
+                             ncells=_ncells_search,
+                             centroid_score_threshold=_cs_threshold,
+                             ndocs=_ndocs)
+        print(f"   PLAID search config: query_maxlen={_search_qmaxlen}, ncells={_ncells_search}, "
+              f"centroid_score_threshold={_cs_threshold}, ndocs={_ndocs}")
         searcher = _ColBERTSearcher(index=_index_name, config=cfg, collection=collection_tsv)
         for qtext in tqdm(query_texts, desc="ColBERT PLAID search"):
             if use_chunk:
-                chunks = _dense_chunk_text(qtext, None, max_tokens=512)
+                chunks = _dense_chunk_text(qtext, None, max_tokens=_search_qmaxlen)
                 if cb_qmc > 0 and len(chunks) > cb_qmc:
                     chunks = chunks[:cb_qmc]
                 merged = {}
@@ -1246,6 +1259,13 @@ def _colbert_passage_scores(args, query_ids, query_texts, passage_ids, corpus_js
                     if 0 <= pid_int < len(passage_ids)
                 })
 
+    # Report PLAID efficiency: dominant cost = ndocs passages receiving full MaxSim scoring per query.
+    # FLOPs = 2 × n_queries × ndocs  (lower bound; each MaxSim candidate counts as one comparison).
+    n_q_done = len(passage_scores_list)
+    total_flops_est = 2 * n_q_done * _ndocs
+    print(f"\n📊 Efficiency — ColBERT CLEF-IP passage (PLAID)")
+    print(f"   PLAID config: ncells={_ncells_search}, ndocs={_ndocs} (full MaxSim candidates/query), topk={plaid_topk}")
+    print(f"   FLOPs: total={total_flops_est:,}, mean per query={total_flops_est // n_q_done if n_q_done else 0:,} (2 × ndocs MaxSim candidates)")
     print(f"  ✅ PLAID search complete: {len(query_ids)} queries, top-{plaid_topk} per query")
     return passage_scores_list
 
@@ -1596,10 +1616,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--length_norm_exponent", type=float, default=0.5,
                        help="Exponent for length norm: divide by doc_span_count^exponent. "
                             "0.5 => sqrt (default). 0.8 => stronger penalization of long docs.")
-    parser.add_argument("--no_stop_centers", action="store_true",
-                       help="Disable stop centers: ignore the stop_centers list from centers.json and "
-                            "allow all centers (including high-df ones) for document/query assignment. "
-                            "For ablation: measures the effect of stop-center filtering.")
+    parser.add_argument("--stop_center_fraction", type=float, default=0.01,
+                       help="Fraction of top centers by doc-DF to disable for retrieval. "
+                           "Default: 0.01 (top 1%%). Computed from posting lists at eval time. "
+                           "Set <= 0 to disable stop-center suppression. "
+                           "NOTE: stop centers are applied AFTER the base sparse vectors cache, "
+                           "so changing this value reuses the cache.")
     parser.add_argument("--query_max_chunks", type=int, default=-1,
                        help="Max number of 512-token chunks per query for sparse_coverage. "
                             "-1 (default) = unlimited: always split long queries into as many 512-token chunks "
@@ -1613,9 +1635,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spacy_model", type=str, default="sci_lg",
                        choices=["sm", "md", "lg", "sci_sm", "sci_md", "sci_lg"],
                        help="SpaCy model for span tokenization (sparse_coverage). Default: sci_lg.")
-    parser.add_argument("--posting_list_batch_size", type=int, default=256,
-                       help="For doc soft: batch size for range_search when building posting lists. "
-                            "Larger = fewer FAISS calls, may use more memory. Default: 256.")
+    parser.add_argument("--centers_search_batch", type=int, default=4096,
+                       help="Batch size for FAISS search when building the centers_search cache. "
+                            "Larger = fewer calls, more VRAM/RAM per batch. Default: 4096.")
+    parser.add_argument("--centers_search_cache_K", type=int, default=16,
+                       help="K_max for the per-span FAISS-search cache (D, I). The cache is keyed on "
+                            "(centers_sig, embeddings_sig, section) and is reused across all sweeps "
+                            "that vary assignment K (hard / soft K=1..K_max), per-center thresholds, "
+                            "weight aggregation, IDF, normalization, stop-center selection, etc. "
+                            "Must be >= the largest assignment K any sweep will request "
+                            "(soft_assignment_max_centers_per_span). Default 16 covers all currently "
+                            "planned sweeps and keeps disk to ~n_spans * 16 * 8 bytes per section. "
+                            "Cache is auto-rebuilt to a larger K_max when a request exceeds the cached one; "
+                            "smaller requests reuse the larger cached file.")
+    parser.add_argument("--centers_search_cache_disable", action="store_true",
+                       help="Disable the per-span FAISS-search cache (always recompute, do not read/write disk).")
 
     parser.add_argument("--clefip_root", type=str, default="",
                        help="CLEF-IP data root (02_topics, qrels). Default: ./clefip2013. Use e.g. ./clefip2023 if your full download is there.")
@@ -1661,17 +1695,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--colbert_plaid_topk", type=int, default=1000,
                        help="Number of passages to retrieve per query with PLAID engine. "
                             "Default: 1000. Higher values give better recall but slower search.")
-    parser.add_argument("--colbert_ncells", type=int, default=16384,
-                       help="Number of centroids for PLAID k-means. Default: 16384 (2**14), "
-                           "a practical setting for large patent corpora. "
-                           "Use 65536 (2**16) for a higher-recall but heavier index.")
+    parser.add_argument("--colbert_ncells_search", type=int, default=4,
+                       help="Number of IVF cells to probe per query token at search time. "
+                            "Default: 4. Lower values use less GPU memory; higher values improve recall. "
+                            "PLAID's hierarchical clustering means even small values give strong recall.")
     parser.add_argument("--colbert_kmeans_niters", type=int, default=4,
                        help="Number of k-means iterations for PLAID index building. "
                             "ColBERT default is 20 but 4 is usually sufficient and 5x faster.")
     parser.add_argument("--colbert_query_maxlen", type=int, default=512,
-                       help="Maximum query token length for ColBERT. Default: 512. "
+                       help="Maximum query token length for ColBERT at INDEX BUILD TIME. Default: 512. "
                             "Original ColBERTv2 default is 32; patent claims are much longer, "
                             "so 512 (BERT max) is recommended. Shorter queries are padded with [MASK].")
+    parser.add_argument("--colbert_search_query_maxlen", type=int, default=192,
+                       help="Maximum query token length at SEARCH TIME (also used to chunk long queries). "
+                            "Default: 192. Lower values cut PLAID GPU memory dramatically (the strided "
+                            "tensor in score_pids scales linearly with this). Long queries are split into "
+                            "chunks of this size and scores are max-merged across chunks.")
+    parser.add_argument("--colbert_centroid_score_threshold", type=float, default=0.45,
+                       help="Min centroid score to keep a document during PLAID's first filter pass. "
+                            "Higher = aggressive pruning = less GPU memory. Default 0.45 "
+                            "(ColBERT's own default at k>100 is 0.4).")
+    parser.add_argument("--colbert_ndocs", type=int, default=8192,
+                       help="Cap on candidate document count after PLAID's first filter. "
+                            "Default 8192. Lower values reduce score_pids memory. "
+                            "ColBERT's default at k>100 is max(k*4, 4096), which can OOM on large corpora.")
 
     return parser
 
@@ -1835,6 +1882,422 @@ def run_sparse_coverage(args):
                 return False
         return os.path.exists(os.path.join(cache_dir, f"span_to_doc_{args.tokenization_unit}.jsonl"))
 
+    def _base_sparse_cache_paths(cache_dir: str, sig: str = "") -> tuple[str, str, str]:
+        suffix = f"_{sig}" if sig else ""
+        base = os.path.join(cache_dir, f"base_sparse_vectors{suffix}")
+        return (
+            f"{base}.meta.json",
+            f"{base}.doc.npz",
+            f"{base}.query.npz",
+        )
+
+    def _base_sparse_cache_sig(meta: dict) -> str:
+        return hashlib.sha1(json.dumps(meta, sort_keys=True).encode()).hexdigest()[:12]
+
+    def _hash_float_array(arr: np.ndarray) -> str:
+        return hashlib.sha1(np.asarray(arr, dtype=np.float32).tobytes()).hexdigest()
+
+    def _load_base_sparse_vectors(cache_dir: str, expected_meta: dict):
+        sig = _base_sparse_cache_sig(expected_meta)
+        meta_path, doc_npz_path, query_npz_path = _base_sparse_cache_paths(cache_dir, sig)
+        if not (os.path.exists(meta_path) and os.path.exists(doc_npz_path) and os.path.exists(query_npz_path)):
+            return None
+        try:
+            with open(meta_path, "r") as f:
+                got_meta = json.load(f)
+            if got_meta != expected_meta:
+                return None
+
+            doc_pack = np.load(doc_npz_path)
+            doc_indptr = doc_pack["indptr"].astype(np.int64, copy=False)
+            doc_idx = doc_pack["doc_idx"].astype(np.int32, copy=False)
+            doc_w = doc_pack["weight"].astype(np.float32, copy=False)
+            V_local = len(doc_indptr) - 1
+            doc_postings: list[list[tuple[int, float]]] = [[] for _ in range(V_local)]
+            for c in range(V_local):
+                s = int(doc_indptr[c])
+                e = int(doc_indptr[c + 1])
+                if e > s:
+                    doc_postings[c] = list(zip(doc_idx[s:e].astype(int).tolist(), doc_w[s:e].astype(float).tolist()))
+
+            q_pack = np.load(query_npz_path)
+            q_indptr = q_pack["indptr"].astype(np.int64, copy=False)
+            q_centers = q_pack["centers"].astype(np.int32, copy=False)
+            q_weights = q_pack["weights"].astype(np.float32, copy=False)
+            n_q = len(q_indptr) - 1
+            query_sparse: list[tuple[np.ndarray, np.ndarray]] = []
+            for q in range(n_q):
+                s = int(q_indptr[q])
+                e = int(q_indptr[q + 1])
+                query_sparse.append((q_centers[s:e].copy(), q_weights[s:e].copy()))
+
+            return doc_postings, query_sparse
+        except Exception as e:
+            print(f"   ⚠️  Failed to load base sparse cache ({e}), recomputing")
+            return None
+
+    def _save_base_sparse_vectors(cache_dir: str, meta: dict, doc_postings: list, query_sparse: list) -> None:
+        os.makedirs(cache_dir, exist_ok=True)
+        sig = _base_sparse_cache_sig(meta)
+        meta_path, doc_npz_path, query_npz_path = _base_sparse_cache_paths(cache_dir, sig)
+        # Cross-process flock: avoid duplicate work + half-written files when
+        # multiple jobs converge on the same (sig). Re-check inside the lock.
+        with _build_lock(meta_path + ".lock", label=f"base_sparse {sig}"):
+            try:
+                if os.path.exists(meta_path) and os.path.exists(doc_npz_path) and os.path.exists(query_npz_path):
+                    with open(meta_path) as f:
+                        if json.load(f) == meta:
+                            return  # peer already saved an identical copy
+            except Exception:
+                pass
+
+            # Flatten doc postings as CSR-like arrays.
+            V_local = len(doc_postings)
+            doc_indptr = np.zeros(V_local + 1, dtype=np.int64)
+            doc_idx_flat: list[int] = []
+            doc_w_flat: list[float] = []
+            for c in range(V_local):
+                pl = doc_postings[c]
+                doc_indptr[c + 1] = doc_indptr[c] + len(pl)
+                for didx, w in pl:
+                    doc_idx_flat.append(int(didx))
+                    doc_w_flat.append(float(w))
+            doc_idx_arr = np.array(doc_idx_flat, dtype=np.int32)
+            doc_w_arr = np.array(doc_w_flat, dtype=np.float32)
+
+            # Flatten query sparse vectors as CSR-like arrays.
+            n_q = len(query_sparse)
+            q_indptr = np.zeros(n_q + 1, dtype=np.int64)
+            q_centers_flat: list[np.ndarray] = []
+            q_weights_flat: list[np.ndarray] = []
+            for q in range(n_q):
+                c_arr, w_arr = query_sparse[q]
+                c_arr = np.asarray(c_arr, dtype=np.int32)
+                w_arr = np.asarray(w_arr, dtype=np.float32)
+                q_indptr[q + 1] = q_indptr[q] + c_arr.shape[0]
+                q_centers_flat.append(c_arr)
+                q_weights_flat.append(w_arr)
+            q_centers = np.concatenate(q_centers_flat) if q_centers_flat else np.zeros((0,), dtype=np.int32)
+            q_weights = np.concatenate(q_weights_flat) if q_weights_flat else np.zeros((0,), dtype=np.float32)
+
+            # Atomic writes: tmp + os.replace.
+            pid = os.getpid()
+            doc_tmp = doc_npz_path + f".tmp.{pid}"
+            q_tmp = query_npz_path + f".tmp.{pid}"
+            meta_tmp = meta_path + f".tmp.{pid}"
+            with open(doc_tmp, "wb") as _f:
+                np.savez_compressed(_f, indptr=doc_indptr, doc_idx=doc_idx_arr, weight=doc_w_arr)
+            with open(q_tmp, "wb") as _f:
+                np.savez_compressed(_f, indptr=q_indptr, centers=q_centers, weights=q_weights)
+            with open(meta_tmp, "w") as f:
+                json.dump(meta, f, indent=2)
+            os.replace(doc_tmp, doc_npz_path)
+            os.replace(q_tmp, query_npz_path)
+            os.replace(meta_tmp, meta_path)
+
+    # ---- Per-span FAISS-search cache ((D, I) at K_max) ----
+    # Keyed on (centers, section, K_max). Independent of all post-search filtering
+    # (assignment K, hard/soft, per-center thresholds, weight aggregation, IDF,
+    # normalization, stop centers, CLS exclusion). One cache hits all 4 sweeps.
+    def _array_sig(arr: np.ndarray) -> str:
+        return hashlib.sha1(np.ascontiguousarray(arr).tobytes()).hexdigest()[:12]
+
+    def _section_emb_sig(cache_dir: str, section: str) -> str:
+        """Cheap fingerprint of a section's embeddings file (size + mtime).
+        Used to invalidate centers_search and base_sparse_vectors caches when
+        the underlying embeddings are regenerated."""
+        p = os.path.join(cache_dir, f"{section}_{args.tokenization_unit}.npy")
+        try:
+            st = os.stat(p)
+            return f"{st.st_size}-{int(st.st_mtime)}"
+        except FileNotFoundError:
+            return "missing"
+
+    def _embeddings_sig(cache_dir: str, doc_sections: list[str]) -> str:
+        joined = "|".join(f"{s}:{_section_emb_sig(cache_dir, s)}" for s in doc_sections)
+        return hashlib.sha1(joined.encode()).hexdigest()[:12]
+
+    @contextlib.contextmanager
+    def _build_lock(lock_path: str, label: str = ""):
+        """Cross-process exclusive lock for cache builders.
+
+        Avoids duplicate work when multiple SLURM jobs hit a cold cache at the
+        same time: the first job acquires the lock and builds; the rest block,
+        then re-check the cache and skip the rebuild. Falls back to a no-op
+        context manager when fcntl is unavailable (non-POSIX).
+        """
+        if fcntl is None:
+            yield False
+            return
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        f = open(lock_path, "a+")
+        acquired_immediately = True
+        try:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                acquired_immediately = False
+                if label:
+                    print(f"   ⏳ Waiting for centers_search build lock ({label})...")
+                t0 = time.time()
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                if label:
+                    print(f"   ✅ Acquired centers_search lock after {time.time() - t0:.1f}s ({label})")
+            yield acquired_immediately
+        finally:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            finally:
+                f.close()
+
+    def _section_search_cache_paths(cache_dir: str, sig: str, section: str) -> tuple[str, str, str]:
+        base = os.path.join(cache_dir, "centers_search",
+                            f"{sig}_{section}_{args.tokenization_unit}")
+        return f"{base}.D.npy", f"{base}.I.npy", f"{base}.meta.json"
+
+    def _get_or_compute_section_search(
+        cache_dir: str,
+        centers_sig: str,
+        K_max: int,
+        section_name: str,
+        center_index: faiss.Index,
+        batch_size: int = 4096,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return (D, I) arrays of shape (n_spans, >=K_max) for *section_name*.
+
+        Cache layout:
+          - canonical filename per (centers_sig, section, embeddings_sig)
+          - meta records the cached K_max; reused as long as cached >= requested
+          - on size-up (requested > cached) we rebuild at max(requested, cached)
+            so the new file is never smaller than the old one.
+        """
+        disabled = bool(getattr(args, "centers_search_cache_disable", False))
+        emb_sig = _section_emb_sig(cache_dir, section_name)
+        D_path, I_path, meta_path = _section_search_cache_paths(
+            cache_dir, centers_sig, section_name)
+
+        def _try_load(min_K: int) -> tuple[Optional[tuple[np.ndarray, np.ndarray]], int]:
+            """Return ((D_mm, I_mm), cached_K) if the cache is usable for >= min_K, else (None, cached_K_or_-1)."""
+            if disabled or not (os.path.exists(D_path) and os.path.exists(I_path) and os.path.exists(meta_path)):
+                return None, -1
+            try:
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                if (meta.get("centers_sig") != centers_sig
+                        or meta.get("section") != section_name
+                        or meta.get("embeddings_sig") != emb_sig):
+                    return None, -1
+                cached_K = int(meta.get("K_max", -1))
+                if cached_K < min_K:
+                    return None, cached_K
+                D_mm = np.load(D_path, mmap_mode='r')
+                I_mm = np.load(I_path, mmap_mode='r')
+                if D_mm.shape == I_mm.shape and D_mm.shape[1] >= min_K:
+                    return (D_mm, I_mm), cached_K
+                return None, cached_K
+            except Exception as e:
+                print(f"   ⚠️  centers_search cache unreadable for {section_name} ({e}); recomputing")
+                return None, -1
+
+        cached, cached_K = _try_load(K_max)
+        if cached is not None:
+            return cached
+
+        # Miss → take cross-process lock, re-check, then build (size-up to max(requested, cached))
+        if not disabled:
+            os.makedirs(os.path.dirname(D_path), exist_ok=True)
+            lock_path = D_path + ".lock"
+            with _build_lock(lock_path, label=f"{section_name} K_max={K_max}"):
+                cached, cached_K = _try_load(K_max)
+                if cached is not None:
+                    return cached
+                build_K = max(K_max, cached_K) if cached_K > 0 else K_max
+                return _build_section_search(
+                    cache_dir, centers_sig, build_K, section_name, emb_sig,
+                    center_index, batch_size, D_path, I_path, meta_path)
+        return _build_section_search(
+            cache_dir, centers_sig, K_max, section_name, emb_sig,
+            center_index, batch_size, D_path, I_path, meta_path)
+
+    def _build_section_search(
+        cache_dir: str,
+        centers_sig: str,
+        K_max: int,
+        section_name: str,
+        emb_sig: str,
+        center_index: faiss.Index,
+        batch_size: int,
+        D_path: str,
+        I_path: str,
+        meta_path: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        disabled = bool(getattr(args, "centers_search_cache_disable", False))
+        _raw = _load_section_emb(cache_dir, section_name)
+        n_spans = int(_raw.shape[0])
+        if n_spans == 0:
+            del _raw; gc.collect()
+            empty_D = np.zeros((0, K_max), dtype=np.float32)
+            empty_I = np.full((0, K_max), -1, dtype=np.int32)
+            if not disabled:
+                os.makedirs(os.path.dirname(D_path), exist_ok=True)
+                np.save(D_path, empty_D)
+                np.save(I_path, empty_I)
+                with open(meta_path, "w") as f:
+                    json.dump({"centers_sig": centers_sig, "K_max": int(K_max),
+                               "section": section_name, "n_spans": 0,
+                               "embeddings_sig": emb_sig}, f)
+            return empty_D, empty_I
+
+        # Process per-batch: copy+normalize only one batch at a time so peak RSS
+        # stays ~batch_size*emb_dim*4 bytes instead of n_spans*emb_dim*4 bytes.
+        # This is critical for large sections (e.g. invention ~96M spans ≈ 395 GB
+        # if loaded in full), which would OOM any node.
+        if disabled:
+            print(f"   🔄 Computing centers_search for {section_name} ({n_spans:,} spans × K_max={K_max}) [cache DISABLED]...")
+            D_full = np.empty((n_spans, K_max), dtype=np.float32)
+            I_full = np.empty((n_spans, K_max), dtype=np.int32)
+            for b_start in tqdm(range(0, n_spans, batch_size),
+                                desc=f"  search {section_name}", leave=False):
+                b_end = min(b_start + batch_size, n_spans)
+                batch = np.array(_raw[b_start:b_end], dtype=np.float32, copy=True)
+                faiss.normalize_L2(batch)
+                D_b, I_b = center_index.search(batch, K_max)
+                D_full[b_start:b_end] = D_b.astype(np.float32, copy=False)
+                I_full[b_start:b_end] = I_b.astype(np.int32, copy=False)
+            del _raw, batch; gc.collect()
+            return D_full, I_full
+
+        os.makedirs(os.path.dirname(D_path), exist_ok=True)
+        D_tmp = D_path + f".tmp.{os.getpid()}"
+        I_tmp = I_path + f".tmp.{os.getpid()}"
+        D_mm = np.lib.format.open_memmap(D_tmp, mode='w+', dtype=np.float32, shape=(n_spans, K_max))
+        I_mm = np.lib.format.open_memmap(I_tmp, mode='w+', dtype=np.int32, shape=(n_spans, K_max))
+        print(f"   🔄 Building centers_search cache for {section_name} ({n_spans:,} spans × K_max={K_max})...")
+        for b_start in tqdm(range(0, n_spans, batch_size),
+                            desc=f"  search {section_name}", leave=False):
+            b_end = min(b_start + batch_size, n_spans)
+            batch = np.array(_raw[b_start:b_end], dtype=np.float32, copy=True)
+            faiss.normalize_L2(batch)
+            D_b, I_b = center_index.search(batch, K_max)
+            D_mm[b_start:b_end] = D_b.astype(np.float32, copy=False)
+            I_mm[b_start:b_end] = I_b.astype(np.int32, copy=False)
+        D_mm.flush(); I_mm.flush()
+        del D_mm, I_mm, _raw, batch; gc.collect()
+        os.replace(D_tmp, D_path)
+        os.replace(I_tmp, I_path)
+        with open(meta_path, "w") as f:
+            json.dump({"centers_sig": centers_sig, "K_max": int(K_max),
+                       "section": section_name, "n_spans": int(n_spans),
+                       "embeddings_sig": emb_sig}, f)
+        return np.load(D_path, mmap_mode='r'), np.load(I_path, mmap_mode='r')
+
+    def _query_search_cache_path(cache_dir: str, sig: str, query_text_hash: str) -> str:
+        return os.path.join(cache_dir, "centers_search",
+                            f"queries_{sig}_{query_text_hash}_{args.tokenization_unit}.npz")
+
+    def _get_or_compute_query_search(
+        cache_dir: str,
+        centers_sig: str,
+        K_max: int,
+        query_text_hash: str,
+        query_spans: list[np.ndarray],
+        center_index: faiss.Index,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Per-query (D, I) at >=K_max columns. Returns list aligned with query_spans.
+
+        Cached on disk by (centers_sig, query_text_hash). The cache is reused
+        as long as the cached K_max is >= the requested one.
+        """
+        disabled = bool(getattr(args, "centers_search_cache_disable", False))
+        path = _query_search_cache_path(cache_dir, centers_sig, query_text_hash)
+        n_q = len(query_spans)
+
+        def _try_load() -> Optional[list[tuple[np.ndarray, np.ndarray]]]:
+            if disabled or not os.path.exists(path):
+                return None
+            try:
+                pack = np.load(path, allow_pickle=False)
+                if (str(pack["centers_sig"].item()) == centers_sig
+                        and int(pack["K_max"].item()) >= int(K_max)
+                        and str(pack["query_text_hash"].item()) == query_text_hash
+                        and int(pack["n_q"].item()) == n_q):
+                    indptr = pack["indptr"].astype(np.int64, copy=False)
+                    D_flat = pack["D"].astype(np.float32, copy=False)
+                    I_flat = pack["I"].astype(np.int32, copy=False)
+                    out = []
+                    for q in range(n_q):
+                        s, e = int(indptr[q]), int(indptr[q + 1])
+                        out.append((D_flat[s:e], I_flat[s:e]))
+                    return out
+            except Exception as e:
+                print(f"   ⚠️  query centers_search cache unreadable ({e}); recomputing")
+            return None
+
+        cached = _try_load()
+        if cached is not None:
+            return cached
+
+        if not disabled:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with _build_lock(path + ".lock", label=f"queries K_max={K_max}"):
+                cached = _try_load()
+                if cached is not None:
+                    return cached
+                return _build_query_search(
+                    centers_sig, K_max, query_text_hash, query_spans,
+                    center_index, path, n_q)
+        return _build_query_search(
+            centers_sig, K_max, query_text_hash, query_spans,
+            center_index, path, n_q)
+
+    def _build_query_search(
+        centers_sig: str,
+        K_max: int,
+        query_text_hash: str,
+        query_spans: list[np.ndarray],
+        center_index: faiss.Index,
+        path: str,
+        n_q: int,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        disabled = bool(getattr(args, "centers_search_cache_disable", False))
+        # Compute (concat + one FAISS call)
+        n_per_q = np.array([int(s.shape[0]) for s in query_spans], dtype=np.int64)
+        indptr = np.concatenate(([0], np.cumsum(n_per_q))).astype(np.int64)
+        total = int(indptr[-1])
+        if total == 0:
+            empty = [(np.zeros((0, K_max), dtype=np.float32),
+                      np.full((0, K_max), -1, dtype=np.int32)) for _ in range(n_q)]
+            return empty
+        d_dim = int(query_spans[next(i for i, n in enumerate(n_per_q) if n > 0)].shape[1])
+        all_spans = np.empty((total, d_dim), dtype=np.float32)
+        for q in range(n_q):
+            s, e = int(indptr[q]), int(indptr[q + 1])
+            if e > s:
+                all_spans[s:e] = query_spans[q].astype(np.float32, copy=False)
+        faiss.normalize_L2(all_spans)
+        D_flat, I_flat = center_index.search(all_spans, K_max)
+        D_flat = D_flat.astype(np.float32, copy=False)
+        I_flat = I_flat.astype(np.int32, copy=False)
+        if not disabled:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                tmp = path + f".tmp.{os.getpid()}"
+                with open(tmp, "wb") as _f:
+                    np.savez(_f,
+                             centers_sig=np.array(centers_sig),
+                             K_max=np.array(int(K_max)),
+                             query_text_hash=np.array(query_text_hash),
+                             n_q=np.array(int(n_q)),
+                             indptr=indptr, D=D_flat, I=I_flat)
+                os.replace(tmp, path)
+            except Exception as e:
+                print(f"   ⚠️  failed to save query centers_search cache ({e})")
+        out = []
+        for q in range(n_q):
+            s, e = int(indptr[q]), int(indptr[q + 1])
+            out.append((D_flat[s:e], I_flat[s:e]))
+        return out
+
     def _chunk_query_text(text: str, max_tokens: int = 512) -> list[str]:
         """Split a long query text into sentence-aligned chunks that each fit
         within *max_tokens* encoder tokens.  Returns a list of text chunks.
@@ -1940,109 +2403,136 @@ def run_sparse_coverage(args):
         center_index: faiss.Index,
         V: int,
         sim_thr_per_center: np.ndarray,
-        idf: Optional[np.ndarray] = None,
         query_span_weights: Optional[list[np.ndarray]] = None,
         stop_centers: Optional[set] = None,
+        precomputed_search: Optional[list[tuple[np.ndarray, np.ndarray]]] = None,
     ) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Assign each query's spans to vocabulary centers.
+
+        Single vectorized implementation covering all four cases
+        (soft / hard × precomputed / live FAISS). Per query we obtain a
+        (n_spans, K) matrix of (D, I) — either by slicing the precomputed cache
+        or by one FAISS call — then apply a vectorized filter
+        (per-center radius + stop-centers + sim>0) and aggregate by center.
+
+        Soft-empty fallback: if all candidates of a query are filtered out, we
+        re-run with the per-center threshold relaxed (only stop-centers and
+        sim>0 enforced). This preserves the original behaviour while keeping
+        a single code path.
+        """
         use_soft_assignment = (args.use_soft_assignment if hasattr(args, "use_soft_assignment") else True) \
             and not getattr(args, "no_soft_assignment", False)
         weight_agg = getattr(args, "weight_aggregation", "max")
         query_first_span_weight = float(getattr(args, "query_first_span_weight", 1.0))
-        _stop = stop_centers if stop_centers is not None else set()
+        max_centers_per_span = int(getattr(args, "soft_assignment_max_centers_per_span", 10) or 0)
 
-        def _to_weight(sim: float, span_idx: int, span_downweight: float = 1.0, span_extra_weight: float = 1.0) -> float:
-            w = sim
-            if span_idx == 0 and query_first_span_weight != 1.0:
-                w *= query_first_span_weight
-            w *= span_downweight
-            w *= span_extra_weight
-            return w
+        # Stop-centers as boolean mask (vectorized membership test).
+        stop_mask = np.zeros(V, dtype=bool)
+        if stop_centers:
+            stop_idx = np.fromiter(stop_centers, dtype=np.int64)
+            stop_idx = stop_idx[(stop_idx >= 0) & (stop_idx < V)]
+            stop_mask[stop_idx] = True
 
-        def _update_weight(
-            weights: dict, key: int, sim: float, span_idx: int = 0, span_downweight: float = 1.0,
-            span_extra_weight: float = 1.0,
-        ) -> None:
-            w = _to_weight(sim, span_idx, span_downweight, span_extra_weight)
-            if w <= 0:
-                return
+        _have_precomp = precomputed_search is not None and len(precomputed_search) == len(query_spans)
+
+        def _per_span_extra(qi: int, n_spans: int) -> np.ndarray:
+            extra = np.ones(n_spans, dtype=np.float32)
+            if query_span_weights is not None and qi < len(query_span_weights):
+                w = np.asarray(query_span_weights[qi], dtype=np.float32)
+                m = min(n_spans, w.shape[0])
+                extra[:m] = w[:m]
+            if n_spans > 0 and query_first_span_weight != 1.0:
+                extra[0] *= query_first_span_weight
+            return extra
+
+        def _aggregate(centers_v: np.ndarray, sims_v: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            """Group (centers_v, sims_v) by center and reduce by max or sum."""
+            if centers_v.size == 0:
+                return np.zeros((0,), dtype=np.int32), np.zeros((0,), dtype=np.float32)
+            order = np.argsort(centers_v, kind="stable")
+            cs = centers_v[order]
+            ws = sims_v[order]
+            edges = np.concatenate(([True], cs[1:] != cs[:-1]))
+            starts = np.where(edges)[0]
             if weight_agg == "sum":
-                weights[key] = weights.get(key, 0.0) + w
+                agg_w = np.add.reduceat(ws, starts)
             else:
-                if w > weights.get(key, 0.0):
-                    weights[key] = w
+                agg_w = np.maximum.reduceat(ws, starts)
+            return cs[starts].astype(np.int32, copy=False), agg_w.astype(np.float32, copy=False)
 
         query_sparse: list[tuple[np.ndarray, np.ndarray]] = []
+        n_fallback = 0
         for q_idx, spans in enumerate(query_spans):
-            if spans.shape[0] == 0:
-                query_sparse.append((np.array([], dtype=np.int32), np.array([], dtype=np.float32)))
+            n_spans_q = int(spans.shape[0])
+            if n_spans_q == 0:
+                query_sparse.append((np.zeros((0,), dtype=np.int32), np.zeros((0,), dtype=np.float32)))
                 continue
 
-            spans_norm = spans.astype(np.float32).copy()
-            faiss.normalize_L2(spans_norm)
-
-            def _span_extra(qi: int, si: int) -> float:
-                if query_span_weights is None or qi >= len(query_span_weights):
-                    return 1.0
-                w = query_span_weights[qi]
-                if si >= w.shape[0]:
-                    return 1.0
-                return float(w[si])
-
+            # 1. Obtain (D_q, I_q) of shape (n_spans_q, K_eff).
             if use_soft_assignment:
-                max_centers_per_span = int(getattr(args, "soft_assignment_max_centers_per_span", 10) or 0)
-                K_search = min(max(max_centers_per_span * 4, 64), V)
-                _min_thr = float(sim_thr_per_center.min())
-                D_q, I_q = center_index.search(spans_norm, K_search)
-                center_weights = {}
-                for span_idx in range(spans_norm.shape[0]):
-                    extra = _span_extra(q_idx, span_idx)
-                    kept = 0
-                    for k in range(K_search):
-                        c = int(I_q[span_idx, k])
-                        if c < 0:
-                            break
-                        sim = float(D_q[span_idx, k])
-                        if sim < _min_thr:
-                            break
-                        if c in _stop or sim <= 0:
-                            continue
-                        if sim < sim_thr_per_center[c]:
-                            continue
-                        _update_weight(center_weights, c, sim, span_idx, span_downweight=1.0, span_extra_weight=extra)
-                        kept += 1
-                        if max_centers_per_span > 0 and kept >= max_centers_per_span:
-                            break
-                if not center_weights:
-                    similarities, assigned = center_index.search(spans_norm, k=1)
-                    for span_idx in range(similarities.shape[0]):
-                        center_id = int(assigned[span_idx, 0])
-                        if center_id in _stop:
-                            continue
-                        sim = float(similarities[span_idx, 0])
-                        extra = _span_extra(q_idx, span_idx)
-                        _update_weight(center_weights, center_id, sim, span_idx, span_downweight=1.0, span_extra_weight=extra)
-
-                if center_weights:
-                    centers_arr = np.array(list(center_weights.keys()), dtype=np.int32)
-                    weights_arr = np.array([center_weights[c] for c in centers_arr], dtype=np.float32)
-                    query_sparse.append((centers_arr, weights_arr))
-                else:
-                    query_sparse.append((np.array([], dtype=np.int32), np.array([], dtype=np.float32)))
+                K_target = max(1, max_centers_per_span)
             else:
-                similarities, assigned = center_index.search(spans_norm, k=1)
-                center_weights = {}
-                for span_idx in range(similarities.shape[0]):
-                    center_id = int(assigned[span_idx, 0])
-                    if center_id in _stop:
-                        continue
-                    sim = float(similarities[span_idx, 0])
-                    extra = _span_extra(q_idx, span_idx)
-                    _update_weight(center_weights, center_id, sim, span_idx, span_downweight=1.0, span_extra_weight=extra)
+                K_target = 1
+            if _have_precomp:
+                D_full, I_full = precomputed_search[q_idx]
+                K_eff = min(K_target, int(D_full.shape[1]) if D_full.ndim == 2 else 0)
+                D_q = np.asarray(D_full[:, :K_eff], dtype=np.float32)
+                I_q = np.asarray(I_full[:, :K_eff], dtype=np.int32)
+            else:
+                spans_norm = spans.astype(np.float32, copy=True)
+                faiss.normalize_L2(spans_norm)
+                D_q, I_q = center_index.search(spans_norm, K_target)
+                D_q = D_q.astype(np.float32, copy=False)
+                I_q = I_q.astype(np.int32, copy=False)
+                K_eff = K_target
 
-                centers_arr = np.array(list(center_weights.keys()), dtype=np.int32)
-                weights_arr = np.array([center_weights[c] for c in centers_arr], dtype=np.float32)
-                query_sparse.append((centers_arr, weights_arr))
+            if K_eff == 0:
+                query_sparse.append((np.zeros((0,), dtype=np.int32), np.zeros((0,), dtype=np.float32)))
+                continue
 
+            extra = _per_span_extra(q_idx, n_spans_q)  # (n_spans_q,)
+
+            # 2. Vectorized filter.
+            I_clamped = np.clip(I_q, 0, V - 1)
+            invalid = (I_q < 0) | (D_q <= 0) | stop_mask[I_clamped]
+            invalid_with_thr = invalid | (D_q < sim_thr_per_center[I_clamped])
+
+            # TopK cap (soft only); for hard K_eff==1 it's a no-op.
+            if use_soft_assignment and max_centers_per_span > 0:
+                valid_m = ~invalid_with_thr
+                cum = np.cumsum(valid_m, axis=1)
+                invalid_with_thr |= (cum > max_centers_per_span) & valid_m
+
+            valid_mask = ~invalid_with_thr
+            if not valid_mask.any() and use_soft_assignment:
+                # Fallback: relax per-center radius (keep stop + sim>0). This
+                # mirrors the original "if not center_weights: search k=1" path
+                # but without the second FAISS call.
+                n_fallback += 1
+                valid_mask = ~invalid
+                # Still cap at max_centers_per_span if requested.
+                if max_centers_per_span > 0 and valid_mask.any():
+                    cum = np.cumsum(valid_mask, axis=1)
+                    valid_mask &= ~((cum > max_centers_per_span) & valid_mask)
+
+            if not valid_mask.any():
+                query_sparse.append((np.zeros((0,), dtype=np.int32), np.zeros((0,), dtype=np.float32)))
+                continue
+
+            rows, cols = np.where(valid_mask)
+            centers_v = I_q[rows, cols].astype(np.int32, copy=False)
+            sims_v = D_q[rows, cols].astype(np.float32, copy=False) * extra[rows]
+            # Drop any non-positive weights resulting from extra<=0.
+            keep = sims_v > 0
+            if not keep.all():
+                centers_v = centers_v[keep]
+                sims_v = sims_v[keep]
+
+            centers_arr, weights_arr = _aggregate(centers_v, sims_v)
+            query_sparse.append((centers_arr, weights_arr))
+
+        if n_fallback > 0:
+            print(f"   ⚠️  soft-assignment fallback (radius relaxed): {n_fallback}/{len(query_spans)} queries")
         return query_sparse
 
 
@@ -2117,7 +2607,7 @@ def run_sparse_coverage(args):
         doc_sections: list[str],
         cache_dir: str,
         batch_size: int = 32,
-        passage_titles_list: list[str] | None = None,
+        passage_titles_list: Optional[list[str]] = None,
     ) -> int:
         """Encode CLEF-IP passages and stream directly to disk (memory-efficient).
 
@@ -2174,7 +2664,12 @@ def run_sparse_coverage(args):
 
             # Stream embeddings to a temporary raw binary file to avoid OOM.
             # Peak RAM = one batch of embeddings + metadata lists (< 2 GB).
-            raw_path = os.path.join(cache_dir, f"_tmp_{section}.raw")
+            # Use a process-unique temp file to avoid collisions when multiple
+            # jobs build the same cache directory concurrently.
+            raw_path = os.path.join(
+                cache_dir,
+                f"_tmp_{section}_{os.getpid()}_{time.time_ns()}.raw",
+            )
             span_count = 0
             section_doc_ids: list[str] = []
             section_is_cls: list[bool] = []
@@ -2211,7 +2706,11 @@ def run_sparse_coverage(args):
                 del out_mm, raw_mm
             else:
                 np.save(npy_path, np.zeros((0, hidden_size), dtype=np.float32))
-            os.remove(raw_path)
+            try:
+                os.remove(raw_path)
+            except FileNotFoundError:
+                # Another concurrent process may have already cleaned it up.
+                pass
 
             # Update global metadata
             for did, is_c in zip(section_doc_ids, section_is_cls):
@@ -2292,13 +2791,7 @@ def run_sparse_coverage(args):
 
     centers_info = _load_centers_info_json(centers_path)
     V = int(centers.shape[0])
-    stop_centers = set(centers_info.get("stop_centers", []))
-    if getattr(args, "no_stop_centers", False):
-        print(f"   --no_stop_centers: ignoring {len(stop_centers)} stop centers (ablation)")
-        stop_centers = set()
-    elif stop_centers:
-        print(f"   stop_centers: {len(stop_centers)} disabled for activation (df >= threshold)")
-    print(f"   Final vocabulary size: {V:,} centers")
+    stop_centers: set = set()  # computed from doc-DF after posting lists are built
 
     r, sim_threshold = _get_r_and_sim_threshold(centers_info)
 
@@ -2319,7 +2812,27 @@ def run_sparse_coverage(args):
     faiss.normalize_L2(centers_norm)
     center_index = faiss.IndexFlatIP(d)
     center_index.add(centers_norm.astype(np.float32))
-    print(f"✅ Center index built")
+    # Move centers index to GPU if available — speeds up the per-section
+    # centers_search build dramatically (often 10-30x for large span counts).
+    # Memory footprint is tiny (V × d × 4 bytes, plus FAISS workspace ~1-2 GB).
+    if torch.cuda.is_available():
+        try:
+            _faiss_gpu_res = faiss.StandardGpuResources()
+            center_index = faiss.index_cpu_to_gpu(_faiss_gpu_res, 0, center_index)
+            print(f"✅ Center index built (GPU: {torch.cuda.get_device_name(0)})")
+        except Exception as _e:
+            print(f"⚠️  GPU FAISS index unavailable ({_e}); falling back to CPU index")
+            print(f"✅ Center index built (CPU)")
+    else:
+        print(f"✅ Center index built (CPU)")
+
+    # Signature for the per-span FAISS-search cache (depends only on centers content).
+    centers_sig = _array_sig(centers_norm)
+    K_max_cache = int(getattr(args, "centers_search_cache_K", 64))
+    if K_max_cache > V:
+        K_max_cache = V
+    print(f"   centers_sig={centers_sig}  K_max_cache={K_max_cache}"
+          + ("  [centers_search cache DISABLED]" if getattr(args, "centers_search_cache_disable", False) else ""))
 
     for mode in available_modes:
         print(f"\n{'='*80}")
@@ -2381,201 +2894,271 @@ def run_sparse_coverage(args):
             if didx is not None:
                 doc_nspans[didx] = float(cnt)
 
-        # ---- Build posting lists ----
-        document_assignment = getattr(args, "document_assignment", "soft")
-        print(f"\n🔨 Computing posting lists for {V:,} centers...")
-        print(f"   Document assignment: {document_assignment}")
+        # Query text formatting must match doc-side formatting for sparse assignment.
+        _fmt_scheme = get_encoder_format_scheme(args.dense_model)
+        query_texts = [format_claim_for_encoder(_fmt_scheme, qt) for qt in _clefip_data["query_texts"]]
 
-        posting_lists: list[list[tuple[int, float]]] = []
-        centers_norm_for_pl = centers.copy()
-        faiss.normalize_L2(centers_norm_for_pl)
+        use_soft_assignment = (args.use_soft_assignment if hasattr(args, "use_soft_assignment") else True) \
+            and not getattr(args, "no_soft_assignment", False)
+        base_sparse_meta = {
+            "mode": mode,
+            "dense_model": args.dense_model,
+            "tokenization_unit": args.tokenization_unit,
+            "centers_path": os.path.abspath(centers_path),
+            "centers_shape": [int(V), int(d)],
+            "centers_sig": centers_sig,
+            "embeddings_sig": _embeddings_sig(cache_dir, doc_sections),
+            "sim_thr_sha1": _hash_float_array(sim_thr_per_center),
+            "document_assignment": getattr(args, "document_assignment", "soft"),
+            "weight_aggregation": getattr(args, "weight_aggregation", "max"),
+            "use_soft_assignment": bool(use_soft_assignment),
+            "soft_assignment_max_centers_per_span": int(getattr(args, "soft_assignment_max_centers_per_span", 10) or 0),
+            "query_first_span_weight": float(getattr(args, "query_first_span_weight", 1.0)),
+            "exclude_cls_spans": bool(exclude_cls_spans),
+            "query_max_chunks": int(getattr(args, "query_max_chunks", -1)),
+            "n_docs": int(len(_clefip_data["passage_ids"])),
+            "query_text_hash": _hash_query_texts(query_texts),
+        }
 
-        if document_assignment == "hard":
-            print(f"   Building posting lists: each span -> nearest center (k=1)")
-            # Pre-build stop_centers mask for vectorized filtering
-            _stop_mask_arr_hard = np.zeros(V, dtype=bool)
-            for _sc in stop_centers:
-                if 0 <= _sc < V:
-                    _stop_mask_arr_hard[_sc] = True
-            posting_lists = [[] for _ in range(V)]
-            span_offset = 0
-            for section_name in doc_sections:
-                _raw = _load_section_emb(cache_dir, section_name)
-                if _raw.shape[0] == 0:
-                    continue
-                if _raw.shape[1] != d:
-                    raise ValueError(f"Embedding dimension mismatch for {section_name}: {_raw.shape[1]} != {d}")
-                sec_emb = np.array(_raw, dtype=np.float32, copy=True)  # single contiguous copy
-                del _raw; gc.collect()  # free before normalize
-                faiss.normalize_L2(sec_emb)
-                sims, assigned = center_index.search(sec_emb, 1)
-                sims_1d = sims[:, 0]
-                assigned_1d = assigned[:, 0]
-                # Build valid mask: not CLS-excluded, not stop center, sim > 0
-                valid = (sims_1d > 0) & (assigned_1d >= 0)
-                valid &= ~_stop_mask_arr_hard[np.clip(assigned_1d, 0, V - 1)]
-                if exclude_cls_spans and exclude_cls_span_indices:
-                    global_indices = np.arange(sec_emb.shape[0]) + span_offset
-                    valid &= ~np.isin(global_indices, list(exclude_cls_span_indices) if not isinstance(exclude_cls_span_indices, np.ndarray) else exclude_cls_span_indices)
-                # Extract valid entries and group by center
-                valid_idx = np.where(valid)[0]
-                if valid_idx.size > 0:
-                    v_centers = assigned_1d[valid_idx]
-                    v_sims = sims_1d[valid_idx]
-                    v_globals = valid_idx.astype(np.int64) + span_offset
-                    order = np.argsort(v_centers)
-                    sorted_c = v_centers[order]
-                    sorted_g = v_globals[order]
-                    sorted_s = v_sims[order]
-                    unique_c, counts = np.unique(sorted_c, return_counts=True)
-                    splits = np.cumsum(counts)[:-1]
-                    g_groups = np.split(sorted_g, splits)
-                    s_groups = np.split(sorted_s, splits)
-                    for ci in range(len(unique_c)):
-                        c = int(unique_c[ci])
-                        posting_lists[c].extend(
-                            zip(g_groups[ci].tolist(), s_groups[ci].tolist())
-                        )
-                span_offset += sec_emb.shape[0]
-                print(f"     {section_name}: {sec_emb.shape[0]:,} spans assigned")
-                del sec_emb; gc.collect()
-            print(f"   Total spans: {total_loaded:,}")
+        cached_sparse = _load_base_sparse_vectors(cache_dir, base_sparse_meta)
+        doc_postings: list[list[tuple[int, float]]]
+        query_sparse: list[tuple[np.ndarray, np.ndarray]]
+
+        if cached_sparse is not None:
+            doc_postings, query_sparse = cached_sparse
+            pl_lens = np.array([len(pl) for pl in doc_postings], dtype=np.float64)
+            n_empty = int(np.sum(pl_lens == 0))
+            total_entries = int(np.sum(pl_lens))
+            doc_non_empty = pl_lens[pl_lens > 0]
+            print(f"\n💾 Loaded base sparse vectors from cache: {cache_dir}")
+            if len(doc_non_empty) > 0:
+                print(f"📊 Doc-level posting lists (cached): total entries={total_entries:,}, "
+                      f"mean/non-empty center={float(doc_non_empty.mean()):.1f}, "
+                      f"max={int(pl_lens.max()):,}")
         else:
-            # Doc soft: search(K) + per-center threshold filter + topK cap
-            # VECTORIZED: replaces Python for-j-for-k loop with numpy ops
+            # ---- Build posting lists (flat CSR; no list[list[tuple]] ever) ----
+            document_assignment = getattr(args, "document_assignment", "soft")
+            print(f"\n🔨 Computing posting lists for {V:,} centers...")
+            print(f"   Document assignment: {document_assignment}")
+
+            # Flat accumulators across sections: (center, span_global, sim).
+            flat_centers_chunks: list[np.ndarray] = []
+            flat_globals_chunks: list[np.ndarray] = []
+            flat_sims_chunks: list[np.ndarray] = []
+
             max_centers_per_span = int(getattr(args, "soft_assignment_max_centers_per_span", 10) or 0)
-            K_search = min(max(max_centers_per_span * 4, 64), V)
+            if document_assignment == "hard":
+                K_search = 1
+            else:
+                # Use the full cached width; no 4×/64 heuristic needed because
+                # we slice the cached top-K_max_cache and cap with topK at the end.
+                K_search = min(K_max_cache, V)
+                if K_search < max_centers_per_span:
+                    print(f"   ⚠️  K_max_cache={K_max_cache} < max_centers_per_span={max_centers_per_span}; "
+                          f"capping survivors at {K_search}.")
+            K_max_eff = max(K_max_cache, K_search)
             min_sim_thr = float(sim_thr_per_center.min())
-            print(f"   Soft assignment: search(K={K_search}) + per-center r_c filter + topK={max_centers_per_span}")
-            # Pre-build stop_centers mask for vectorized filtering
-            _stop_mask_arr = np.zeros(V, dtype=bool)
-            for _sc in stop_centers:
-                if 0 <= _sc < V:
-                    _stop_mask_arr[_sc] = True
-            posting_lists = [[] for _ in range(V)]
+            if document_assignment == "hard":
+                print(f"   Building posting lists: each span -> nearest center (k=1) [via centers_search cache]")
+            else:
+                print(f"   Soft assignment: top-K={K_search} from cache (K_max={K_max_eff}) "
+                      f"+ per-center r_c filter + topK cap={max_centers_per_span}")
+            _bs_search = max(1, int(getattr(args, "centers_search_batch", 4096)))
+
+            # CLS exclusion as int64 array (fast np.isin)
+            cls_excl_arr: Optional[np.ndarray] = None
+            if exclude_cls_spans and exclude_cls_span_indices:
+                if isinstance(exclude_cls_span_indices, np.ndarray):
+                    cls_excl_arr = exclude_cls_span_indices.astype(np.int64, copy=False)
+                else:
+                    cls_excl_arr = np.fromiter(exclude_cls_span_indices, dtype=np.int64)
+
             span_offset = 0
             for section_name in doc_sections:
-                _raw = _load_section_emb(cache_dir, section_name)
-                if _raw.shape[0] == 0:
-                    span_offset += 0
+                D_mm, I_mm = _get_or_compute_section_search(
+                    cache_dir, centers_sig, K_max_eff, section_name,
+                    center_index, batch_size=_bs_search)
+                n_spans_sec = int(D_mm.shape[0])
+                if n_spans_sec == 0:
                     continue
-                if _raw.shape[1] != d:
-                    raise ValueError(f"Embedding dimension mismatch for {section_name}: {_raw.shape[1]} != {d}")
-                sec_emb_n = np.array(_raw, dtype=np.float32, copy=True)  # single contiguous copy
-                del _raw; gc.collect()  # free original before normalize
-                faiss.normalize_L2(sec_emb_n)
-                batch_size = max(1, int(getattr(args, "posting_list_batch_size", 4096)))
-                for b_start in tqdm(range(0, sec_emb_n.shape[0], batch_size),
-                                    desc=f"  {section_name} spans->centers", leave=False):
-                    b_end = min(b_start + batch_size, sec_emb_n.shape[0])
-                    batch = sec_emb_n[b_start:b_end]
-                    D_batch, I_batch = center_index.search(batch, K_search)
 
-                    # --- Vectorized filtering ---
-                    # 1. Clamp negative center IDs to 0 (will be masked out)
-                    I_clamped = np.clip(I_batch, 0, V - 1)
-                    # 2. Build boolean masks for invalid entries
-                    mask_neg_id = I_batch < 0                                    # (n, K)
-                    mask_low_global = D_batch < min_sim_thr                      # (n, K)
-                    mask_non_pos = D_batch <= 0                                  # (n, K)
-                    mask_stop = _stop_mask_arr[I_clamped]                        # (n, K)
-                    # Per-center threshold: sim < r_c[center_id]
-                    mask_below_rc = D_batch < sim_thr_per_center[I_clamped]      # (n, K)
-                    # Combined invalid mask
-                    invalid = mask_neg_id | mask_low_global | mask_non_pos | mask_stop | mask_below_rc
+                # One-shot whole-section read of the K_search columns we need.
+                # mmap → contiguous in-memory copy (n_spans_sec, K_search) is the only
+                # working set; no per-batch FAISS calls, no per-batch tqdm noise.
+                D_sec = np.array(D_mm[:, :K_search], dtype=np.float32, copy=True)
+                I_sec = np.array(I_mm[:, :K_search], dtype=np.int32, copy=True)
+                del D_mm, I_mm; gc.collect()
 
-                    # 3. CLS exclusion (row-level mask)
-                    if exclude_cls_spans and exclude_cls_span_indices:
-                        global_indices = np.arange(b_start, b_end) + span_offset
-                        # Build row mask: True for rows to exclude
-                        row_exclude = np.isin(global_indices, list(exclude_cls_span_indices) if not isinstance(exclude_cls_span_indices, np.ndarray) else exclude_cls_span_indices)
-                        invalid[row_exclude] = True
+                # --- Vectorized filtering (whole section) ---
+                I_clamped = np.clip(I_sec, 0, V - 1)
+                invalid = (I_sec < 0) | (D_sec <= 0) | (D_sec < min_sim_thr) \
+                          | (D_sec < sim_thr_per_center[I_clamped])
 
-                    # 4. TopK cap: for each row, keep only the first max_centers_per_span valid entries
-                    if max_centers_per_span > 0:
-                        valid = ~invalid                                          # (n, K)
-                        cumvalid = np.cumsum(valid, axis=1)                       # (n, K)
-                        invalid |= (cumvalid > max_centers_per_span) & valid
+                if cls_excl_arr is not None:
+                    global_indices = np.arange(n_spans_sec, dtype=np.int64) + span_offset
+                    row_exclude = np.isin(global_indices, cls_excl_arr)
+                    invalid[row_exclude] = True
 
-                    # 5. Extract valid (row, col) pairs and populate posting lists
-                    valid_mask = ~invalid
+                # TopK cap per row
+                if document_assignment != "hard" and max_centers_per_span > 0:
+                    valid_mat = ~invalid
+                    cumvalid = np.cumsum(valid_mat, axis=1)
+                    invalid |= (cumvalid > max_centers_per_span) & valid_mat
+
+                valid_mask = ~invalid
+                if valid_mask.any():
                     rows, cols = np.where(valid_mask)
-                    if rows.size > 0:
-                        centers_valid = I_batch[rows, cols]
-                        sims_valid = D_batch[rows, cols]
-                        global_rows = rows.astype(np.int64) + (span_offset + b_start)
-                        # Group by center using argsort for batch extend
-                        order = np.argsort(centers_valid)
-                        sorted_c = centers_valid[order]
-                        sorted_g = global_rows[order]
-                        sorted_s = sims_valid[order]
-                        unique_c, counts = np.unique(sorted_c, return_counts=True)
-                        splits = np.cumsum(counts)[:-1]
-                        g_groups = np.split(sorted_g, splits)
-                        s_groups = np.split(sorted_s, splits)
-                        for ci in range(len(unique_c)):
-                            c = int(unique_c[ci])
-                            posting_lists[c].extend(
-                                zip(g_groups[ci].tolist(), s_groups[ci].tolist())
-                            )
-                span_offset += sec_emb_n.shape[0]
-                print(f"     {section_name}: {sec_emb_n.shape[0]:,} spans assigned")
-                del sec_emb_n; gc.collect()
+                    centers_valid = I_sec[rows, cols].astype(np.int32, copy=False)
+                    sims_valid = D_sec[rows, cols].astype(np.float32, copy=False)
+                    globals_valid = rows.astype(np.int64, copy=False) + span_offset
+                    flat_centers_chunks.append(centers_valid)
+                    flat_globals_chunks.append(globals_valid)
+                    flat_sims_chunks.append(sims_valid)
+
+                span_offset += n_spans_sec
+                print(f"     {section_name}: {n_spans_sec:,} spans assigned")
+                del D_sec, I_sec, invalid, valid_mask; gc.collect()
             print(f"   Total spans: {total_loaded:,}")
 
-        # Alignment sanity check
-        if total_loaded != len(span_to_doc):
-            raise ValueError(
-                f"Embeddings count ({total_loaded:,}) != span_to_doc count ({len(span_to_doc):,}). "
-                "Posting lists require exact 1:1 alignment."
+            # Alignment sanity check
+            if total_loaded != len(span_to_doc):
+                raise ValueError(
+                    f"Embeddings count ({total_loaded:,}) != span_to_doc count ({len(span_to_doc):,}). "
+                    "Posting lists require exact 1:1 alignment."
+                )
+
+            # Concatenate flat span-level posting list (centers, globals, sims).
+            if flat_centers_chunks:
+                flat_centers = np.concatenate(flat_centers_chunks)
+                flat_globals = np.concatenate(flat_globals_chunks)
+                flat_sims = np.concatenate(flat_sims_chunks)
+            else:
+                flat_centers = np.zeros((0,), dtype=np.int32)
+                flat_globals = np.zeros((0,), dtype=np.int64)
+                flat_sims = np.zeros((0,), dtype=np.float32)
+            del flat_centers_chunks, flat_globals_chunks, flat_sims_chunks; gc.collect()
+
+            # Span-level posting list stats (numpy bincount, no per-center loop)
+            if flat_centers.size > 0:
+                span_pl_lens = np.bincount(flat_centers, minlength=V).astype(np.int64)
+                span_non_empty = span_pl_lens[span_pl_lens > 0]
+                print(f"\n📊 Span-level posting lists (build cost/memory): "
+                      f"total entries={int(span_pl_lens.sum()):,}, "
+                      f"mean/non-empty center={float(span_non_empty.mean()):.1f}, "
+                      f"max={int(span_pl_lens.max()):,}")
+
+            # Build document-level inverted index: convert span->doc, aggregate by (center, doc).
+            print(f"\n🔨 Building document-level inverted index from posting lists...")
+            weight_agg = getattr(args, "weight_aggregation", "max")
+
+            # Vectorized span_global -> doc_idx via lookup array.
+            n_spans_total = int(span_offset)
+            span_to_didx = np.full(n_spans_total, -1, dtype=np.int64)
+            for span_idx, doc_id in span_to_doc.items():
+                didx = doc_id_to_idx.get(doc_id)
+                if didx is not None and 0 <= span_idx < n_spans_total:
+                    span_to_didx[int(span_idx)] = int(didx)
+
+            if flat_centers.size > 0:
+                flat_didx = span_to_didx[flat_globals]
+                # Drop entries with no doc mapping or sim<=0
+                keep = (flat_didx >= 0) & (flat_sims > 0)
+                if not keep.all():
+                    flat_centers = flat_centers[keep]
+                    flat_didx = flat_didx[keep]
+                    flat_sims = flat_sims[keep]
+                else:
+                    flat_didx = flat_didx
+            else:
+                flat_didx = np.zeros((0,), dtype=np.int64)
+
+            # Aggregate (center, doc_idx) pairs -> max or sum of sims.
+            if flat_centers.size > 0:
+                # Pack key = center * N_docs + doc_idx (both fit in int64).
+                _N = int(N_docs)
+                key = flat_centers.astype(np.int64) * _N + flat_didx
+                order = np.argsort(key, kind="stable")
+                key_s = key[order]
+                sim_s = flat_sims[order]
+                # Group boundaries
+                edges = np.concatenate(([True], key_s[1:] != key_s[:-1]))
+                group_start = np.where(edges)[0]
+                group_end = np.append(group_start[1:], key_s.size)
+                if weight_agg == "sum":
+                    agg_w = np.add.reduceat(sim_s, group_start)
+                else:
+                    agg_w = np.maximum.reduceat(sim_s, group_start)
+                agg_key = key_s[group_start]
+                agg_centers = (agg_key // _N).astype(np.int32, copy=False)
+                agg_didx = (agg_key % _N).astype(np.int32, copy=False)
+                agg_w = agg_w.astype(np.float32, copy=False)
+                # Build doc_postings (list-of-list-of-tuple) for downstream code.
+                # This is the only place we materialize the legacy structure.
+                doc_postings = [[] for _ in range(V)]
+                # Group by center via np.split on contiguous runs.
+                c_order = np.argsort(agg_centers, kind="stable")
+                ac = agg_centers[c_order]
+                ad = agg_didx[c_order]
+                aw = agg_w[c_order]
+                if ac.size > 0:
+                    c_edges = np.concatenate(([True], ac[1:] != ac[:-1]))
+                    c_starts = np.where(c_edges)[0]
+                    c_ends = np.append(c_starts[1:], ac.size)
+                    for i in range(c_starts.size):
+                        s, e = int(c_starts[i]), int(c_ends[i])
+                        cid = int(ac[s])
+                        doc_postings[cid] = list(zip(ad[s:e].tolist(), aw[s:e].tolist()))
+            else:
+                doc_postings = [[] for _ in range(V)]
+            del flat_centers, flat_globals, flat_sims, span_to_didx; gc.collect()
+
+            # Doc-level posting list stats (retrieval cost / FLOPs)
+            pl_lens = np.array([len(pl) for pl in doc_postings], dtype=np.float64)
+            doc_non_empty = pl_lens[pl_lens > 0]
+            n_empty = int(np.sum(pl_lens == 0))
+            total_entries = int(np.sum(pl_lens))
+            if len(doc_non_empty) > 0:
+                print(f"📊 Doc-level posting lists (retrieval cost/FLOPs): "
+                      f"total entries={total_entries:,}, "
+                      f"mean/non-empty center={float(doc_non_empty.mean()):.1f}, "
+                      f"max={int(pl_lens.max()):,}")
+
+            # Encode + assign queries once (without stop-center post-processing)
+            query_spans = _encode_query_spans(query_texts, section=query_section, d=d)
+            query_span_weights = None
+            # Pre-compute (and cache) per-query (D, I) at K_max_cache so subsequent
+            # sweeps that vary assignment K (1..K_max_cache) hit the cache.
+            _q_K = min(K_max_cache, V)
+            _query_text_hash = base_sparse_meta.get("query_text_hash", "")
+            query_precomp = _get_or_compute_query_search(
+                cache_dir, centers_sig, _q_K, _query_text_hash,
+                query_spans, center_index)
+            query_sparse = _assign_query_spans_to_centers(
+                query_spans,
+                center_index=center_index,
+                V=V,
+                sim_thr_per_center=sim_thr_per_center,
+                query_span_weights=query_span_weights,
+                stop_centers=None,
+                precomputed_search=query_precomp,
             )
 
-        # Span-level posting list stats (index build cost / memory)
-        span_pl_lens = np.array([len(pl) for pl in posting_lists], dtype=np.float64)
-        span_non_empty = span_pl_lens[span_pl_lens > 0]
-        if len(span_non_empty) > 0:
-            print(f"\n📊 Span-level posting lists (build cost/memory): "
-                  f"total entries={int(span_pl_lens.sum()):,}, "
-                  f"mean/non-empty center={float(span_non_empty.mean()):.1f}, "
-                  f"max={int(span_pl_lens.max()):,}")
+            _save_base_sparse_vectors(cache_dir, base_sparse_meta, doc_postings, query_sparse)
+            print(f"   💾 Saved base sparse vectors cache: {cache_dir}")
 
-        # Build document-level inverted index (doc_idx, weight)
-        print(f"\n🔨 Building document-level inverted index from posting lists...")
-        doc_postings: list[list[tuple[int, float]]] = [[] for _ in range(V)]
-
-        weight_agg = getattr(args, "weight_aggregation", "max")
-        for center_idx in tqdm(range(V), desc="Building inverted index"):
-            span_sims = posting_lists[center_idx]
-            if not span_sims:
-                continue
-            agg: dict[int, float] = {}  # doc_idx -> weight
-            for entry in span_sims:
-                span_idx, similarity = entry[0], entry[1]
-                doc_id = span_to_doc.get(span_idx, None)
-                if doc_id is None:
-                    continue
-                didx = doc_id_to_idx.get(doc_id)
-                if didx is None:
-                    continue
-                sim = float(similarity)
-                if weight_agg == "sum":
-                    agg[didx] = agg.get(didx, 0.0) + max(0.0, sim)
-                else:
-                    if didx not in agg or max(0.0, sim) > agg[didx]:
-                        agg[didx] = max(0.0, sim)
-            for didx, w in agg.items():
-                doc_postings[center_idx].append((didx, float(w)))
-
-        # Doc-level posting list stats (retrieval cost / FLOPs)
-        pl_lens = np.array([len(pl) for pl in doc_postings], dtype=np.float64)
-        doc_non_empty = pl_lens[pl_lens > 0]
-        n_empty = int(np.sum(pl_lens == 0))
-        total_entries = int(np.sum(pl_lens))
-        if len(doc_non_empty) > 0:
-            print(f"📊 Doc-level posting lists (retrieval cost/FLOPs): "
-                  f"total entries={total_entries:,}, "
-                  f"mean/non-empty center={float(doc_non_empty.mean()):.1f}, "
-                  f"max={int(pl_lens.max()):,}")
+        # --- Compute stop_centers from doc-DF (top fraction by posting-list length) ---
+        if getattr(args, "stop_center_fraction", 0.0) > 0:
+            _df_for_stop = np.array([len(pl) for pl in doc_postings], dtype=np.float64)
+            n_stop = max(1, round(V * args.stop_center_fraction))
+            _stop_ranked = np.argsort(-_df_for_stop)
+            stop_centers = set(int(c) for c in _stop_ranked[:n_stop])
+            _stop_thr = int(_df_for_stop[_stop_ranked[n_stop - 1]])
+            print(f"   stop_centers: top {n_stop} ({args.stop_center_fraction:.1%}) by doc-DF, "
+                  f"min_df={_stop_thr:,} → {len(stop_centers):,} centers cleared")
+            for _sc in stop_centers:
+                doc_postings[_sc] = []
+        else:
+            print(f"   stop-center suppression disabled (stop_center_fraction <= 0)")
 
         N_docs = len(_clefip_data["passage_ids"])
         df = np.array([len(pl) for pl in doc_postings], dtype=np.float32)  # doc_idx unique per center (aggregated above)
@@ -2584,14 +3167,8 @@ def run_sparse_coverage(args):
         if idf_exponent != 1.0:
             print(f"   IDF exponent: {idf_exponent} (score term uses idf^{idf_exponent})")
 
-        # Encode + assign queries (format must match utils.collect_doc_texts for doc side)
+        # Query sparse vectors are precomputed/cached without stop-center post-processing.
         print(f"\n📝 Evaluating: CLEF-IP Claims -> Passages")
-        _fmt_scheme = get_encoder_format_scheme(args.dense_model)
-        query_texts = [format_claim_for_encoder(_fmt_scheme, qt) for qt in _clefip_data["query_texts"]]
-
-        query_spans = _encode_query_spans(query_texts, section=query_section, d=d)
-        query_span_weights = None
-        query_sparse = _assign_query_spans_to_centers(query_spans, center_index=center_index, V=V, sim_thr_per_center=sim_thr_per_center, idf=idf, query_span_weights=query_span_weights, stop_centers=stop_centers)
         # Per-query retrieval cost diagnostics
         postings_per_query = np.array(
             [sum(len(doc_postings[t]) for t in qpack[0]) for qpack in query_sparse],
@@ -2765,8 +3342,7 @@ def run_sparse_coverage(args):
                                                           full_doc_ranking_list=_full_doc_ranking_f)
                     _robustness_results.append((_n_docs_f, _n_passages_f, _res_f))
                     print(f"   {_n_docs_f:>6} docs ({_n_passages_f:>8,} passages): "
-                          f"recall@100={_res_f.get('recall@100', 0):.4f}  "
-                          f"ndcg@10={_res_f.get('ndcg@10', 0):.4f}  "
+                          f"recall_passage@1000={_res_f.get('recall_passage@1000', 0):.4f}  "
                           f"map_doc={_res_f.get('map_doc', 0):.4f}  "
                           f"pres_doc@100={_res_f.get('pres_doc@100', 0):.4f}")
 
@@ -2775,13 +3351,12 @@ def run_sparse_coverage(args):
                     print(f"\n{'='*90}")
                     print(f"CLEF-IP Robustness Summary (relevant docs always included, negatives subsampled)")
                     print(f"{'='*90}")
-                    print(f"{'Docs':>8} {'Passages':>10} {'recall@100':>12} {'ndcg@10':>10} "
+                    print(f"{'Docs':>8} {'Passages':>10} {'recall_passage@1000':>20} "
                           f"{'map_doc':>10} {'pres_doc@100':>14} {'magp':>8}")
-                    print(f"{'-'*8} {'-'*10} {'-'*12} {'-'*10} {'-'*10} {'-'*14} {'-'*8}")
+                    print(f"{'-'*8} {'-'*10} {'-'*20} {'-'*10} {'-'*14} {'-'*8}")
                     for _nd, _np, _r in _robustness_results:
                         print(f"{_nd:>8} {_np:>10,} "
-                              f"{_r.get('recall@100', 0):>12.4f} "
-                              f"{_r.get('ndcg@10', 0):>10.4f} "
+                              f"{_r.get('recall_passage@1000', 0):>20.4f} "
                               f"{_r.get('map_doc', 0):>10.4f} "
                               f"{_r.get('pres_doc@100', 0):>14.4f} "
                               f"{_r.get('magp', 0):>8.4f}")
@@ -2793,7 +3368,9 @@ def run_sparse_coverage(args):
 
         # Free large objects before next mode to avoid peak memory overlap
         del span_to_doc, exclude_cls_span_indices
-        del posting_lists, doc_postings, query_sparse
+        if "posting_lists" in locals():
+            del posting_lists
+        del doc_postings, query_sparse
         gc.collect()
 
     print(f"\n✅ Sparse Coverage evaluation completed for all available tasks")

@@ -198,6 +198,7 @@ def auto_batch_size(
     device=None,
     min_bs: int = 4,
     max_bs: int = 2048,
+    vocab_size: int = 0,
 ) -> int:
     """Estimate a safe encoding batch size based on available GPU memory.
 
@@ -205,6 +206,9 @@ def auto_batch_size(
         per_sample_mb ≈ (max_length/512) * (hidden_size/768)^0.5 * 3 MB
         usable_mb     = free_vram * 0.85
         batch_size    = largest power-of-2 ≤ usable_mb / per_sample_mb
+
+    For MLM/SPLADE models that project to vocab_size (dominant memory cost):
+        per_sample_mb ≈ (max_length/512) * (vocab_size/30522) * 60 MB
 
     ``free_vram`` is total minus already-allocated (accounting for model weights when
     the model is already on GPU).  Falls back to 32 on CPU or on error.
@@ -216,6 +220,7 @@ def auto_batch_size(
         device:      torch.device to query; defaults to current CUDA device.
         min_bs:      minimum returned batch size.
         max_bs:      maximum returned batch size.
+        vocab_size:  if > 0, use vocab-projection memory formula (for SPLADE/MLM models).
     """
     if not torch.cuda.is_available():
         print("[auto_batch_size] No GPU detected → default batch_size=32")
@@ -234,7 +239,15 @@ def auto_batch_size(
         allocated_mb = torch.cuda.memory_allocated(dev_idx) / (1024 ** 2)
         free_mb = max(total_mb - allocated_mb, 0.0)
 
-        per_sample_mb = (max_length / 512) * (hidden_size / 768) ** 0.5 * 3.0
+        if vocab_size > 0:
+            # MLM/SPLADE head projects to vocab_size. Peak cost is several simultaneous
+            # [B, seq_len, vocab_size] fp32 tensors (logits, masked logits, ReLU, log).
+            # Empirically: ~240 MB / sample at seq=512, vocab=30522.
+            per_sample_mb = (max_length / 512) * (vocab_size / 30522) * 240.0
+            # Cap conservatively: SPLADE-style models OOM easily on long sequences.
+            max_bs = min(max_bs, 256)
+        else:
+            per_sample_mb = (max_length / 512) * (hidden_size / 768) ** 0.5 * 3.0
         usable_mb = free_mb * 0.85
         estimated = int(usable_mb / per_sample_mb)
 

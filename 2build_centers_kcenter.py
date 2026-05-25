@@ -65,105 +65,8 @@ def _check_gpu():
         return False
 
 
-def _load_span_doc_ids(embedding_files, N):
-    """
-    Load span index -> doc_id from per-section metadata JSONL (same order as embedding files).
-    Each line: {"d": doc_id, ...}. Returns list of length N (doc_id per global span index) or None if missing/mismatch.
-    """
-    doc_ids = []
-    for fp in embedding_files:
-        meta_path = os.path.splitext(fp)[0] + "_metadata.jsonl"
-        if not os.path.isfile(meta_path):
-            return None
-        try:
-            # Batch read entire file at once
-            with open(meta_path, "r") as f:
-                content = f.read()
-            lines = content.split("\n")
-            del content  # free memory early
-            file_ids = []
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)
-                file_ids.append(obj.get("d", obj.get("doc_id", "")))
-            doc_ids.extend(file_ids)
-        except Exception:
-            return None
-    if len(doc_ids) != N:
-        return None
-    return doc_ids
 
 
-def _filter_embeddings_by_span_kind(embedding_files, section_embeddings, exclude_cls=False, exclude_doc_mean=False):
-    """
-    Filter embedding rows by span_kind using metadata JSONL.
-
-    For each section .npy, reads the companion _metadata.jsonl and keeps only
-    rows whose 'k' field is NOT in the excluded set.  Returns filtered arrays
-    (loaded into memory, no longer mmap) and the filtered doc_ids list.
-
-    Returns:
-        filtered_embeddings: list of np.ndarray (one per section, content-only rows)
-        filtered_doc_ids: list of str (doc_id per kept row, across all sections)
-    """
-    exclude_kinds = set()
-    if exclude_cls:
-        exclude_kinds.add("cls")
-    if exclude_doc_mean:
-        exclude_kinds.add("doc_mean")
-    if not exclude_kinds:
-        return section_embeddings, None  # nothing to filter
-
-    filtered_embeddings = []
-    filtered_doc_ids = []
-    total_before = 0
-    total_after = 0
-
-    for fp, arr in zip(embedding_files, section_embeddings):
-        meta_path = os.path.splitext(fp)[0] + "_metadata.jsonl"
-        if not os.path.isfile(meta_path):
-            raise FileNotFoundError(
-                f"Metadata file required for --exclude_cls/--exclude_doc_mean but not found: {meta_path}\n"
-                f"Re-run 1create_N_embeddings.py with --save_metadata 1"
-            )
-
-        n_rows = arr.shape[0]
-        total_before += n_rows
-
-        # Read span_kind for every row
-        keep_mask = np.ones(n_rows, dtype=bool)
-        doc_ids_section = []
-        with open(meta_path, "r") as f:
-            for i, line in enumerate(f):
-                line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)
-                kind = obj.get("k", "content")
-                doc_id = obj.get("d", obj.get("doc_id", ""))
-                if kind in exclude_kinds:
-                    keep_mask[i] = False
-                doc_ids_section.append(doc_id)
-
-        if len(doc_ids_section) != n_rows:
-            raise ValueError(
-                f"Metadata row count ({len(doc_ids_section)}) != embedding rows ({n_rows}) for {fp}"
-            )
-
-        # Apply mask: copy into memory (no longer mmap)
-        kept_arr = arr[keep_mask]
-        kept_doc_ids = [d for d, m in zip(doc_ids_section, keep_mask) if m]
-        filtered_embeddings.append(kept_arr)
-        filtered_doc_ids.extend(kept_doc_ids)
-        total_after += kept_arr.shape[0]
-        excluded = n_rows - kept_arr.shape[0]
-        print(f"  {os.path.basename(fp)}: {n_rows:,} -> {kept_arr.shape[0]:,} (excluded {excluded:,} {exclude_kinds})")
-
-    print(f"[kcenter] Span filtering: {total_before:,} -> {total_after:,} "
-          f"(removed {total_before - total_after:,} rows with kind in {exclude_kinds})")
-    return filtered_embeddings, filtered_doc_ids
 
 
 def _eligible_indices_proportional(store, ref_size, rng):
@@ -206,193 +109,7 @@ def _eligible_indices_proportional(store, ref_size, rng):
     return np.concatenate(per_section)
 
 
-def _span_doc_ids_to_ints(span_doc_ids):
-    """Map a list of opaque doc ID strings to a contiguous int32 array (and return the dict).
 
-    Used by both DF diagnostic implementations to build a compact ``(N,)`` array suitable
-    for ``np.unique`` on ``(center_id, doc_int)`` pairs.
-    """
-    doc_to_int: dict[str, int] = {}
-    doc_ints = np.empty(len(span_doc_ids), dtype=np.int32)
-    for i, did in enumerate(span_doc_ids):
-        if did not in doc_to_int:
-            doc_to_int[did] = len(doc_to_int)
-        doc_ints[i] = doc_to_int[did]
-    return doc_ints, doc_to_int
-
-
-def _df_quantiles(df_per_center):
-    """Standard {p50, p90, p99, max} dict from a per-center DF array."""
-    q = np.percentile(df_per_center, [50, 90, 99])
-    return {"p50": int(q[0]), "p90": int(q[1]), "p99": int(q[2]), "max": int(np.max(df_per_center))}
-
-
-def _compute_df_diagnostic(assignments, assign_dists, span_doc_ids, r_per_center, V_actual, top_k=10):
-    """
-    Compute document-frequency (df) per center: number of distinct documents that activate each center.
-    O(N log N) via sort-based unique counting instead of O(V*N) per-center masking.
-    Returns (df_per_center, quantiles, top_df_centers).
-    """
-    doc_ints, _ = _span_doc_ids_to_ints(span_doc_ids)
-
-    # Sort-based df: unique (center, doc) pairs, then bincount on center
-    pairs = np.stack([assignments, doc_ints], axis=1)  # (N, 2)
-    unique_pairs = np.unique(pairs, axis=0)             # deduplicated (center, doc)
-    df_per_center = np.bincount(unique_pairs[:, 0].astype(np.int64), minlength=V_actual).astype(np.int64)
-
-    quantiles = _df_quantiles(df_per_center)
-
-    # Top-k by df: only need per-center argmin(assign_dists) for the top-k centers
-    top_indices = np.argsort(-df_per_center)[:top_k]
-    # Vectorized: sort by distance, then np.unique on assignments finds first (=closest) per center
-    order = np.argsort(assign_dists)
-    sorted_assignments = assignments[order]
-    unique_centers, first_idx = np.unique(sorted_assignments, return_index=True)
-    rep_span_for_center = np.full(V_actual, -1, dtype=np.int64)
-    rep_span_for_center[unique_centers] = order[first_idx]
-
-    top_df_centers = []
-    for c in top_indices:
-        rep_i = int(rep_span_for_center[c])
-        if rep_i < 0:
-            top_df_centers.append({"center_id": int(c), "df": 0, "r_c": float(r_per_center[c]), "rep_span_idx": None, "rep_span_dist": None})
-            continue
-        top_df_centers.append({
-            "center_id": int(c),
-            "df": int(df_per_center[c]),
-            "r_c": float(r_per_center[c]),
-            "rep_span_idx": rep_i,
-            "rep_span_dist": float(assign_dists[rep_i]),
-        })
-    return df_per_center, quantiles, top_df_centers
-
-
-def _compute_df_diagnostic_activation(
-    store, center_index, N, d, use_gpu,
-    span_doc_ids, r_per_center, V_actual,
-    max_centers_per_span=10, top_k_report=10,
-):
-    """
-    Activation-based DF diagnostic: matches evaluate.py's soft assignment.
-
-    For each span, search(K) nearest centers, filter by per-center r_c,
-    cap at max_centers_per_span.  df_c = |{doc : exists span in doc activating c}|.
-    This reflects the actual posting-list lengths in retrieval and is typically
-    much larger than the Voronoi df (nearest-1 only).
-
-    Returns (df_per_center, quantiles, top_report_centers, activation_stats).
-    """
-    import time as _time
-    t0 = _time.time()
-
-    doc_ints, _ = _span_doc_ids_to_ints(span_doc_ids)
-
-    # Precompute per-center similarity threshold: sim >= 1 - r_c[c]
-    sim_thr_per_center = (1.0 - r_per_center).astype(np.float32)
-    min_sim_thr = float(sim_thr_per_center.min())
-
-    # K_search: match evaluate.py logic — search more than max_centers_per_span
-    # to allow filtering by r_c before capping
-    K_search = min(max(max_centers_per_span * 4, 64), V_actual)
-
-    assign_batch = _adaptive_batch_size(d, use_gpu)
-
-    # Collect (center_id, doc_int) pairs in streaming batches
-    all_centers_list = []
-    all_docs_list = []
-    total_activations = 0
-
-    for start in range(0, N, assign_batch):
-        end = min(start + assign_batch, N)
-        batch = store.get_chunk(start, end)
-        l2_normalize_inplace(batch)
-        sims, idxs = center_index.search(batch, K_search)  # (batch_size, K_search)
-
-        batch_size = end - start
-        batch_doc = doc_ints[start:end]  # (batch_size,)
-
-        # Vectorized filtering: flatten (batch, K) -> (batch*K,)
-        center_ids_flat = idxs.ravel().astype(np.int64)   # (batch*K,)
-        sims_flat = sims.ravel()                           # (batch*K,)
-        docs_flat = np.repeat(batch_doc, K_search)         # (batch*K,)
-        span_indices = np.repeat(np.arange(batch_size), K_search)  # for topK cap
-
-        # Filter 1: valid center id and positive similarity
-        valid = (center_ids_flat >= 0) & (sims_flat > 0)
-        # Filter 2: global min threshold (early exit equivalent)
-        valid &= sims_flat >= min_sim_thr
-        # Filter 3: per-center r_c threshold
-        valid &= sims_flat >= sim_thr_per_center[center_ids_flat]
-
-        # Apply validity filter
-        v_centers = center_ids_flat[valid]
-        v_sims = sims_flat[valid]
-        v_docs = docs_flat[valid]
-        v_spans = span_indices[valid]
-
-        # Filter 4: top-K cap per span (keep at most max_centers_per_span per span)
-        # FAISS returns results sorted by descending sim per span; after boolean
-        # masking the relative order within each span is preserved.
-        # Fully vectorized group-wise cumcount via sort + maximum.accumulate.
-        if max_centers_per_span > 0 and len(v_centers) > 0:
-            order = np.argsort(v_spans, kind='stable')
-            sorted_spans = v_spans[order]
-            positions = np.arange(len(sorted_spans), dtype=np.int64)
-            # Detect group boundaries (new span id)
-            changes = np.empty(len(sorted_spans), dtype=np.bool_)
-            changes[0] = True
-            np.not_equal(sorted_spans[1:], sorted_spans[:-1], out=changes[1:])
-            # Propagate each group's start position forward
-            group_start = np.maximum.accumulate(np.where(changes, positions, 0))
-            cumcount_sorted = positions - group_start   # 0, 1, 2, ... within each group
-            # Unsort back to original order
-            cumcount = np.empty_like(cumcount_sorted)
-            cumcount[order] = cumcount_sorted
-            keep_mask = cumcount < max_centers_per_span
-            v_centers = v_centers[keep_mask]
-            v_docs = v_docs[keep_mask]
-
-        all_centers_list.append(v_centers)
-        all_docs_list.append(v_docs)
-        total_activations += len(v_centers)
-
-    # Concatenate all batches
-    all_centers = np.concatenate(all_centers_list) if all_centers_list else np.array([], dtype=np.int64)
-    all_docs = np.concatenate(all_docs_list) if all_docs_list else np.array([], dtype=np.int32)
-
-    # Unique (center, doc) pairs -> df per center
-    if len(all_centers) > 0:
-        pairs = np.stack([all_centers, all_docs.astype(np.int64)], axis=1)
-        unique_pairs = np.unique(pairs, axis=0)
-        df_per_center = np.bincount(unique_pairs[:, 0].astype(np.int64), minlength=V_actual).astype(np.int64)
-    else:
-        df_per_center = np.zeros(V_actual, dtype=np.int64)
-
-    quantiles = _df_quantiles(df_per_center)
-
-    # Top centers by activation df
-    top_indices = np.argsort(-df_per_center)[:top_k_report]
-    top_df_centers = []
-    for c in top_indices:
-        top_df_centers.append({
-            "center_id": int(c),
-            "df": int(df_per_center[c]),
-            "r_c": float(r_per_center[c]),
-        })
-
-    mean_activations_per_span = total_activations / N if N > 0 else 0.0
-    activation_stats = {
-        "total_activations": int(total_activations),
-        "mean_activations_per_span": float(mean_activations_per_span),
-        "K_search": int(K_search),
-        "max_centers_per_span": int(max_centers_per_span),
-    }
-
-    elapsed = _time.time() - t0
-    print(f"[kcenter] Activation DF diagnostic done in {elapsed:.1f}s "
-          f"({total_activations:,} activations, {mean_activations_per_span:.1f} per span)")
-
-    return df_per_center, quantiles, top_df_centers, activation_stats
 
 
 def _compute_r_c_and_coverage(assignments, assign_dists, V_actual, r_c_percentile, hist_bins):
@@ -500,6 +217,29 @@ def _adaptive_batch_size(d, use_gpu, target_mb=512):
     lo = 10_000
     hi = 500_000 if use_gpu else 200_000
     return max(lo, min(hi, batch))
+
+
+def _quantization_metrics(assign_dists):
+    """Compute quantization-quality metrics from per-point cosine distances to assigned center.
+
+    `assign_dists[i] = 1 - cos(x_i, c_{a(i)})` in [0, 2]. For unit vectors,
+    squared L2 distance ||x - c||^2 = 2 * (1 - cos) = 2 * d, so the standard
+    k-means quantization error (mean squared L2) = 2 * mean(d).
+
+    Returns dict with mean_cos_distance, mean_sq_l2 (the standard quantization
+    error), and a few percentiles of cos distance for diagnostics.
+    """
+    d = np.asarray(assign_dists, dtype=np.float64)
+    mean_cd = float(d.mean())
+    return {
+        "mean_cos_distance": mean_cd,
+        "quantization_error_sq_l2": float(2.0 * mean_cd),
+        "mean_sq_cos_distance": float((d * d).mean()),
+        "cos_distance_p50": float(np.percentile(d, 50)),
+        "cos_distance_p95": float(np.percentile(d, 95)),
+        "cos_distance_p99": float(np.percentile(d, 99)),
+        "cos_distance_max": float(d.max()),
+    }
 
 
 def _voronoi_assign(store, center_index, N, d, use_gpu):
@@ -787,103 +527,17 @@ def farthest_first_traversal_streaming_gpu(store, N, d, V, chunk_size=100_000, b
         torch.cuda.empty_cache()
 
 
-
-def _compute_df_and_stop_centers(
-    args, store, span_doc_ids, assignments, assign_dists,
-    r_per_center, V_actual, center_index, N, d, use_gpu,
-):
-    """Compute Voronoi/activation DF diagnostics and select stop-centers (top fraction by DF).
-
-    Returns ``(df_diagnostic_dict_or_None, stop_centers_list, stop_center_threshold_int_or_None)``.
-    Returns ``(None, [], None)`` when ``span_doc_ids`` is unavailable.
-    """
-    if span_doc_ids is None:
-        return None, [], None
-
-    # --- Voronoi DF (nearest-1 only; lower bound) ---
-    df_per_center_voronoi, df_quantiles_voronoi, top10_df_voronoi = _compute_df_diagnostic(
-        assignments, assign_dists, span_doc_ids, r_per_center, V_actual, top_k=10
-    )
-    print(f"\n[kcenter] ── Voronoi DF (nearest-1 assignment, lower bound) ──")
-    print(f"[kcenter] df quantiles: p50={df_quantiles_voronoi['p50']:,}, p90={df_quantiles_voronoi['p90']:,}, "
-          f"p99={df_quantiles_voronoi['p99']:,}, max={df_quantiles_voronoi['max']:,}")
-
-    # --- Activation DF (top-K + r_c filter; matches evaluate.py soft assignment) ---
-    df_top_k = args.df_top_k
-    if df_top_k > 0:
-        print(f"\n[kcenter] ── Activation DF (top-{df_top_k} + per-center r_c, matches evaluate.py) ──")
-        df_per_center_act, df_quantiles_act, top10_df_act, act_stats = _compute_df_diagnostic_activation(
-            store, center_index, N, d, use_gpu,
-            span_doc_ids, r_per_center, V_actual,
-            max_centers_per_span=df_top_k, top_k_report=10,
-        )
-        print(f"[kcenter] activation df quantiles: p50={df_quantiles_act['p50']:,}, p90={df_quantiles_act['p90']:,}, "
-              f"p99={df_quantiles_act['p99']:,}, max={df_quantiles_act['max']:,}")
-        ratio_p50 = df_quantiles_act['p50'] / max(df_quantiles_voronoi['p50'], 1)
-        ratio_max = df_quantiles_act['max'] / max(df_quantiles_voronoi['max'], 1)
-        print(f"[kcenter] activation/voronoi ratio: p50={ratio_p50:.1f}x, max={ratio_max:.1f}x")
-        print(f"[kcenter] mean activations per span: {act_stats['mean_activations_per_span']:.1f} "
-              f"(K_search={act_stats['K_search']}, cap={act_stats['max_centers_per_span']})")
-        df_for_stop = df_per_center_act
-        df_label = "activation"
-    else:
-        df_for_stop = df_per_center_voronoi
-        df_label = "voronoi"
-        df_quantiles_act = None
-        top10_df_act = None
-        act_stats = None
-
-    # Stop-center rule: top fraction of centers by df (using activation df when available).
-    n_stop = max(1, int(math.ceil(V_actual * args.stop_center_fraction)))
-    ranked = np.argsort(-df_for_stop)
-    stop_centers = [int(ranked[i]) for i in range(n_stop)]
-    stop_center_threshold = int(df_for_stop[ranked[n_stop - 1]])
-    print(f"[kcenter] stop_centers (top {n_stop} by {df_label} df, min_df={stop_center_threshold:,}): "
-          f"{len(stop_centers):,} disabled for retrieval")
-
-    df_diagnostic = {
-        "voronoi_df_p50": df_quantiles_voronoi["p50"],
-        "voronoi_df_p90": df_quantiles_voronoi["p90"],
-        "voronoi_df_p99": df_quantiles_voronoi["p99"],
-        "voronoi_df_max": df_quantiles_voronoi["max"],
-        "voronoi_top10_df_centers": top10_df_voronoi,
-    }
-    if df_quantiles_act is not None:
-        df_diagnostic["activation_df_p50"] = df_quantiles_act["p50"]
-        df_diagnostic["activation_df_p90"] = df_quantiles_act["p90"]
-        df_diagnostic["activation_df_p99"] = df_quantiles_act["p99"]
-        df_diagnostic["activation_df_max"] = df_quantiles_act["max"]
-        df_diagnostic["activation_top10_df_centers"] = top10_df_act
-        df_diagnostic["activation_stats"] = act_stats
-        df_diagnostic["stop_centers_source"] = "activation"
-    else:
-        df_diagnostic["stop_centers_source"] = "voronoi"
-
-    print(f"\n[kcenter] Top-10 df centers ({df_label}):")
-    top10_for_print = top10_df_act if top10_df_act is not None else top10_df_voronoi
-    for row in top10_for_print:
-        print(f"  center {row['center_id']}: df={row['df']:,}, r_c={row['r_c']:.4f}")
-    return df_diagnostic, stop_centers, stop_center_threshold
-
-
 def _save_outputs(
     *, args, centers, refine_iters, V_actual, nominal_r, min_r, max_r,
     N, d, ff_pool_size, points_per_center, empty_cells, use_gpu, dir_info,
-    coverage, coverage_history, r_per_center,
-    df_diagnostic, stop_centers, stop_center_threshold,
+    coverage, coverage_history, r_per_center, quant_metrics=None,
 ):
-    """Build the output directory, save centers .npy, stop_centers files, and stats JSON."""
+    """Build the output directory, save centers .npy and stats JSON."""
     suffix = f"_kcenter_V{args.V}"
     if args.r_c_percentile < 100.0:
         suffix += f"_r{args.r_c_percentile:g}"
     if refine_iters > 0:
         suffix += f"_refine{refine_iters}"
-    if args.exclude_cls and args.exclude_doc_mean:
-        suffix += "_nocls_nomean"
-    elif args.exclude_cls:
-        suffix += "_nocls"
-    elif args.exclude_doc_mean:
-        suffix += "_nomean"
     args.out_dir = build_output_dir(args.out_dir, args.embeddings_dir, suffix=suffix)
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -892,18 +546,6 @@ def _save_outputs(
     out_name = f"centers_greedy_V{V_actual}_r{nominal_r:.3f}_r{min_r:.3f}-{max_r:.3f}_{r_range_hash:08x}.npy"
     out_path = os.path.join(args.out_dir, out_name)
     np.save(out_path, centers)
-
-    # Standalone stop_centers files (fast loading, no JSON parse).
-    if df_diagnostic is not None and stop_centers:
-        sc_arr = np.array(stop_centers, dtype=np.int64)
-        sc_npy_path = os.path.join(args.out_dir, "stop_centers.npy")
-        np.save(sc_npy_path, sc_arr)
-        sc_txt_path = os.path.join(args.out_dir, "stop_centers.txt")
-        with open(sc_txt_path, "w") as f:
-            for c in sorted(stop_centers):
-                f.write(f"{c}\n")
-        print(f"[kcenter] Saved: {sc_npy_path} ({len(sc_arr)} centers)")
-        print(f"[kcenter] Saved: {sc_txt_path}")
 
     stats = {
         "method": "kcenter",
@@ -929,14 +571,12 @@ def _save_outputs(
         "use_gpu": bool(use_gpu),
         "refine_iterations": int(refine_iters),
     }
+    if quant_metrics:
+        # Standard k-means quantization error (mean squared L2 to assigned center)
+        # plus cosine-distance diagnostics.
+        stats["quantization"] = {k: float(v) for k, v in quant_metrics.items()}
     if dir_info:
         stats["embeddings_dir_info"] = dir_info
-    if df_diagnostic is not None:
-        stats["df_diagnostic"] = df_diagnostic
-        stats["stop_centers"] = stop_centers
-        stats["stop_center_threshold"] = stop_center_threshold
-    else:
-        stats["stop_centers"] = []
     stats_path = os.path.join(args.out_dir, out_name.replace(".npy", ".json"))
     with open(stats_path, "w") as f:
         json.dump(stats, f, indent=2)
@@ -975,26 +615,13 @@ def main():
                          "keeps center distribution aligned with corpus, avoids bias toward small sections.")
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--log_every", type=int, default=500)
-    ap.add_argument("--refine_iterations", type=int, default=1,
+    ap.add_argument("--refine_iterations", type=int, default=0,
                     help="Number of K-means-style centroid refinement iterations after farthest-first. "
                          "Each iteration: replace each center with mean of its Voronoi cell, re-assign, recompute r_c. "
                          "1-2 often helps for models with broad centers (e.g. PatentMap).")
     ap.add_argument("--r_c_hist_bins", type=int, default=512,
                     help="Number of histogram bins for percentile r_c (cosine distance in [0, 2]). "
                          "Streaming histogram avoids storing all N distances; 512–1024 is typically enough.")
-    ap.add_argument("--df_top_k", type=int, default=10,
-                    help="max_centers_per_span for activation DF diagnostic (matches evaluate.py soft assignment). "
-                         "0 = skip activation DF and use Voronoi DF for stop-centers. Default: 10.")
-    ap.add_argument("--stop_center_fraction", type=float, default=0.01,
-                    help="Fraction of top centers (by document frequency) to disable for retrieval. "
-                         "Default: 0.01 (top 1%%).")
-    ap.add_argument("--exclude_cls", action="store_true", default=False,
-                    help="Exclude [CLS] embedding rows (span_kind='cls') from center construction. "
-                         "Requires metadata JSONL (saved with --save_metadata 1 in 1create_N_embeddings.py).")
-    ap.add_argument("--exclude_doc_mean", action="store_true", default=False,
-                    help="Exclude doc-mean embedding rows (span_kind='doc_mean') from center construction. "
-                         "Requires metadata JSONL (saved with --save_metadata 1 in 1create_N_embeddings.py).")
-
     args = ap.parse_args()
     rng = np.random.default_rng(args.seed)
 
@@ -1041,26 +668,9 @@ def main():
         section_embeddings.append(arr)
         print(f"  Loaded {arr.shape[0]:,} x {arr.shape[1]} from {os.path.basename(fp)}")
 
-    # ── Filter out CLS / doc_mean rows if requested ──
-    if args.exclude_cls or args.exclude_doc_mean:
-        print(f"[kcenter] Filtering: exclude_cls={args.exclude_cls}, exclude_doc_mean={args.exclude_doc_mean}")
-        section_embeddings, filtered_doc_ids = _filter_embeddings_by_span_kind(
-            embedding_files, section_embeddings,
-            exclude_cls=args.exclude_cls, exclude_doc_mean=args.exclude_doc_mean,
-        )
-    else:
-        filtered_doc_ids = None
-
     store = ChunkedEmbeddingStore(section_embeddings)
     N, d = store.N, store.d
     print(f"[kcenter] Total: N={N:,}, d={d} (streaming: no full concatenate)")
-
-    if filtered_doc_ids is not None:
-        span_doc_ids = filtered_doc_ids
-    else:
-        span_doc_ids = _load_span_doc_ids(embedding_files, N)
-    if span_doc_ids is None:
-        print("[kcenter] No metadata (or mismatch): df diagnostic will be skipped. Use {section}_{unit}_metadata.jsonl for df/posting-list stats.")
 
     # ── Prepare reference set and run farthest-first ──
     eligible_indices = None
@@ -1138,9 +748,6 @@ def main():
             print(f"[kcenter] Data fits in RAM ({data_bytes / 1e9:.1f}GB < {total_ram * 0.50 / 1e9:.1f}GB threshold)")
         print(f"[kcenter] Loading all {N:,} points into RAM (bulk read, no mmap)...")
         t_load = time.time()
-        # Read from store's section_embeddings (already filtered & in-memory after
-        # _filter_embeddings_by_span_kind) instead of re-reading raw files, which
-        # would include filtered-out rows (cls/doc_mean) and cause an index mismatch.
         parts = []
         for j, se in enumerate(store.section_embeddings):
             print(f"  Reading section {j}...", end=" ", flush=True)
@@ -1165,15 +772,6 @@ def main():
 
     ff_pool_size = (len(eligible_indices) if eligible_indices is not None else
                     (args.ref_size if (args.ref_size and args.ref_size < N) else N))
-
-    # Auto-tune batch_size_ff for streaming: with default (1), each round requires a full
-    # data pass.  For V=30K streaming that's 30K passes — painfully slow.  Batch=64 cuts
-    # passes by 64× with minimal quality loss (k-center is approximate anyway).
-    if use_streaming_ff and args.batch_size_ff == 1 and args.V > 1000:
-        auto_batch = min(128, max(16, args.V // 500))
-        print(f"[kcenter] Auto batch_size_ff: 1 → {auto_batch} (streaming + V={args.V:,}; "
-              f"override with --batch_size_ff 1 to force exact)")
-        args.batch_size_ff = auto_batch
 
     if use_streaming_ff:
         ff_label = "GPU" if use_gpu else "CPU"
@@ -1217,6 +815,12 @@ def main():
     t0 = time.time()
     assignments, assign_dists = _voronoi_assign(store, center_index, N, d, use_gpu)
     print(f"[kcenter] Voronoi assignment (streaming) done in {time.time() - t0:.1f}s")
+
+    quant_metrics = _quantization_metrics(assign_dists)
+    print(f"[kcenter] Quantization (init FFT): mean_cos_d={quant_metrics['mean_cos_distance']:.6f}, "
+          f"sq_l2={quant_metrics['quantization_error_sq_l2']:.6f}, "
+          f"p50={quant_metrics['cos_distance_p50']:.4f}, p95={quant_metrics['cos_distance_p95']:.4f}, "
+          f"p99={quant_metrics['cos_distance_p99']:.4f}, max={quant_metrics['cos_distance_max']:.4f}")
 
     # Per-center r_c from Voronoi cell distances
     r_per_center, points_per_center, coverage = _compute_r_c_and_coverage(
@@ -1273,7 +877,9 @@ def main():
         r_per_center, points_per_center, coverage = _compute_r_c_and_coverage(
             assignments, assign_dists, V_actual, args.r_c_percentile, args.r_c_hist_bins
         )
-        print(f"[kcenter] After refine {ref_it + 1}: r_median={np.median(r_per_center):.4f}, cov={coverage:.4%}")
+        quant_metrics = _quantization_metrics(assign_dists)
+        print(f"[kcenter] After refine {ref_it + 1}: r_median={np.median(r_per_center):.4f}, cov={coverage:.4%}, "
+              f"mean_cos_d={quant_metrics['mean_cos_distance']:.6f}, sq_l2={quant_metrics['quantization_error_sq_l2']:.6f}")
 
     # Ensure r_c >= small epsilon
     r_per_center = np.maximum(r_per_center, 1e-6)
@@ -1291,12 +897,6 @@ def main():
     if empty_cells > 0:
         print(f"[kcenter] Warning: {empty_cells} centers have 0 assigned points")
 
-    # ── DF diagnostic + stop-center selection ──
-    df_diagnostic, stop_centers, stop_center_threshold = _compute_df_and_stop_centers(
-        args, store, span_doc_ids, assignments, assign_dists,
-        r_per_center, V_actual, center_index, N, d, use_gpu,
-    )
-
     # Final coverage only (k-center does not track per-step coverage; no fake curve)
     coverage_history = [float(coverage)]
 
@@ -1307,8 +907,7 @@ def main():
         N=N, d=d, ff_pool_size=ff_pool_size, points_per_center=points_per_center,
         empty_cells=empty_cells, use_gpu=use_gpu, dir_info=dir_info,
         coverage=coverage, coverage_history=coverage_history, r_per_center=r_per_center,
-        df_diagnostic=df_diagnostic, stop_centers=stop_centers,
-        stop_center_threshold=stop_center_threshold,
+        quant_metrics=quant_metrics,
     )
 
 
