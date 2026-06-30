@@ -480,7 +480,7 @@ def create_contextual_span_embeddings(
                 running spaCy at runtime. Keys: (doc_id, section, sub_part) → list of (start, end, text).
     shuffle_doc_sections: if True, shuffle doc_data after collect_doc_texts (seed=42) so that
                           early-stop covers documents from all years/sources uniformly.
-    max_spans_per_doc_section: if set, cap content spans (excl. CLS/DOC_MEAN) per (doc, section)
+    max_spans_per_doc_section: if set, cap content spans per (doc, section)
                                pair. Uses evenly-spaced sub-sampling (deterministic). This limits
                                the contribution of long sections so more unique documents are
                                covered before reaching max_spans.
@@ -2019,49 +2019,6 @@ def process_doc_batch(doc_texts: List[str],
 # Embedding file and directory parsing utilities
 # ============================================================================
 
-def parse_embedding_filename(filename: str) -> dict:
-    """
-    Parse embedding filename to extract task, model, tokenization info.
-    
-    Expected format: patent_contextual_spans_{mode}_{model_name}_{unit}_{cls_suffix}.{ext}
-    
-    Example: patent_contextual_spans_abstract2abstract_PatentMap-V0-SecPair-Claim_spacy_token_cls.npy
-    
-    Returns dict with keys: mode, model_name, unit, cls_suffix, or None if parsing fails.
-    """
-    import os
-    basename = os.path.basename(filename)
-    # Remove extension
-    name_without_ext = os.path.splitext(basename)[0]
-    # Handle .npz files (remove .npz extension)
-    if name_without_ext.endswith('.npz'):
-        name_without_ext = name_without_ext[:-4]
-    
-    # Pattern: patent_contextual_spans_{mode}_{model_name}_{unit}_{cls_suffix}
-    pattern = r'patent_contextual_spans_(.+?)_(.+?)_(.+?)_(cls|nocls)$'
-    match = re.match(pattern, name_without_ext)
-    
-    if match:
-        return {
-            'mode': match.group(1),  # abstract2abstract or claim2all
-            'model_name': match.group(2),  # e.g., PatentMap-V0-SecPair-Claim
-            'unit': match.group(3),  # e.g., spacy_token, encoder_token
-            'cls_suffix': match.group(4)  # cls or nocls
-        }
-    else:
-        # Try alternative pattern (without cls suffix, for backward compatibility)
-        pattern_alt = r'patent_contextual_spans_(.+?)_(.+?)_(.+?)$'
-        match_alt = re.match(pattern_alt, name_without_ext)
-        if match_alt:
-            return {
-                'mode': match_alt.group(1),
-                'model_name': match_alt.group(2),
-                'unit': match_alt.group(3),
-                'cls_suffix': 'unknown'
-            }
-        return None
-
-
 def parse_embeddings_dir(dirname: str) -> dict:
     """
     Parse embeddings directory name from 1create_N_embeddings.py output.
@@ -2214,7 +2171,7 @@ def find_centers(dense_model: str, tokenization_unit: str, search_dir: str = "."
     """
     import glob
     model_name = dense_model.strip("/").split("/")[-1].replace("/", "_").replace("\\", "_")
-    expected_dir_pattern = f"centers_greedy_{model_name}_{tokenization_unit}{centers_suffix}"
+    expected_dir_pattern = f"centers_{model_name}_{tokenization_unit}{centers_suffix}"
     search_pattern = os.path.join(search_dir, expected_dir_pattern)
     matching_dirs = glob.glob(search_pattern)
     if not matching_dirs:
@@ -2230,10 +2187,10 @@ def find_centers(dense_model: str, tokenization_unit: str, search_dir: str = "."
         matching_dirs.sort(key=lambda x: os.path.getmtime(x), reverse=True)
         centers_dir = matching_dirs[0]
         print(f"⚠️  Found {len(matching_dirs)} matching directories, using: {centers_dir}")
-    centers_pattern = os.path.join(centers_dir, "centers_greedy_*.npy")
+    centers_pattern = os.path.join(centers_dir, "centers_*.npy")
     centers_files = glob.glob(centers_pattern)
     if not centers_files:
-        raise FileNotFoundError(f"Could not find centers file in: {centers_dir}\nExpected pattern: centers_greedy_*.npy")
+        raise FileNotFoundError(f"Could not find centers file in: {centers_dir}\nExpected pattern: centers_*.npy")
     centers_path = centers_files[0]
     if len(centers_files) > 1:
         centers_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)

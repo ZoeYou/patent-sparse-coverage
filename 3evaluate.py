@@ -1259,13 +1259,6 @@ def _colbert_passage_scores(args, query_ids, query_texts, passage_ids, corpus_js
                     if 0 <= pid_int < len(passage_ids)
                 })
 
-    # Report PLAID efficiency: dominant cost = ndocs passages receiving full MaxSim scoring per query.
-    # FLOPs = 2 × n_queries × ndocs  (lower bound; each MaxSim candidate counts as one comparison).
-    n_q_done = len(passage_scores_list)
-    total_flops_est = 2 * n_q_done * _ndocs
-    print(f"\n📊 Efficiency — ColBERT CLEF-IP passage (PLAID)")
-    print(f"   PLAID config: ncells={_ncells_search}, ndocs={_ndocs} (full MaxSim candidates/query), topk={plaid_topk}")
-    print(f"   FLOPs: total={total_flops_est:,}, mean per query={total_flops_est // n_q_done if n_q_done else 0:,} (2 × ndocs MaxSim candidates)")
     print(f"  ✅ PLAID search complete: {len(query_ids)} queries, top-{plaid_topk} per query")
     return passage_scores_list
 
@@ -2812,19 +2805,53 @@ def run_sparse_coverage(args):
     faiss.normalize_L2(centers_norm)
     center_index = faiss.IndexFlatIP(d)
     center_index.add(centers_norm.astype(np.float32))
-    # Move centers index to GPU if available — speeds up the per-section
-    # centers_search build dramatically (often 10-30x for large span counts).
-    # Memory footprint is tiny (V × d × 4 bytes, plus FAISS workspace ~1-2 GB).
-    if torch.cuda.is_available():
+    print(f"✅ Center index built")
+
+    # ------------------------------------------------------------------
+    # Move the center index to GPU for fast batched search.
+    # The hot path is center_index.search() over tens of millions of spans
+    # (claim ~24M, invention ~96M); on CPU this dominates wall-clock.
+    # We probe the installed faiss-gpu wheel's compute capabilities and
+    # fall back to CPU on unsupported GPUs (e.g. sm_90 / H100 with the
+    # stock faiss-gpu-cu12 1.12 wheel that only ships sm_70/sm_80 kernels;
+    # see CUDA error 209 "no kernel image is available").
+    # Toggle off entirely with FAISS_FORCE_CPU=1.
+    # ------------------------------------------------------------------
+    def _maybe_move_index_to_gpu(idx):
+        if os.environ.get("FAISS_FORCE_CPU", "0") == "1":
+            print("   FAISS_FORCE_CPU=1 → keeping center index on CPU")
+            return idx
+        if not hasattr(faiss, "StandardGpuResources"):
+            return idx
         try:
-            _faiss_gpu_res = faiss.StandardGpuResources()
-            center_index = faiss.index_cpu_to_gpu(_faiss_gpu_res, 0, center_index)
-            print(f"✅ Center index built (GPU: {torch.cuda.get_device_name(0)})")
-        except Exception as _e:
-            print(f"⚠️  GPU FAISS index unavailable ({_e}); falling back to CPU index")
-            print(f"✅ Center index built (CPU)")
-    else:
-        print(f"✅ Center index built (CPU)")
+            n_gpus = faiss.get_num_gpus()
+        except Exception:
+            n_gpus = 0
+        if n_gpus <= 0:
+            return idx
+        # Skip GPUs whose compute capability isn't in the faiss-gpu wheel.
+        # Stock faiss-gpu-cu12 1.12 ships sm_70 + sm_80 only.
+        try:
+            import torch
+            cap = torch.cuda.get_device_capability(0)
+            cap_str = f"{cap[0]}.{cap[1]}"
+            if cap[0] >= 9:  # Hopper (H100) / Blackwell not supported by wheel
+                print(f"   GPU compute capability {cap_str} not supported by installed faiss-gpu wheel; using CPU search")
+                return idx
+        except Exception:
+            pass
+        try:
+            res = faiss.StandardGpuResources()
+            gpu_idx = faiss.index_cpu_to_gpu(res, 0, idx)
+            # Keep res alive on the index object so it isn't GC'd between calls.
+            gpu_idx._gpu_res = res  # type: ignore[attr-defined]
+            print("   ✅ Center index moved to GPU for fast search")
+            return gpu_idx
+        except Exception as e:
+            print(f"   ⚠️  Failed to move center index to GPU ({e}); falling back to CPU")
+            return idx
+
+    center_index = _maybe_move_index_to_gpu(center_index)
 
     # Signature for the per-span FAISS-search cache (depends only on centers content).
     centers_sig = _array_sig(centers_norm)

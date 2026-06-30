@@ -96,7 +96,7 @@ def build_output_dir(base_out_dir: str, embeddings_dir: str, suffix: str = "_kme
     basename = os.path.basename(embeddings_dir.rstrip("/"))
     if basename.endswith("_fp16"):
         basename = basename[:-len("_fp16")]
-    return f"centers_greedy_{basename}{suffix}"
+    return f"centers_{basename}{suffix}"
 
 
 def _eligible_indices_proportional(store, ref_size, rng):
@@ -289,7 +289,7 @@ def _save_outputs(
 
     r_range_hash = hash((min_r, max_r, nominal_r, int(V_actual))) & 0xFFFFFFFF
     out_name = (
-        f"centers_greedy_V{V_actual}_r{nominal_r:.3f}_"
+        f"centers_kmeanspp_V{V_actual}_r{nominal_r:.3f}_"
         f"r{min_r:.3f}-{max_r:.3f}_{r_range_hash:08x}.npy"
     )
     out_path = os.path.join(args.out_dir, out_name)
