@@ -99,43 +99,6 @@ def build_output_dir(base_out_dir: str, embeddings_dir: str, suffix: str = "_kme
     return f"centers_{basename}{suffix}"
 
 
-def _eligible_indices_proportional(store, ref_size, rng):
-    """Sample ref_size indices proportionally to section sizes."""
-    n_sections = len(store.cumsum) - 1
-    n_per = np.diff(store.cumsum).astype(np.int64)
-    N = int(store.cumsum[-1])
-
-    targets = ref_size * (n_per / N)
-    counts = np.round(targets).astype(np.int64)
-    np.clip(counts, 0, n_per, out=counts)
-
-    total = int(counts.sum())
-    if total > ref_size:
-        need_remove = total - ref_size
-        for j in np.argsort(-counts):
-            take = min(int(counts[j]), need_remove)
-            counts[j] -= take
-            need_remove -= take
-            if need_remove <= 0:
-                break
-
-    per_section = []
-    for j in range(n_sections):
-        c = int(counts[j])
-        if c <= 0:
-            continue
-        n = int(n_per[j])
-        if c >= n:
-            idx_local = np.arange(n)
-        else:
-            idx_local = rng.choice(n, size=c, replace=False)
-        per_section.append(store.cumsum[j] + idx_local)
-
-    if not per_section:
-        return np.array([], dtype=np.int64)
-    return np.concatenate(per_section)
-
-
 def _compute_r_c_and_coverage(assignments, assign_dists, V_actual, r_c_percentile, hist_bins):
     """Compute per-center r_c and estimated coverage."""
     N = len(assignments)
@@ -353,10 +316,6 @@ def main():
                     help="Number of K-means restarts (best by inertia).")
     ap.add_argument("--ref_size", type=int, default=0,
                     help="Fit subset size (0=full). Voronoi assignment/r_c always on full data.")
-    ap.add_argument("--max_per_section", type=int, default=0,
-                    help="Cap per-section spans for fit subset (equal sampling mode only). 0=no cap.")
-    ap.add_argument("--section_sampling", type=str, default="equal", choices=["equal", "proportional"],
-                    help="How to subsample for fit set. proportional requires --ref_size > 0.")
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--r_c_hist_bins", type=int, default=512,
                     help="Histogram bins for percentile r_c (cos distance in [0,2]).")
@@ -376,8 +335,6 @@ def main():
         raise ValueError("--r_c_percentile must be in (0, 100]")
     if args.r_c_hist_bins < 32:
         raise ValueError("--r_c_hist_bins must be >= 32")
-    if args.section_sampling == "proportional" and (not args.ref_size or args.ref_size <= 0):
-        raise ValueError("--section_sampling proportional requires --ref_size > 0")
     if not os.path.isdir(args.embeddings_dir):
         raise ValueError(f"Embeddings directory not found: {args.embeddings_dir}")
 
@@ -417,38 +374,7 @@ def main():
     if args.V > N:
         raise ValueError(f"V={args.V} > N={N}: cannot train more centers than points")
 
-    eligible_indices = None
-    if args.section_sampling == "proportional" and args.ref_size > 0:
-        eligible_indices = _eligible_indices_proportional(store, args.ref_size, rng)
-        print(f"[kmeans++] Section sampling=proportional, ref_size={args.ref_size:,} -> "
-              f"eligible pool {len(eligible_indices):,}")
-    elif args.max_per_section > 0:
-        per_section = []
-        for j in range(len(store.cumsum) - 1):
-            s, e = int(store.cumsum[j]), int(store.cumsum[j + 1])
-            n_j = e - s
-            take = min(args.max_per_section, n_j)
-            if take <= 0:
-                continue
-            if take == n_j:
-                idx = np.arange(s, e, dtype=np.int64)
-            else:
-                idx = rng.choice(np.arange(s, e, dtype=np.int64), size=take, replace=False)
-            per_section.append(idx)
-        if per_section:
-            eligible_indices = np.concatenate(per_section)
-            print(f"[kmeans++] Section cap max_per_section={args.max_per_section:,} -> "
-                  f"eligible pool {len(eligible_indices):,}")
-
-    if eligible_indices is not None and len(eligible_indices) < args.V:
-        raise ValueError(
-            f"Eligible fit pool too small for V={args.V}: {len(eligible_indices)}. "
-            "Increase --ref_size or --max_per_section."
-        )
-
-    if eligible_indices is not None:
-        fit_idx = eligible_indices
-    elif args.ref_size and args.ref_size < N:
+    if args.ref_size and args.ref_size < N:
         fit_idx = rng.choice(N, size=args.ref_size, replace=False)
     else:
         fit_idx = None

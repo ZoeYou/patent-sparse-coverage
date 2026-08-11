@@ -24,14 +24,6 @@ Output:
   - centers_kcenter_V{V}_r{nominal_r}_....npy
   - matching .json with r_per_center, coverage, stats
 
-Section sampling (--section_sampling):
-  - equal + max_per_section: cap each section at the same count; can bias centers toward
-    small sections and produce odd df/r_c patterns. Prefer proportional when subsampling.
-  - proportional + ref_size: stratified by section size (n_j/N); keeps center distribution
-    aligned with corpus.
-  - To use only retrieval-candidate side (e.g. avoid query vs doc imbalance), pass
-    only the candidate-side embedding files in --embeddings_dir.
-
 Centers are task-agnostic: all available sections (abstract, claim, invention)
 are loaded and used for center construction. The same vocabulary is shared
 across abstract2abstract and claim2all evaluation tasks.
@@ -64,49 +56,6 @@ def _check_gpu():
     except ImportError:
         return False
 
-
-
-
-
-
-def _eligible_indices_proportional(store, ref_size, rng):
-    """
-    Stratified proportional sampling: sample ref_size indices so each section j
-    contributes proportionally to its size (n_j / N). Preserves corpus distribution
-    and avoids bias toward small sections (no equal cap).
-    """
-    n_sections = len(store.cumsum) - 1
-    n_per = np.diff(store.cumsum).astype(np.int64)
-    N = int(store.cumsum[-1])
-    # target count per section (float), then round and clamp to [0, n_per]
-    targets = ref_size * (n_per / N)
-    counts = np.round(targets).astype(np.int64)
-    np.clip(counts, 0, n_per, out=counts)
-    # ensure total <= ref_size; if we rounded down a lot, sum may be < ref_size
-    total = int(counts.sum())
-    if total > ref_size:
-        need_remove = total - ref_size
-        # remove from largest sections first
-        for j in np.argsort(-counts):
-            take = min(counts[j], need_remove)
-            counts[j] -= take
-            need_remove -= take
-            if need_remove <= 0:
-                break
-    per_section = []
-    for j in range(n_sections):
-        c = int(counts[j])
-        if c <= 0:
-            continue
-        n = int(n_per[j])
-        if c >= n:
-            idx_local = np.arange(n)
-        else:
-            idx_local = rng.choice(n, size=c, replace=False)
-        per_section.append(store.cumsum[j] + idx_local)
-    if not per_section:
-        return np.array([], dtype=np.int64)
-    return np.concatenate(per_section)
 
 
 
@@ -528,7 +477,7 @@ def farthest_first_traversal_streaming_gpu(store, N, d, V, chunk_size=100_000, b
 
 
 def _save_outputs(
-    *, args, centers, refine_iters, V_actual, nominal_r, min_r, max_r,
+    *, args, centers, V_actual, nominal_r, min_r, max_r,
     N, d, ff_pool_size, points_per_center, empty_cells, use_gpu, dir_info,
     coverage, coverage_history, r_per_center, quant_metrics=None,
 ):
@@ -536,8 +485,6 @@ def _save_outputs(
     suffix = f"_kcenter_V{args.V}"
     if args.r_c_percentile < 100.0:
         suffix += f"_r{args.r_c_percentile:g}"
-    if refine_iters > 0:
-        suffix += f"_refine{refine_iters}"
     args.out_dir = build_output_dir(args.out_dir, args.embeddings_dir, suffix=suffix)
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -569,7 +516,6 @@ def _save_outputs(
         "empty_cells": int(empty_cells),
         "seed": int(args.seed),
         "use_gpu": bool(use_gpu),
-        "refine_iterations": int(refine_iters),
     }
     if quant_metrics:
         # Standard k-means quantization error (mean squared L2 to assigned center)
@@ -605,20 +551,8 @@ def main():
                     help="Reference subset size for farthest-first (0=full). "
                          "For N=5M, use 500000-1000000 to speed up center selection. "
                          "Voronoi assignment + r_c are always computed on full data.")
-    ap.add_argument("--max_per_section", type=int, default=0,
-                    help="Cap per-section spans (section_sampling=equal only). Each section contributes at most this many. "
-                         "0=no cap. Voronoi assignment still uses all spans.")
-    ap.add_argument("--section_sampling", type=str, default="equal", choices=["equal", "proportional"],
-                    help="How to subsample sections for center selection. "
-                         "equal: uniform cap per section (max_per_section) or uniform random (ref_size). "
-                         "proportional: sample ref_size points stratified by section size (ref_size required); "
-                         "keeps center distribution aligned with corpus, avoids bias toward small sections.")
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--log_every", type=int, default=500)
-    ap.add_argument("--refine_iterations", type=int, default=0,
-                    help="Number of K-means-style centroid refinement iterations after farthest-first. "
-                         "Each iteration: replace each center with mean of its Voronoi cell, re-assign, recompute r_c. "
-                         "1-2 often helps for models with broad centers (e.g. PatentMap).")
     ap.add_argument("--r_c_hist_bins", type=int, default=512,
                     help="Number of histogram bins for percentile r_c (cosine distance in [0, 2]). "
                          "Streaming histogram avoids storing all N distances; 512–1024 is typically enough.")
@@ -633,8 +567,6 @@ def main():
         raise ValueError("--r_c_percentile must be in (0, 100]")
     if args.r_c_hist_bins < 32:
         raise ValueError("--r_c_hist_bins must be >= 32")
-    if args.section_sampling == "proportional" and (not args.ref_size or args.ref_size <= 0):
-        raise ValueError("--section_sampling proportional requires --ref_size > 0")
     if not os.path.isdir(args.embeddings_dir):
         raise ValueError(f"Embeddings directory not found: {args.embeddings_dir}")
 
@@ -673,27 +605,6 @@ def main():
     print(f"[kcenter] Total: N={N:,}, d={d} (streaming: no full concatenate)")
 
     # ── Prepare reference set and run farthest-first ──
-    eligible_indices = None
-    if args.section_sampling == "proportional" and args.ref_size > 0:
-        # Stratified proportional: pool reflects section sizes (n_j/N), avoids bias toward small sections
-        eligible_indices = _eligible_indices_proportional(store, args.ref_size, rng)
-        print(f"[kcenter] Section sampling=proportional, ref_size={args.ref_size:,} -> eligible pool {len(eligible_indices):,}")
-    elif args.section_sampling == "equal" and getattr(args, "max_per_section", 0) > 0:
-        # Per-section equal cap: each section contributes at most max_per_section (can bias toward small sections)
-        n_per = np.diff(store.cumsum).astype(np.int64)
-        n_sections = len(n_per)
-        per_section = []
-        for j in range(n_sections):
-            n = int(n_per[j])
-            cap = min(n, args.max_per_section)
-            if cap < n:
-                idx_local = rng.choice(n, size=cap, replace=False)
-            else:
-                idx_local = np.arange(n)
-            per_section.append(store.cumsum[j] + idx_local)
-        eligible_indices = np.concatenate(per_section)
-        print(f"[kcenter] Section sampling=equal, max_per_section={args.max_per_section:,} -> eligible pool {len(eligible_indices):,}")
-
     # ── Fit heuristic: load all into memory if RAM (or GPU VRAM) allows ──
     data_bytes = N * d * 4  # float32
     # GPU: need X (N×d) + min_dist (N) + scratch; use 50% VRAM threshold
@@ -726,13 +637,7 @@ def main():
         max_chunk_rows = int(total_ram * 0.10 / (d * 4))
         ff_chunk_size = max(100_000, min(max_chunk_rows, N))
 
-    if eligible_indices is not None:
-        X_ff = store.get_rows(eligible_indices)
-        l2_normalize_inplace(X_ff)
-        ff_to_global = eligible_indices
-        use_streaming_ff = False
-        print(f"[kcenter] Farthest-first on eligible set: {len(X_ff):,}")
-    elif args.ref_size and args.ref_size < N:
+    if args.ref_size and args.ref_size < N:
         ref_idx = rng.choice(N, size=args.ref_size, replace=False)
         X_ff = store.get_rows(ref_idx)
         l2_normalize_inplace(X_ff)
@@ -770,8 +675,7 @@ def main():
             print(f"[kcenter] Data too large for RAM ({data_bytes / 1e9:.1f}GB); using streaming")
         print(f"[kcenter] Farthest-first on full data (streaming): {N:,} (chunk={ff_chunk_size:,})")
 
-    ff_pool_size = (len(eligible_indices) if eligible_indices is not None else
-                    (args.ref_size if (args.ref_size and args.ref_size < N) else N))
+    ff_pool_size = args.ref_size if (args.ref_size and args.ref_size < N) else N
 
     if use_streaming_ff:
         ff_label = "GPU" if use_gpu else "CPU"
@@ -817,7 +721,7 @@ def main():
     print(f"[kcenter] Voronoi assignment (streaming) done in {time.time() - t0:.1f}s")
 
     quant_metrics = _quantization_metrics(assign_dists)
-    print(f"[kcenter] Quantization (init FFT): mean_cos_d={quant_metrics['mean_cos_distance']:.6f}, "
+    print(f"[kcenter] Quantization: mean_cos_d={quant_metrics['mean_cos_distance']:.6f}, "
           f"sq_l2={quant_metrics['quantization_error_sq_l2']:.6f}, "
           f"p50={quant_metrics['cos_distance_p50']:.4f}, p95={quant_metrics['cos_distance_p95']:.4f}, "
           f"p99={quant_metrics['cos_distance_p99']:.4f}, max={quant_metrics['cos_distance_max']:.4f}")
@@ -830,56 +734,6 @@ def main():
         print(f"[kcenter] r_c = max(Voronoi cell distances) -> coverage = 100%")
     else:
         print(f"[kcenter] r_c = percentile({args.r_c_percentile}) of Voronoi cell distances (hist B={args.r_c_hist_bins}) -> coverage = {coverage:.4%}")
-
-    # Centroid refinement (K-means-style: replace center with mean of Voronoi cell; stream over data)
-    refine_iters = max(0, int(getattr(args, "refine_iterations", 0)))
-    assign_batch = _adaptive_batch_size(d, use_gpu)
-    for ref_it in range(refine_iters):
-        print(f"\n[kcenter] Refinement {ref_it + 1}/{refine_iters}: centroid update (streaming)...")
-        sum_c = np.zeros((V_actual, d), dtype=np.float64)
-        count_c = np.zeros(V_actual, dtype=np.int64)
-        for start in range(0, N, assign_batch):
-            end = min(start + assign_batch, N)
-            batch = store.get_chunk(start, end)
-            l2_normalize_inplace(batch)
-            c_batch = assignments[start:end]
-            # Sort-based grouped sum: contiguous memory access, much faster than np.add.at
-            order = np.argsort(c_batch, kind="mergesort")
-            sorted_c = c_batch[order]
-            sorted_batch = batch[order].astype(np.float64)
-            # Find boundaries between groups
-            change = np.empty(len(sorted_c), dtype=np.bool_)
-            change[0] = True
-            np.not_equal(sorted_c[1:], sorted_c[:-1], out=change[1:])
-            group_starts = np.nonzero(change)[0]
-            group_ids = sorted_c[group_starts]
-            group_ends = np.empty_like(group_starts)
-            group_ends[:-1] = group_starts[1:]
-            group_ends[-1] = len(sorted_c)
-            group_counts = group_ends - group_starts
-            # Cumsum trick: compute prefix sums, then diff at boundaries
-            cumsum_batch = np.cumsum(sorted_batch, axis=0)
-            for gi in range(len(group_starts)):
-                s, e = int(group_starts[gi]), int(group_ends[gi])
-                gid = int(group_ids[gi])
-                group_sum = cumsum_batch[e - 1] - (cumsum_batch[s - 1] if s > 0 else 0)
-                sum_c[gid] += group_sum
-                count_c[gid] += group_counts[gi]
-        centers_new = np.zeros_like(centers, dtype=np.float32)
-        # Vectorized division with safe handling of empty cells (count_c=0)
-        active = count_c > 0
-        centers_new[active] = (sum_c[active] / count_c[active, None]).astype(np.float32)
-        centers_new[~active] = centers[~active]
-        l2_normalize_inplace(centers_new)
-        centers = centers_new
-        center_index = _build_faiss_center_index(centers, use_gpu)
-        assignments, assign_dists = _voronoi_assign(store, center_index, N, d, use_gpu)
-        r_per_center, points_per_center, coverage = _compute_r_c_and_coverage(
-            assignments, assign_dists, V_actual, args.r_c_percentile, args.r_c_hist_bins
-        )
-        quant_metrics = _quantization_metrics(assign_dists)
-        print(f"[kcenter] After refine {ref_it + 1}: r_median={np.median(r_per_center):.4f}, cov={coverage:.4%}, "
-              f"mean_cos_d={quant_metrics['mean_cos_distance']:.6f}, sq_l2={quant_metrics['quantization_error_sq_l2']:.6f}")
 
     # Ensure r_c >= small epsilon
     r_per_center = np.maximum(r_per_center, 1e-6)
@@ -897,12 +751,11 @@ def main():
     if empty_cells > 0:
         print(f"[kcenter] Warning: {empty_cells} centers have 0 assigned points")
 
-    # Final coverage only (k-center does not track per-step coverage; no fake curve)
     coverage_history = [float(coverage)]
 
     # ── Save ──
     _save_outputs(
-        args=args, centers=centers, refine_iters=refine_iters,
+        args=args, centers=centers,
         V_actual=V_actual, nominal_r=nominal_r, min_r=min_r, max_r=max_r,
         N=N, d=d, ff_pool_size=ff_pool_size, points_per_center=points_per_center,
         empty_cells=empty_cells, use_gpu=use_gpu, dir_info=dir_info,
