@@ -158,12 +158,15 @@ def _clefip_two_stage_rerank(
         topk_docs:              number of top documents to keep after Stage 1 (default 100).
 
     Returns:
-        (reranked_list, doc_ranking_list, full_doc_ranking_list):
-          reranked_list:         per-query list of passage_ids (all passages from top-K docs, sorted by score).
-          doc_ranking_list:      per-query list of doc_ids from Stage 1 dedup, truncated to topk_docs.
-                                 Used for @k document metrics (PRES@100, recall@100, NDCG@10).
-          full_doc_ranking_list: per-query list of doc_ids from Stage 1 dedup, NOT truncated
-                                 (all docs touched by any scored passage). Used for untruncated map_doc.
+        (reranked_list, doc_ranking_list, full_doc_ranking_list, full_passage_ranking_list):
+          reranked_list:              per-query list of passage_ids (all passages from top-K docs, sorted by score).
+          doc_ranking_list:           per-query list of doc_ids from Stage 1 dedup, truncated to topk_docs.
+                                      Used for @k document metrics (PRES@100, recall@100, NDCG@10).
+          full_doc_ranking_list:      per-query list of doc_ids from Stage 1 dedup, NOT truncated
+                                      (all docs touched by any scored passage). Used for untruncated map_doc.
+          full_passage_ranking_list:  per-query list of passage_ids ranked directly by Stage-1 score
+                                      (no doc-level dedup / no top-K doc filtering). Used for
+                                      unconditioned passage-level metrics (e.g. recall_passage@1000).
     """
     # Pre-build passage_id -> doc_id mapping and doc_id -> set(passage_ids)
     pid_to_doc = {}
@@ -176,11 +179,13 @@ def _clefip_two_stage_rerank(
     reranked_list = []
     doc_ranking_list = []
     full_doc_ranking_list = []
+    full_passage_ranking_list = []
     for q_idx in range(len(passage_scores_list)):
         scores = passage_scores_list[q_idx]
 
         # Stage 1: rank passages by score desc, derive full document ranking (first-occurrence dedup)
         ranked_pids = sorted(scores.keys(), key=lambda pid: scores[pid], reverse=True)
+        full_passage_ranking_list.append(ranked_pids)
         seen_docs = set()
         full_docs = []
         for pid in ranked_pids:
@@ -201,7 +206,7 @@ def _clefip_two_stage_rerank(
         scored_candidates.sort(key=lambda x: -x[1])
         reranked_list.append([pid for pid, _ in scored_candidates])
 
-    return reranked_list, doc_ranking_list, full_doc_ranking_list
+    return reranked_list, doc_ranking_list, full_doc_ranking_list, full_passage_ranking_list
 
 
 def clefip_passage_evaluation(
@@ -249,7 +254,7 @@ def clefip_passage_evaluation(
         {passage_ids[j]: float(sim[q_idx, j]) for j in range(sim.shape[1])}
         for q_idx in range(len(query_ids))
     ]
-    predicted_labels_list, doc_ranking_list, full_doc_ranking_list = _clefip_two_stage_rerank(
+    predicted_labels_list, doc_ranking_list, full_doc_ranking_list, full_passage_ranking_list = _clefip_two_stage_rerank(
         passage_ids, passage_scores_list, topk_docs=topk_docs,
     )
     print(f"  🔄 Two-stage retrieval: top-{topk_docs} docs → re-ranked passages per query")
@@ -259,6 +264,7 @@ def clefip_passage_evaluation(
         two_stage=True, topk_docs=topk_docs,
         doc_ranking_list=doc_ranking_list,
         full_doc_ranking_list=full_doc_ranking_list,
+        full_passage_ranking_list=full_passage_ranking_list,
     )
     return results
 
@@ -874,13 +880,16 @@ def _make_clefip_official_metrics(
     predicted_labels_list: list,
     doc_ranking_list: list,
     full_doc_ranking_list: list = None,
+    full_passage_ranking_list: list = None,
 ) -> dict:
     """
     CLEF-IP metrics: passage-level + document-level.
 
         Passage-level (2):
             - magp                 — MAP(D), official CLEF-IP hierarchical per-document AP (Piroi et al. 2012).
-            - recall_passage@1000  — passage recall at depth 1000.
+            - recall_passage@1000  — passage recall at depth 1000, computed on the Stage-1 raw passage
+                                     ranking (no doc-level top-K filtering). Falls back to
+                                     ``predicted_labels_list`` when ``full_passage_ranking_list`` is None.
 
     Document-level (5):
       - pres_doc@100   — official CLEF-IP document PRES.
@@ -892,10 +901,15 @@ def _make_clefip_official_metrics(
     *doc_ranking_list* (truncated to topk_docs) drives the @k document metrics.
     *full_doc_ranking_list* (untruncated Stage-1 dedup ranking) drives untruncated map_doc;
     if not provided, falls back to doc_ranking_list (yielding truncated MAP).
+    *full_passage_ranking_list* (untruncated Stage-1 passage ranking, before doc dedup)
+    drives passage-level recall@1000; if not provided, falls back to predicted_labels_list.
     """
     # Passage-level
+    _recall_passage_ranking = (
+        full_passage_ranking_list if full_passage_ranking_list is not None else predicted_labels_list
+    )
     metrics = {
-        "recall_passage@1000": mean_recall_at_k(true_labels_list, predicted_labels_list, k=1000),
+        "recall_passage@1000": mean_recall_at_k(true_labels_list, _recall_passage_ranking, k=1000),
         "magp": _clefip_mean_agp_passage(true_labels_list, predicted_labels_list, k=None),
     }
     # Document-level
@@ -903,7 +917,7 @@ def _make_clefip_official_metrics(
         list({_clefip_passage_id_to_doc_id(pid) for pid in rel_passages})
         for rel_passages in true_labels_list
     ]
-    metrics["pres_doc@100"] = mean_pres_at_k(true_doc_ids_list, doc_ranking_list, k=100, N_max=100)
+    metrics["pres_doc@100"] = mean_pres_at_k(true_doc_ids_list, doc_ranking_list, N_max=100)
     metrics["recall_doc@100"] = mean_recall_at_k(true_doc_ids_list, doc_ranking_list, k=100)
     metrics["ndcg_doc@10"] = mean_ndcg_at_k(true_doc_ids_list, doc_ranking_list, k=10)
     _map_ranking = full_doc_ranking_list if full_doc_ranking_list is not None else doc_ranking_list
@@ -924,17 +938,20 @@ def _evaluate_and_print_clefip(
     header_extra: str = "",
     doc_ranking_list: list,
     full_doc_ranking_list: list = None,
+    full_passage_ranking_list: list = None,
 ) -> dict:
     """Evaluate CLEF-IP passage retrieval: compute metrics and print results.
 
     *doc_ranking_list* is the Stage-1 truncated document ranking (used for @k metrics).
     *full_doc_ranking_list* is the untruncated Stage-1 ranking (used for untruncated map_doc).
+    *full_passage_ranking_list* is the untruncated Stage-1 passage ranking (used for recall_passage@1000).
     """
     true_labels_list = [qrels.get(qid, []) for qid in query_ids]
     results = _make_clefip_official_metrics(
         true_labels_list, predicted_labels_list,
         doc_ranking_list=doc_ranking_list,
         full_doc_ranking_list=full_doc_ranking_list,
+        full_passage_ranking_list=full_passage_ranking_list,
     )
     label_suffix = f" (two-stage top-{topk_docs} docs)" if two_stage else ""
     print_subsection_header(f"CLEF-IP 2013 EN claims-to-passages{header_extra}{label_suffix}")
@@ -1390,7 +1407,7 @@ def _dense_passage_eval(args, query_ids, query_texts, passage_ids, corpus_jsonl_
             query_texts_fmt, passage_ids, passage_emb, _q_encode_fn, dense_tokenizer,
             query_max_chunks=qmc, batch_size=32,
         )
-        predicted_labels_list, doc_ranking_list, full_doc_ranking_list = _clefip_two_stage_rerank(
+        predicted_labels_list, doc_ranking_list, full_doc_ranking_list, full_passage_ranking_list = _clefip_two_stage_rerank(
             passage_ids, passage_scores_list, topk_docs=topk_docs,
         )
         print(f"  🔄 Two-stage retrieval: top-{topk_docs} docs → re-ranked passages per query")
@@ -1400,6 +1417,7 @@ def _dense_passage_eval(args, query_ids, query_texts, passage_ids, corpus_jsonl_
             two_stage=True, topk_docs=topk_docs,
             doc_ranking_list=doc_ranking_list,
             full_doc_ranking_list=full_doc_ranking_list,
+            full_passage_ranking_list=full_passage_ranking_list,
         )
     else:
         clefip_passage_evaluation(
@@ -1451,7 +1469,7 @@ def _run_clefip_eval_full_corpus(
                             qrels_passage_ids, topk_docs, device, model_name)
         return
 
-    predicted_labels_list, doc_ranking_list, full_doc_ranking_list = _clefip_two_stage_rerank(
+    predicted_labels_list, doc_ranking_list, full_doc_ranking_list, full_passage_ranking_list = _clefip_two_stage_rerank(
         passage_ids, passage_scores_list, topk_docs=topk_docs,
     )
     print(f"  🔄 Two-stage retrieval: top-{topk_docs} docs → re-ranked passages per query")
@@ -1461,6 +1479,7 @@ def _run_clefip_eval_full_corpus(
         two_stage=True, topk_docs=topk_docs, header_extra=header_extra,
         doc_ranking_list=doc_ranking_list,
         full_doc_ranking_list=full_doc_ranking_list,
+        full_passage_ranking_list=full_passage_ranking_list,
     )
 
 
@@ -3262,7 +3281,7 @@ def run_sparse_coverage(args):
                 else:
                     pscores = {}
                 all_passage_scores_list.append(pscores)
-            predicted_labels_list, doc_ranking_list, full_doc_ranking_list = _clefip_two_stage_rerank(
+            predicted_labels_list, doc_ranking_list, full_doc_ranking_list, full_passage_ranking_list = _clefip_two_stage_rerank(
                 _clefip_pid_list, all_passage_scores_list,
                 topk_docs=topk_docs,
             )
@@ -3274,6 +3293,7 @@ def run_sparse_coverage(args):
                 two_stage=True, topk_docs=topk_docs,
                 doc_ranking_list=doc_ranking_list,
                 full_doc_ranking_list=full_doc_ranking_list,
+                full_passage_ranking_list=full_passage_ranking_list,
             )
 
             # ---- CLEF-IP Robustness Test: varying negative pool sizes ----
@@ -3359,14 +3379,15 @@ def run_sparse_coverage(args):
                         else:
                             _pscores_f = {}
                         _passage_scores_f.append(_pscores_f)
-                    _pred_f, _doc_ranking_f, _full_doc_ranking_f = _clefip_two_stage_rerank(
+                    _pred_f, _doc_ranking_f, _full_doc_ranking_f, _full_passage_ranking_f = _clefip_two_stage_rerank(
                         _allowed_pid_list, _passage_scores_f, topk_docs=topk_docs,
                     )
 
                     _true_f = [_clefip_qrels.get(qid, []) for qid in _clefip_qids]
                     _res_f = _make_clefip_official_metrics(_true_f, _pred_f,
                                                           doc_ranking_list=_doc_ranking_f,
-                                                          full_doc_ranking_list=_full_doc_ranking_f)
+                                                          full_doc_ranking_list=_full_doc_ranking_f,
+                                                          full_passage_ranking_list=_full_passage_ranking_f)
                     _robustness_results.append((_n_docs_f, _n_passages_f, _res_f))
                     print(f"   {_n_docs_f:>6} docs ({_n_passages_f:>8,} passages): "
                           f"recall_passage@1000={_res_f.get('recall_passage@1000', 0):.4f}  "

@@ -352,108 +352,81 @@ def mean_average_precision(true_labels_list, predicted_labels_list, k=None):
 
 
 
-def pres_at_k(true_labels, predicted_docs, k=100, N_max=None):
+def pres_at_k(true_labels, predicted_docs, N_max=100):
     """
-    Calculate PRES (Patent Retrieval Evaluation Score) at k for a single query.
-    
-    PRES is a recall-oriented metric that measures how well a retrieval system
-    retrieves all relevant documents early in the ranking, under an adjustable
-    cutoff N_max (maximum rank user is willing to examine).
-    
-    Reference: Magdy & Jones, SIGIR 2010
-    https://dl.acm.org/doi/epdf/10.1145/1835449.1835551
-    
-    Parameters:
+    Calculate PRES (Patent Retrieval Evaluation Score) at N_max for a single query.
+
+    Follows Magdy & Jones, SIGIR 2010 (https://dl.acm.org/doi/10.1145/1835449.1835551):
+
+        PRES = 1 - (sum_i r_i - n(n+1)/2) / (n * N_max)
+
+    where n is the number of relevant documents and r_i is the rank of the
+    i-th relevant doc in the ranked list. Relevant documents NOT retrieved in
+    the top N_max are assigned ranks N_max + 1, N_max + 2, ..., N_max + (n - m)
+    (i.e., a graded penalty), so that the all-missing case yields PRES = 0 and
+    the perfect case (all relevants at ranks 1..n) yields PRES = 1.
+
+    Parameters
+    ----------
     true_labels : list
-        True relevant items for this query.
+        Relevant items for this query.
     predicted_docs : list
-        Predicted recommended items for this query (ranked list).
-    k : int
-        Number of recommendations to consider (default: 100).
-    N_max : int or None
-        Maximum rank cutoff user checks. If None, uses k.
-        Relevant documents beyond N_max are treated as missed (rank = N_max).
-    
-    Returns:
+        Ranked prediction list for this query.
+    N_max : int
+        Maximum rank the user is willing to examine.
+
+    Returns
+    -------
     float
-        PRES score in [0, 1], where 1 is best (all relevant docs in top positions).
+        PRES in [0, 1] (1 = best).
     """
-    if N_max is None:
-        N_max = k
-    
-    # Look at top max(k, N_max) documents to find all relevant ones within N_max
-    # (if N_max > k, we need to look beyond k to find relevant docs up to N_max)
-    top_docs = predicted_docs[:max(k, N_max)]
     true_set = set(true_labels)
-    
-    if not true_set:
+    if not true_set or N_max <= 0:
         return 0.0
-    
-    n = len(true_set)  # Total number of relevant documents
-    
-    # Find ranks of relevant documents in top max(k, N_max) (1-based indexing)
-    rel_ranks = []
-    for rank, doc_id in enumerate(top_docs, start=1):
-        if doc_id in true_set and rank <= N_max:
-            rel_ranks.append(rank)
-    
-    # Sort ranks
-    rel_ranks = sorted(rel_ranks)
-    m = len(rel_ranks)  # Number of relevant docs retrieved in top k
-    
-    # For missing relevant docs (beyond top k or beyond N_max), treat as rank = N_max
+
+    n = len(true_set)
+
+    # Ranks of relevant docs within top N_max (1-based)
+    rel_ranks = [
+        rank for rank, doc_id in enumerate(predicted_docs[:N_max], start=1)
+        if doc_id in true_set
+    ]
+    m = len(rel_ranks)
     num_missing = n - m
-    full_ranks = rel_ranks + [N_max] * num_missing
-    
-    # Compute sum of (r_i - i) for i = 1..n
-    sum_diff = 0.0
-    for i, r in enumerate(full_ranks, start=1):
-        # Ensure r doesn't exceed N_max
-        r_i = min(r, N_max)
-        sum_diff += (r_i - i)
-    
-    # Denominator: n * (N_max - n)
-    denom = n * (N_max - n)
-    
-    if denom <= 0:
-        # Edge case: if N_max == n, denominator is 0
-        # PRES is 1 if all relevant docs are in top n, else 0
-        return 1.0 if sum_diff == 0 else 0.0
-    
-    pres = 1.0 - (sum_diff / denom)
-    # Ensure in [0, 1]
-    pres = max(0.0, min(1.0, pres))
-    return pres
+
+    # Missing relevants get ranks N_max + 1, ..., N_max + num_missing
+    sum_r = sum(rel_ranks) + num_missing * N_max + num_missing * (num_missing + 1) / 2.0
+
+    denom = n * N_max
+    pres = 1.0 - (sum_r - n * (n + 1) / 2.0) / denom
+    return max(0.0, min(1.0, pres))
 
 
 
-def mean_pres_at_k(true_labels_list, predicted_labels_list, k=100, N_max=None):
+def mean_pres_at_k(true_labels_list, predicted_labels_list, N_max=100):
     """
-    Calculate Mean PRES (Patent Retrieval Evaluation Score) at k over multiple queries.
-    
-    PRES is a recall-oriented metric that measures how well a retrieval system
-    retrieves all relevant documents early in the ranking.
-    
+    Calculate Mean PRES over multiple queries.
+
     Reference: Magdy & Jones, SIGIR 2010
-    https://dl.acm.org/doi/epdf/10.1145/1835449.1835551
-    
-    Parameters:
+    https://dl.acm.org/doi/10.1145/1835449.1835551
+
+    Parameters
+    ----------
     true_labels_list : list of list
         True relevant items for each query.
     predicted_labels_list : list of list
         Predicted recommended items for each query (ranked lists).
-    k : int
-        Number of recommendations to consider (default: 100).
-    N_max : int or None
-        Maximum rank cutoff user checks. If None, uses k.
-    
-    Returns:
+    N_max : int
+        Maximum rank cutoff user checks (default: 100).
+
+    Returns
+    -------
     float
-        Mean PRES@k value.
+        Mean PRES@N_max value.
     """
     scores = []
     for q_true_labels, q_pred_docs in zip(true_labels_list, predicted_labels_list):
-        scores.append(pres_at_k(q_true_labels, q_pred_docs, k=k, N_max=N_max))
+        scores.append(pres_at_k(q_true_labels, q_pred_docs, N_max=N_max))
     return np.mean(scores) if scores else 0.0
 
 
